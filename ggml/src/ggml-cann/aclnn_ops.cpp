@@ -44,6 +44,7 @@
 #include <aclnnop/aclnn_exp.h>
 #include <aclnnop/aclnn_fill_scalar.h>
 #include <aclnnop/aclnn_fused_infer_attention_score_v2.h>
+#include <aclnnop/aclnn_fused_infer_attention_score_v5.h>
 #include <aclnnop/aclnn_ger.h>
 #include <aclnnop/aclnn_group_norm.h>
 #include <aclnnop/aclnn_gather_v2.h>
@@ -3838,6 +3839,9 @@ void ggml_cann_mul_mat_id(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+    static bool use_fa_v5 = getenv("GGML_CANN_FA_V5") == nullptr ||
+                            strcmp(getenv("GGML_CANN_FA_V5"), "0") != 0;
+
     ggml_tensor * src0 = dst->src[0];  // q, fp32 | B, N, S, D (uncont) -> B, S, N, D (cont)
     ggml_tensor * src1 = dst->src[1];  // k, fp16 | B, N, S, D (uncont) -> B, S, N, D (cont)
     ggml_tensor * src2 = dst->src[2];  // v, fp16 | B, N, S, D (uncont) -> B, S, N, D (cont)
@@ -4058,29 +4062,58 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst
             fa_dst_tensor = ggml_cann_create_tensor(dst);
         }
 
-        GGML_CANN_CALL_ACLNN_OP(ctx, FusedInferAttentionScoreV2, acl_q_tensor.get(), acl_k_tensor_list.get(),
-                                acl_v_tensor_list.get(),               // q, k, v
-                                bcast_pse_tensor.get(), nullptr,       // pse, mask
-                                nullptr, nullptr,                      // actSeqLen, actSeqLenkv
-                                nullptr, nullptr,                      // deqScale1, quantScale1
-                                nullptr, nullptr, nullptr,             // deqScale2, quantScale2, quantOffset2
-                                nullptr, nullptr,                      // antiquantScale, antiquantOffset
-                                nullptr,                               // blockTable
-                                nullptr, nullptr,                      // qPadSize, kvPadSize
-                                nullptr, nullptr,                      // kAntiquantScale, kAntiQuantOffset
-                                nullptr, nullptr,                      // vAntiquantScale, vAntiQuantOffset
-                                nullptr, nullptr, nullptr,             // kSharedPrefix, vSharedPrefix, actSharedLen
-                                numHeads, scaleValue,                  // heads, scaleValue
-                                preTokens, nextTokens,                 // preTokens, nextTokens
-                                layout,                                // inputLayout
-                                numKeyValueHeads,                      // numKVHeads
-                                sparseMode, innerPrecise,              // sparseMode, innerPrecise
-                                blockSize, antiquantMode,              // blockSize, antiquantMode
-                                softmaxLseFlag,                        // softmaxLseFlag
-                                keyAntiquantMode, valueAntiquantMode,  // keyAntiqMode, valueAntiqMode
-                                fa_dst_tensor.get(),                   // attentionOut
-                                nullptr                                // softmaxLse
-        );
+        if (use_fa_v5) {
+            GGML_CANN_CALL_ACLNN_OP(ctx, FusedInferAttentionScoreV5, acl_q_tensor.get(), acl_k_tensor_list.get(),
+                                    acl_v_tensor_list.get(),               // q, k, v
+                                    bcast_pse_tensor.get(), nullptr,       // pse, mask
+                                    nullptr, nullptr,                      // actSeqLen, actSeqLenkv
+                                    nullptr, nullptr,                      // deqScale1, quantScale1
+                                    nullptr, nullptr, nullptr,             // deqScale2, quantScale2, quantOffset2
+                                    nullptr, nullptr,                      // antiquantScale, antiquantOffset
+                                    nullptr,                               // blockTable
+                                    nullptr, nullptr,                      // qPadSize, kvPadSize
+                                    nullptr, nullptr,                      // kAntiquantScale, kAntiQuantOffset
+                                    nullptr, nullptr,                      // vAntiquantScale, vAntiQuantOffset
+                                    nullptr, nullptr, nullptr,             // kSharedPrefix, vSharedPrefix, actSharedLen
+                                    nullptr, nullptr, nullptr,             // queryRope, keyRope, keyRopeAntiqScale
+                                    nullptr, nullptr, nullptr, nullptr,    // dequantScaleQuery, sink, qStartIdx, kvStartIdx
+                                    numHeads, scaleValue,                  // heads, scaleValue
+                                    preTokens, nextTokens,                 // preTokens, nextTokens
+                                    layout,                                // inputLayout
+                                    numKeyValueHeads,                      // numKVHeads
+                                    sparseMode, innerPrecise,              // sparseMode, innerPrecise
+                                    blockSize, antiquantMode,              // blockSize, antiquantMode
+                                    softmaxLseFlag,                        // softmaxLseFlag
+                                    keyAntiquantMode, valueAntiquantMode,  // keyAntiqMode, valueAntiqMode
+                                    0, 0,                                  // queryQuantMode, pseType
+                                    fa_dst_tensor.get(),                   // attentionOut
+                                    nullptr                                // softmaxLse
+            );
+        } else {
+            GGML_CANN_CALL_ACLNN_OP(ctx, FusedInferAttentionScoreV2, acl_q_tensor.get(), acl_k_tensor_list.get(),
+                                    acl_v_tensor_list.get(),               // q, k, v
+                                    bcast_pse_tensor.get(), nullptr,       // pse, mask
+                                    nullptr, nullptr,                      // actSeqLen, actSeqLenkv
+                                    nullptr, nullptr,                      // deqScale1, quantScale1
+                                    nullptr, nullptr, nullptr,             // deqScale2, quantScale2, quantOffset2
+                                    nullptr, nullptr,                      // antiquantScale, antiquantOffset
+                                    nullptr,                               // blockTable
+                                    nullptr, nullptr,                      // qPadSize, kvPadSize
+                                    nullptr, nullptr,                      // kAntiquantScale, kAntiQuantOffset
+                                    nullptr, nullptr,                      // vAntiquantScale, vAntiQuantOffset
+                                    nullptr, nullptr, nullptr,             // kSharedPrefix, vSharedPrefix, actSharedLen
+                                    numHeads, scaleValue,                  // heads, scaleValue
+                                    preTokens, nextTokens,                 // preTokens, nextTokens
+                                    layout,                                // inputLayout
+                                    numKeyValueHeads,                      // numKVHeads
+                                    sparseMode, innerPrecise,              // sparseMode, innerPrecise
+                                    blockSize, antiquantMode,              // blockSize, antiquantMode
+                                    softmaxLseFlag,                        // softmaxLseFlag
+                                    keyAntiquantMode, valueAntiquantMode,  // keyAntiqMode, valueAntiqMode
+                                    fa_dst_tensor.get(),                   // attentionOut
+                                    nullptr                                // softmaxLse
+            );
+        }
 
         // Step 6: post-processing — slice padded output and/or cast to f32
         if (needs_padding) {

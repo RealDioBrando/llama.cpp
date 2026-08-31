@@ -507,3 +507,44 @@ ACLNN `inputLayout` 从 `BSND` 改成 `BNSD`, 并省掉前面的 `transpose12`.
 transpose, 还可能和 ACLNN 内部 kernel 选择或 Q cast 有关. 后续应优先用
 带 op name 的 profiling 确认调用链, 再考虑 `IncreFlashAttention` 或
 `FusedInferAttentionScoreV5` 这类 decode 专用接口.
+
+### 8.8 OPT-7: FusedInferAttentionScoreV5 实验开关 (2026-08-31)
+
+**改动**: `ggml/src/ggml-cann/aclnn_ops.cpp` 接入
+`aclnnFusedInferAttentionScoreV5`. 新增环境变量 `GGML_CANN_FA_V5`:
+
+- 默认 `1`: 使用 V5.
+- 设为 `0`: 回到 V2.
+
+V5 相比 V2 增加了 query RoPE, key RoPE, dequant scale, learnable sink,
+q/kv start index 等可选输入. 当前 llama.cpp 路径先全部传空, 只替换主
+attention 接口, 不改变 Q/K/V layout 和 KV cache 结构.
+
+**功能验证**:
+
+```bash
+ASCEND_VISIBLE_DEVICES=5 GGML_CANN_FA_V5=1 \
+  ./llama-cli -m /app/gguf-models/qwen3-8b-f16.gguf \
+  -c 512 -n 16 -p hi -st --no-warmup -fa on
+```
+
+模型能正常加载并生成文本, 没有出现 V5 接口不支持或参数校验错误.
+
+**性能观察**:
+
+环境: Ascend 310P3 device 5, 容器 `z00575061-llama-bench-v2`, CANN 9.1.0.
+
+| 配置 | PP512 x10 | TG128 x10 |
+|------|-----------:|----------:|
+| V5 | 497.56 / 503.41 t/s | 23.10 / 21.65 t/s |
+| V2 | 349.86 / 559.92 / 332.56 t/s | 8.83 / 24.77 / 8.27 t/s |
+
+device 6 上 V5 也得到 `PP=517.63 t/s, TG=22.95 t/s`.
+
+**结论**: V5 可以在 310P3 上运行, 且 TG 稳定在 21.6-23.1 t/s 区间.
+V2 在同一台服务器上波动很大, 有多次掉到 8-9 t/s 的采样. 因此本分支
+默认切到 V5, 保留 `GGML_CANN_FA_V5=0` 回退开关.
+
+**风险**: 在 device 4 上 V5 曾触发一次 AICore exception, 但同一版本在
+device 5/6 上重复运行正常. 目前不能排除 device 4 本身状态或 V5 对某些
+芯片/固件组合的兼容性问题. 上游化之前需要在更多 310P3 设备上验证.
