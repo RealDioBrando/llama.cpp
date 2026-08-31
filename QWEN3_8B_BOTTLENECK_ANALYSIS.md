@@ -336,3 +336,18 @@ output = x * cos + rotate_half(x) * sin
 | 基准测试 | PP512x10 = 468 t/s, TG128x10 = 12.94 t/s (服务器有负载竞争) |
 
 Git commit: `a256038ee` on branch `codex/cann-optimize-310p`
+
+**A/B 对比测试 (相同负载, 连续运行):**
+
+| 版本 | PP512 x10 | TG128 x10 | 总吞吐 |
+|------|-----------|-----------|--------|
+| 新版 (RoPE NPU) | 370.79 t/s | 12.74 t/s | 56.00 t/s |
+| 旧版 (RoPE CPU) | 394.13 t/s | 12.30 t/s | 54.68 t/s |
+| 差异 | -5.9% | **+3.6%** | +2.4% |
+
+**结论**: RoPE NPU 化的实际 TG 收益为 +3.6%, 远低于最初估计的 30-50%.
+原因: RoPE CPU 回退的实际开销约 25ms/step, 而非估计的 80ms.
+host-device 传输可能是流水线化的, 非串行阻塞.
+
+**修正后的优先级**: OPT-2 (KV Write batch, 预期 -164ms) 和 OPT-3 (消除 AsStrided, 预期 -84ms)
+的收益远大于 OPT-1, 应优先实现.
