@@ -1299,7 +1299,8 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
-    GGML_UNUSED(sinfo);
+    static bool use_contiguous_cpy = getenv("GGML_CANN_KV_CONTIGUOUS_CPY") == nullptr ||
+                                     strcmp(getenv("GGML_CANN_KV_CONTIGUOUS_CPY"), "0") != 0;
 
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -1316,6 +1317,16 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     GGML_ASSERT(ggml_row_size(k_cur->type, n_embd_head) == k_cur->nb[1]);
 
     k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
+
+    // A contiguous slot range can use a plain strided copy. This avoids the
+    // much more expensive index-copy kernel on backends such as CANN.
+    if (use_contiguous_cpy && sinfo.n_stream() == 1 && sinfo.is_contiguous()) {
+        const int64_t kv_size = get_size();
+        const int64_t offset  = (sinfo.strm[0]*kv_size + sinfo.idxs[0][0])*k->nb[1];
+        ggml_tensor * k_dst = ggml_view_2d(ctx, k, n_embd_gqa, n_tokens, k->nb[1], offset);
+
+        return ggml_cpy(ctx, k_cur, k_dst);
+    }
 
     const int64_t n_stream = k->ne[2];
 
@@ -1336,6 +1347,9 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
+    static bool use_contiguous_cpy = getenv("GGML_CANN_KV_CONTIGUOUS_CPY") == nullptr ||
+                                     strcmp(getenv("GGML_CANN_KV_CONTIGUOUS_CPY"), "0") != 0;
+
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
@@ -1354,6 +1368,14 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     // take this branch when FA is enabled (the V cache is not transposed)
     if (!v_trans) {
         v_cur = ggml_view_2d(ctx, v_cur, n_embd_gqa, n_tokens, v_cur->nb[2], 0);
+
+        if (use_contiguous_cpy && sinfo.n_stream() == 1 && sinfo.is_contiguous()) {
+            const int64_t kv_size = get_size();
+            const int64_t offset  = (sinfo.strm[0]*kv_size + sinfo.idxs[0][0])*v->nb[1];
+            ggml_tensor * v_dst = ggml_view_2d(ctx, v, n_embd_gqa, n_tokens, v->nb[1], offset);
+
+            return ggml_cpy(ctx, v_cur, v_dst);
+        }
 
         if (n_stream > 1) {
             const int64_t kv_size = get_size();
@@ -1457,6 +1479,10 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
 }
 
 void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
+    if (dst->buffer == nullptr) {
+        return; // the graph used the contiguous-copy fast path
+    }
+
     const uint32_t n_tokens = ubatch->n_tokens;
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
 
@@ -1473,6 +1499,10 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
 }
 
 void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
+    if (dst->buffer == nullptr) {
+        return; // the graph used the contiguous-copy fast path
+    }
+
     const uint32_t n_tokens = ubatch->n_tokens;
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
 

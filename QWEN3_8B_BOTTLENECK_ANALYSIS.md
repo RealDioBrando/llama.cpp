@@ -457,3 +457,53 @@ src[] 指针. ggml 的 DAG 拓扑排序无法捕获这种依赖.
 | 组合效果 | | **TG +164%, PP +118%** |
 
 分支: `codex/cann-optimize-310p`
+
+### 8.6 OPT-5: KV 连续 slot 写入快路径 (2026-08-31)
+
+**背景**: profiling 显示 `ScatterUpdate`(即 `aclnnInplaceIndexCopy`) 来自
+`ggml_cann_set_rows()`, 在 decode 阶段占比约 42.8%. 当本批 token 落在
+KV cache 的连续 slot 区间时, 仍然用 index copy 是多余的.
+
+**改动**: `src/llama-kv-cache.cpp` 在 `cpy_k()`/`cpy_v()` 中增加快路径.
+当 `slot_info` 只有一个 stream 且索引连续时, 直接构造目标 KV cache view,
+用 `ggml_cpy()` 走普通 strided copy; 否则保持原来的 `ggml_set_rows()`.
+
+**为什么不在 backend 内检测**: `SET_ROWS` 只能看到 device 上的 index tensor.
+如果在 backend 内读回索引判断连续性, 会引入 host-device 同步. 因此把
+host 侧已经知道的 `slot_info` 连续性信息放在 graph 构建期使用.
+
+**A/B 测试**:
+
+环境: Ascend 310P3 device 6, 容器 `z00575061-llama-bench-v2`, CANN 9.1.0.
+device 2 当时被其他业务占用, 所以本轮对比统一改用 device 6. 因此下面的
+绝对值不能和 8.3 节在 device 2 上得到的数据直接混比.
+
+| 配置 | PP512 x10 | TG128 x10 |
+|------|-----------:|----------:|
+| baseline (`GGML_CANN_KV_CONTIGUOUS_CPY=0`) | 461.49 / 525.09 t/s | 15.28 / 17.24 t/s |
+| contiguous-copy fast path | 518.27 / 508.00 t/s | 22.47 / 20.77 t/s |
+
+两次采样的均值:
+
+| 指标 | baseline | fast path | 变化 |
+|------|---------:|----------:|-----:|
+| PP512 x10 | 493.29 t/s | 513.14 t/s | +4.0% |
+| TG128 x10 | 16.26 t/s | 21.62 t/s | +33.0% |
+
+**结论**: 连续 slot 快路径对 10 并发 decode 的收益明显, 对 PP 影响较小.
+这与 profiling 中 `ScatterUpdate` 主要出现在 decode 阶段的观察一致.
+
+### 8.7 OPT-6: FA 输入布局 BNSD 尝试 (已回退)
+
+**假设**: `AsStrided` 来自 `FusedInferAttentionScoreV2` 对 K/V 视图的布局
+materialization. llama.cpp 的物理 KV cache 更接近 `BNSD`, 因此尝试把
+ACLNN `inputLayout` 从 `BSND` 改成 `BNSD`, 并省掉前面的 `transpose12`.
+
+**结果**: 在同一 device 6 上, `GGML_CANN_FA_BNSD=1` 得到
+`PP=485.29 t/s, TG=22.61 t/s`; `GGML_CANN_FA_BNSD=0` 得到
+`PP=518.27 t/s, TG=22.47 t/s`. 没有稳定收益, PP 还略差.
+
+**处理**: 已回退该改动. `AsStrided` 的来源可能不是单纯的 K/V logical
+transpose, 还可能和 ACLNN 内部 kernel 选择或 Q cast 有关. 后续应优先用
+带 op name 的 profiling 确认调用链, 再考虑 `IncreFlashAttention` 或
+`FusedInferAttentionScoreV5` 这类 decode 专用接口.
