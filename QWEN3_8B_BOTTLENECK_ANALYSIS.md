@@ -587,3 +587,63 @@ stream 只有 1 个 token, 变成大量小 strided copy, TG 反而下降. 因此
 decode 阶段继续保留 scatter, 避免小拷贝退化.
 
 **功能验证**: `llama-cli` 使用 V5 + 多 stream 快路径生成正常文本.
+ 
+### 8.10 OPT-9: RoPE copy+negate 融合 + memcpy 快路径 (2026-09-01)
+ 
+**背景**: profiling 显示 AsStrided 占 device 侧 44.8% (2220 次, 1.67s),
+主要来源:
+- InplaceCopy (1388 次) - 来自 `cann_copy` / `aclnnInplaceCopy`
+- InplaceMuls (556 次) - 来自 RoPE 的 `aclnn_muls(inplace=true)`
+- Matmul (276 次) - 来自 ACLNN matmul 内部处理转置 weight
+ 
+**改动**:
+ 
+1. **RoPE copy+negate 融合**: 将 `cann_copy + aclnn_muls(inplace=true)`
+   合并为 `aclnn_muls(non-inplace)`, 消除一次 InplaceCopy 和一次
+   InplaceMuls. 对 NeoX 和 non-NeoX 两种 RoPE 路径均生效.
+ 
+2. **aclrtMemcpyAsync 连续快路径**: `ggml_cann_dup()` 中, 当 src 和 dst
+   均连续时, 用 `aclrtMemcpyAsync` 替代 `aclnnInplaceCopy`.
+ 
+3. **aclrtMemcpy2dAsync 2D strided 快路径**: 新增 `cann_memcpy2d()`
+   helper, 对非连续但具有 2D strided 布局的 tensor, 用单次
+   `aclrtMemcpy2dAsync` 替代 `aclnnInplaceCopy`. 当前工作负载下
+   `ggml_cann_dup` 的非连续路径未被触发 (0 hits), 但为未来场景预留.
+ 
+**A/B 测试**:
+ 
+环境: Ascend 310P3 device 2, 容器 `z00575061-llama-bench-v2`, CANN 9.1.0.
+模型: qwen3-8b-f16.gguf, 10 并发, PP512/TG128, `-fa auto`.
+ 
+| 配置 | PP t/s | TG t/s | Total t/s |
+|------|-------:|-------:|----------:|
+| baseline (OPT-1~8) | 909.74 | 28.21 | 125.50 |
+| + aclrtMemcpyAsync | 916.03 | 27.92 | 124.42 |
+| + aclrtMemcpy2dAsync | 930.99 | 28.25 | 125.98 |
+| + RoPE 融合 | 992.01 | 27.99 | 125.74 |
+ 
+PP 提升约 9.1% (992 vs 909). TG 基本持平, 因为 TG 瓶颈不在 RoPE 而在
+matmul 和 ACLNN runtime 内部 AsStrided.
+ 
+**关键发现**:
+ 
+- `cann_memcpy2d` 在当前工作负载下 0 hits / 0 misses, 说明
+  `ggml_cann_dup` 的非连续路径未被触发. AsStrided 主要来自其他路径
+  (RoPE 内部, attention, matmul).
+- 关闭 NZ weight 格式 (`GGML_CANN_WEIGHT_NZ=off`) 导致 TG 从 28 跌到 13
+  t/s (-54%), 说明 NZ 格式是 310P 上 matmul 性能的关键.
+- FA V5 比 V2 快约 3% (125.74 vs 122.30 t/s).
+- ACLNN runtime 内部 `aclrtSynchronizeStream` 调用 8720 次 (3.11s),
+  占 host 侧 42%, 无法从 backend 层面消除.
+ 
+**TG 瓶颈分析**: TG 占总时间 90%, 但 TG t/s 停在 ~28 t/s. 主要瓶颈:
+- AsStrided 44.8%: NZ 格式转换 + ACLNN runtime 内部, 无法从 backend 消除
+- MatMulV2 20.9%: 实际矩阵乘法
+- TransData 10.1%: NZ 格式转换
+- Cast 8.4%: F32/F16 类型转换 (matmul 输入输出, attention Q cast)
+- Host sync 42.1%: ACLNN runtime 内部同步
+ 
+这些瓶颈大多属于 CANN runtime / ACLNN 内部行为, 需要框架级改动
+(如 F16 全链路计算, 算子融合, ACL Graph) 才能进一步突破.
+ 
+**Git**: commit `1ec8e559c` on `codex/cann-optimize-310p`.
