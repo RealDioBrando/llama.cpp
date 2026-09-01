@@ -1075,6 +1075,51 @@ static void cann_copy(ggml_backend_cann_context & ctx, aclTensor * acl_src, aclT
     GGML_CANN_CALL_ACLNN_OP(ctx, InplaceCopy, acl_dst, acl_src);
 }
 
+// Try 2D memcpy for non-contiguous tensors with a single strided dimension.
+// Returns true if handled, false if caller should fall back.
+static bool cann_memcpy2d(ggml_backend_cann_context & ctx,
+                          const ggml_tensor * src, const ggml_tensor * dst) {
+    if (src->type != dst->type || src->data == dst->data) {
+        return src->data == dst->data;
+    }
+
+    size_t ts = ggml_type_size(src->type);
+    if (src->nb[0] != ts || dst->nb[0] != ts) return false;
+
+    // find innermost contiguous dims shared by src and dst
+    int cd = 1;
+    for (int i = 1; i < GGML_MAX_DIMS; i++) {
+        bool sc = (src->nb[i] == src->nb[i-1] * src->ne[i-1]);
+        bool dc = (dst->nb[i] == dst->nb[i-1] * dst->ne[i-1]);
+        if (sc && dc) cd = i + 1;
+        else break;
+    }
+    if (cd >= GGML_MAX_DIMS) return false; // fully contig, handled by caller
+
+    // width = contiguous block bytes
+    size_t width = ts;
+    for (int i = 0; i < cd; i++) width *= src->ne[i];
+
+    size_t spitch = src->nb[cd];
+    size_t dpitch = dst->nb[cd];
+
+    // remaining dims must be uniformly strided
+    for (int i = cd + 1; i < GGML_MAX_DIMS; i++) {
+        if (src->nb[i] != src->nb[i-1] * src->ne[i-1]) return false;
+        if (dst->nb[i] != dst->nb[i-1] * dst->ne[i-1]) return false;
+    }
+
+    size_t inner = 1;
+    for (int i = 0; i < cd; i++) inner *= src->ne[i];
+    size_t height = ggml_nelements(src) / inner;
+
+    if (spitch < width || dpitch < width || width == 0 || height == 0) return false;
+
+    ACL_CHECK(aclrtMemcpy2dAsync(dst->data, dpitch, src->data, spitch,
+                                 width, height, ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
+    return true;
+}
+
 void ggml_cann_dup(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * src0 = dst->src[0];
 
@@ -1082,7 +1127,19 @@ void ggml_cann_dup(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         acl_tensor_ptr acl_src = ggml_cann_create_tensor(src0);
         acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
         if (dst->type == src0->type) {
-            cann_copy(ctx, acl_src.get(), acl_dst.get());
+            bool src_contig = ggml_is_contiguous(src0);
+            bool dst_contig = ggml_is_contiguous(dst);
+            if (src_contig && dst_contig) {
+                size_t nbytes = ggml_nbytes(src0);
+                if (nbytes > 0 && src0->data != dst->data) {
+                    ACL_CHECK(aclrtMemcpyAsync(dst->data, nbytes, src0->data, nbytes,
+                                               ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
+                }
+            } else {
+                if (!cann_memcpy2d(ctx, src0, dst)) {
+                    cann_copy(ctx, acl_src.get(), acl_dst.get());
+                }
+            }
         } else {
             aclnn_cast(ctx, acl_src.get(), acl_dst.get(), ggml_cann_type_mapping(dst->type));
         }
@@ -2991,8 +3048,7 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
             (char *)input_roll_mul_scale_buffer + half_bytes, src_type, elem_size, half_ne, out_half_nb, GGML_MAX_DIMS);
 
         // out[0:d/2] = -input[d/2:d]
-        cann_copy(ctx, in_second.get(), out_first.get());
-        aclnn_muls(ctx, out_first.get(), -1.0f, nullptr, true);
+        aclnn_muls(ctx, in_second.get(), -1.0f, out_first.get(), false);
         // out[d/2:d] = input[0:d/2]
         cann_copy(ctx, in_first.get(), out_second.get());
     } else {
@@ -3019,8 +3075,7 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
             (char *)input_roll_mul_scale_buffer + elem_size, src_type, elem_size, half_ne, out_s2_nb, GGML_MAX_DIMS);
 
         // out[even] = -input[odd]
-        cann_copy(ctx, in_odd.get(), out_even.get());
-        aclnn_muls(ctx, out_even.get(), -1.0f, nullptr, true);
+        aclnn_muls(ctx, in_odd.get(), -1.0f, out_even.get(), false);
         // out[odd] = input[even]
         cann_copy(ctx, in_even.get(), out_odd.get());
     }
