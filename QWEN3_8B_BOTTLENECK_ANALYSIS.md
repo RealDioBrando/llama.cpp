@@ -548,3 +548,42 @@ V2 在同一台服务器上波动很大, 有多次掉到 8-9 t/s 的采样. 因�
 **风险**: 在 device 4 上 V5 曾触发一次 AICore exception, 但同一版本在
 device 5/6 上重复运行正常. 目前不能排除 device 4 本身状态或 V5 对某些
 芯片/固件组合的兼容性问题. 上游化之前需要在更多 310P3 设备上验证.
+
+### 8.9 OPT-8: 多 stream KV 连续写入 (2026-09-01)
+
+**发现**: `llama-batched-bench` 默认使用 non-unified KV cache
+(`kv_unified=false`). 此时 `sinfo.n_stream()` 等于并发 sequence 数,
+所以 8.6 节的单 stream 快路径在 10 并发基准里没有命中.
+
+**改动**: `src/llama-kv-cache.cpp` 增加多 stream 连续写入快路径.
+当所有 stream 的 slot 都连续且起始 cell 相同时, 把 K/V 写入合并成一个
+3D `CPY`:
+
+```text
+src: [n_embd_gqa, n_seq_tokens, n_stream]
+dst: [n_embd_gqa, n_seq_tokens, n_stream]
+```
+
+这覆盖了 non-unified KV cache 下最常见的 prefill/decode pattern.
+
+**decode 特例**: 最初也把 decode 交给这个 3D copy. 但 decode 时每个
+stream 只有 1 个 token, 变成大量小 strided copy, TG 反而下降. 因此
+快路径限定为 `sinfo.size() > 1`; decode 仍然走 `SET_ROWS`.
+
+**A/B 测试**:
+
+环境: Ascend 310P3 device 6, 容器 `z00575061-llama-bench-v2`, CANN 9.1.0.
+
+| 配置 | PP512 x10 | TG128 x10 |
+|------|-----------:|----------:|
+| fast path off | 247.50 / 382.65 t/s | 13.87 / 10.73 t/s |
+| fast path on  | 378.70 / 482.54 / 484.31 t/s | 10.23 / 22.49 / 23.06 t/s |
+
+第一次 fast path on 是未限定 decode 的版本, 所以 TG 掉到 10.23 t/s.
+限定 `sinfo.size() > 1` 后, 后两次稳定在 22.5-23.1 t/s.
+
+**结论**: 多 stream prefill 连续写入收益明显. PP 从约 248-383 t/s
+提升到约 483 t/s; TG 从约 10.7-13.9 t/s 提升到约 22.5-23.1 t/s.
+decode 阶段继续保留 scatter, 避免小拷贝退化.
+
+**功能验证**: `llama-cli` 使用 V5 + 多 stream 快路径生成正常文本.

@@ -17,6 +17,30 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+static bool kv_slots_contiguous_same_start(const llama_kv_cache::slot_info & sinfo, int64_t * start) {
+    if (sinfo.idxs.empty() || sinfo.idxs[0].empty()) {
+        return false;
+    }
+
+    const size_t n_tokens = sinfo.idxs[0].size();
+    const int64_t first   = sinfo.idxs[0][0];
+
+    for (const auto & idxs : sinfo.idxs) {
+        if (idxs.size() != n_tokens || idxs[0] != first) {
+            return false;
+        }
+
+        for (size_t i = 0; i < idxs.size(); ++i) {
+            if (idxs[i] != first + (int64_t) i) {
+                return false;
+            }
+        }
+    }
+
+    *start = first;
+    return true;
+}
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -1320,12 +1344,17 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
     // A contiguous slot range can use a plain strided copy. This avoids the
     // much more expensive index-copy kernel on backends such as CANN.
-    if (use_contiguous_cpy && sinfo.n_stream() == 1 && sinfo.is_contiguous()) {
-        const int64_t kv_size = get_size();
-        const int64_t offset  = (sinfo.strm[0]*kv_size + sinfo.idxs[0][0])*k->nb[1];
-        ggml_tensor * k_dst = ggml_view_2d(ctx, k, n_embd_gqa, n_tokens, k->nb[1], offset);
+    int64_t slot_start = 0;
+    if (use_contiguous_cpy && sinfo.size() > 1 && kv_slots_contiguous_same_start(sinfo, &slot_start)) {
+        const int64_t n_seq_tokens = sinfo.size();
+        const int64_t n_stream     = sinfo.n_stream();
 
-        return ggml_cpy(ctx, k_cur, k_dst);
+        ggml_tensor * k_dst = ggml_view_3d(ctx, k, n_embd_gqa, n_seq_tokens, n_stream,
+                                           k->nb[1], k->nb[2], slot_start*k->nb[1]);
+        ggml_tensor * k_src = ggml_view_3d(ctx, k_cur, n_embd_gqa, n_seq_tokens, n_stream,
+                                           k_cur->nb[1], k_cur->nb[1]*n_seq_tokens, 0);
+
+        return ggml_cpy(ctx, k_src, k_dst);
     }
 
     const int64_t n_stream = k->ne[2];
@@ -1345,8 +1374,6 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
-    GGML_UNUSED(sinfo);
-
     static bool use_contiguous_cpy = getenv("GGML_CANN_KV_CONTIGUOUS_CPY") == nullptr ||
                                      strcmp(getenv("GGML_CANN_KV_CONTIGUOUS_CPY"), "0") != 0;
 
@@ -1369,12 +1396,17 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     if (!v_trans) {
         v_cur = ggml_view_2d(ctx, v_cur, n_embd_gqa, n_tokens, v_cur->nb[2], 0);
 
-        if (use_contiguous_cpy && sinfo.n_stream() == 1 && sinfo.is_contiguous()) {
-            const int64_t kv_size = get_size();
-            const int64_t offset  = (sinfo.strm[0]*kv_size + sinfo.idxs[0][0])*v->nb[1];
-            ggml_tensor * v_dst = ggml_view_2d(ctx, v, n_embd_gqa, n_tokens, v->nb[1], offset);
+        int64_t slot_start = 0;
+        if (use_contiguous_cpy && sinfo.size() > 1 && kv_slots_contiguous_same_start(sinfo, &slot_start)) {
+            const int64_t n_seq_tokens = sinfo.size();
+            const int64_t n_stream     = sinfo.n_stream();
 
-            return ggml_cpy(ctx, v_cur, v_dst);
+            ggml_tensor * v_dst = ggml_view_3d(ctx, v, n_embd_gqa, n_seq_tokens, n_stream,
+                                               v->nb[1], v->nb[2], slot_start*v->nb[1]);
+            ggml_tensor * v_src = ggml_view_3d(ctx, v_cur, n_embd_gqa, n_seq_tokens, n_stream,
+                                               v_cur->nb[1], v_cur->nb[1]*n_seq_tokens, 0);
+
+            return ggml_cpy(ctx, v_src, v_dst);
         }
 
         if (n_stream > 1) {
