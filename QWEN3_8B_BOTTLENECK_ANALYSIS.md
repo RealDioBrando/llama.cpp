@@ -995,3 +995,52 @@ Softmax + Transpose (19.1% device). 这是 310P 与 910B/MindIE
 2. Attention 19.1% -- FA 不可用, 无法融合
 3. TransData 17.1% -- NZ 格式转换, 需框架级改动
 4. Host sync 97.2s -- ACL Graph 可消除, 但 310P 不支持
+
+### 8.13 OPT-10c/10d: RMS_NORM+MUL 融合 (2026-09-03)
+
+#### 优化内容
+
+发现 aclnnRmsNorm 的 gamma 参数当前填全 1, 但图里 RmsNorm 后总是
+跟着 ggml_mul(cur, mw) 应用权重. 将权重直接作为 gamma 传入可消除
+独立的 Mul 调用.
+
+实现了两种融合:
+1. **RMS_NORM + MUL(weight)**: 二路融合, 传入权重作为 gamma
+2. **ADD + RMS_NORM + MUL(weight)**: 三路融合, 在 AddRmsNorm 中
+   传入权重作为 gamma
+
+融合检查条件:
+- MUL 的某个 src 是 RMS_NORM 输出
+- 另一个 src 是 1D (ne[1]=ne[2]=ne[3]=1), 即 norm weight
+- weight 类型与 norm 输出类型一致
+
+#### 性能
+
+| 配置 | PP t/s | TG t/s | Total t/s |
+|---|---:|---:|---:|
+| baseline (OPT-10a) | 483.63 | 62.43 | 205.87 |
+| + RMS_NORM+MUL 融合 | 486.11 | 62.41 | 206.18 |
+
+TG 持平, PP +0.5%. 收益极小, 因为 Mul 本身很快 (avg 38us),
+消除的 ~145 次/step Mul 调用总共只省 ~1s.
+
+**Git**: commit `5544b98cf` on `codex/cann-optimize-310p`.
+
+#### 结论
+
+backend 层面的算子融合已接近极限. 已实现的融合:
+- ADD + RMS_NORM (二路, OPT-10a)
+- ADD + RMS_NORM + MUL (三路, OPT-10c)
+- RMS_NORM + MUL (二路, OPT-10c)
+
+剩余瓶颈无法从 backend 层面优化:
+- MatMul 32.5%: 核心计算
+- Attention 19.1%: FA 不可用 (310P CANN 无算子包)
+- TransData 17.1%: NZ 格式转换 (框架级)
+- Cast 9.3%: F32/F16 转换 (框架级)
+- RoPE 5 calls/invocation: 无 fused multiply-add 算子
+
+后续方向:
+1. 框架级: F16 全链路 (消除 Cast), KV cache NZ 格式 (消除 TransData)
+2. 硬件级: 910B + ACL Graph (消除 host sync + launch)
+3. 算子级: 自定义 fused QK+Softmax+AV kernel (替代 FA)
