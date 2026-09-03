@@ -2256,11 +2256,84 @@ static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
         return true;
     }
 
+    // CANN backend supports fusing RMS_NORM + MUL(weight) operations
+    if ((ops.size() == 2) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
+        if (node_idx + 2 > cgraph->n_nodes) {
+            return false;
+        }
+
+        ggml_tensor * norm_node = cgraph->nodes[node_idx];
+        ggml_tensor * mul_node  = cgraph->nodes[node_idx + 1];
+
+        if (norm_node->op != GGML_OP_RMS_NORM || mul_node->op != GGML_OP_MUL) {
+            return false;
+        }
+        if (!(norm_node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            !(mul_node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            return false;
+        }
+        // MUL must consume the RMS_NORM result
+        ggml_tensor * mw = nullptr;
+        if (mul_node->src[0] == norm_node) {
+            mw = mul_node->src[1];
+        } else if (mul_node->src[1] == norm_node) {
+            mw = mul_node->src[0];
+        } else {
+            return false;
+        }
+        // weight must be 1D (broadcast along ne[0])
+        if (mw->ne[1] != 1 || mw->ne[2] != 1 || mw->ne[3] != 1) {
+            return false;
+        }
+        if (mw->ne[0] != norm_node->ne[0]) {
+            return false;
+        }
+        // weight type must match norm output type
+        if (mw->type != norm_node->type) {
+            return false;
+        }
+        return true;
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }
 
     return false;
+}
+
+// Check if node after RMS_NORM is a MUL with norm weight (for three-way fusion)
+static bool cann_can_fuse_norm_mul(const struct ggml_cgraph * cgraph, int norm_idx) {
+    if (norm_idx + 2 > cgraph->n_nodes) {
+        return false;
+    }
+    ggml_tensor * norm_node = cgraph->nodes[norm_idx];
+    ggml_tensor * mul_node  = cgraph->nodes[norm_idx + 1];
+    if (norm_node->op != GGML_OP_RMS_NORM || mul_node->op != GGML_OP_MUL) {
+        return false;
+    }
+    if (!(norm_node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+        !(mul_node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        return false;
+    }
+    ggml_tensor * mw = nullptr;
+    if (mul_node->src[0] == norm_node) {
+        mw = mul_node->src[1];
+    } else if (mul_node->src[1] == norm_node) {
+        mw = mul_node->src[0];
+    } else {
+        return false;
+    }
+    if (mw->ne[1] != 1 || mw->ne[2] != 1 || mw->ne[3] != 1) {
+        return false;
+    }
+    if (mw->ne[0] != norm_node->ne[0]) {
+        return false;
+    }
+    if (mw->type != norm_node->type) {
+        return false;
+    }
+    return true;
 }
 
 /**
@@ -2293,8 +2366,22 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
             if (opt_fusion) {
+                // Three-way: ADD + RMS_NORM + MUL(weight)
+                if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM }) &&
+                    cann_can_fuse_norm_mul(cgraph, i + 1)) {
+                    ggml_cann_op_add_rms_norm_mul_fused(*cann_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+                    i += 2;
+                    continue;
+                }
+                // Two-way: ADD + RMS_NORM
                 if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM })) {
                     ggml_cann_op_add_rms_norm_fused(*cann_ctx, node, cgraph->nodes[i + 1]);
+                    i++;
+                    continue;
+                }
+                // Two-way: RMS_NORM + MUL(weight)
+                if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+                    ggml_cann_op_rms_norm_mul_fused(*cann_ctx, node, cgraph->nodes[i + 1]);
                     i++;
                     continue;
                 }

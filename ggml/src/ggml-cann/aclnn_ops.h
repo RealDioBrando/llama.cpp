@@ -975,6 +975,18 @@ void ggml_cann_op_add_rms_norm_fused(ggml_backend_cann_context & ctx,
                                      ggml_tensor *               add_node,
                                      ggml_tensor *               rms_norm_node);
 
+// Fused RMS_NORM + MUL(weight): passes norm weight as gamma to aclnnRmsNorm,
+// eliminating a separate Mul kernel launch.
+void ggml_cann_op_rms_norm_mul_fused(ggml_backend_cann_context & ctx,
+                                     ggml_tensor *               rms_norm_node,
+                                     ggml_tensor *               mul_node);
+
+// Fused ADD + RMS_NORM + MUL(weight): passes norm weight as gamma to aclnnAddRmsNorm.
+void ggml_cann_op_add_rms_norm_mul_fused(ggml_backend_cann_context & ctx,
+                                         ggml_tensor *               add_node,
+                                         ggml_tensor *               rms_norm_node,
+                                         ggml_tensor *               mul_node);
+
 /**
  * @brief   Check whether a tensor is a weight tensor for matrix multiplication.
  *

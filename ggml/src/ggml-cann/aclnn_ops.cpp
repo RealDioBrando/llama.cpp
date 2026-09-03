@@ -4436,6 +4436,91 @@ void ggml_cann_op_add_rms_norm_fused(ggml_backend_cann_context & ctx,
                             acl_yout.get(), acl_rstd.get(), acl_xout.get());
 }
 
+// Helper: find the weight tensor in a MUL node (the 1D broadcast src)
+static ggml_tensor * get_mul_weight(ggml_tensor * mul_node, ggml_tensor * norm_node) {
+    if (mul_node->src[0] == norm_node) {
+        return mul_node->src[1];
+    }
+    return mul_node->src[0];
+}
+
+void ggml_cann_op_rms_norm_mul_fused(ggml_backend_cann_context & ctx,
+                                     ggml_tensor *               rms_norm_node,
+                                     ggml_tensor *               mul_node) {
+    ggml_tensor * src = rms_norm_node->src[0];
+    ggml_tensor * mw  = get_mul_weight(mul_node, rms_norm_node);
+
+    acl_tensor_ptr acl_src = ggml_cann_create_tensor(src);
+    // output goes to mul_node's buffer since rms_norm output has single use
+    acl_tensor_ptr acl_dst = ggml_cann_create_tensor(mul_node);
+
+    float eps;
+    memcpy(&eps, rms_norm_node->op_params, sizeof(float));
+
+    // use actual norm weight as gamma instead of all-ones
+    size_t acl_gamma_nb[GGML_MAX_DIMS];
+    acl_gamma_nb[0] = ggml_type_size(mw->type);
+    for (int i = 1; i < GGML_MAX_DIMS; i++) {
+        acl_gamma_nb[i] = acl_gamma_nb[i - 1] * mw->ne[i - 1];
+    }
+    acl_tensor_ptr acl_gamma = ggml_cann_create_tensor(mw, mw->ne, acl_gamma_nb, 1);
+
+    int64_t acl_rstd_ne[] = { 1, src->ne[1], src->ne[2], src->ne[3] };
+    size_t  acl_rstd_nb[GGML_MAX_DIMS - 1];
+    acl_rstd_nb[0] = sizeof(float);
+    for (int i = 1; i < GGML_MAX_DIMS - 1; i++) {
+        acl_rstd_nb[i] = acl_rstd_nb[i - 1] * acl_rstd_ne[i - 1];
+    }
+    acl_tensor_ptr acl_rstd =
+        get_cache_acl_tensor(ctx, &ctx.rms_norm_zero_tensor_cache.cache,
+                             ctx.rms_norm_zero_tensor_cache.size,
+                             acl_rstd_ne, acl_rstd_nb, GGML_TYPE_F32, GGML_MAX_DIMS, 0.0f);
+
+    GGML_CANN_CALL_ACLNN_OP(ctx, RmsNorm, acl_src.get(), acl_gamma.get(),
+                            eps, acl_dst.get(), acl_rstd.get());
+}
+
+void ggml_cann_op_add_rms_norm_mul_fused(ggml_backend_cann_context & ctx,
+                                         ggml_tensor *               add_node,
+                                         ggml_tensor *               rms_norm_node,
+                                         ggml_tensor *               mul_node) {
+    ggml_tensor * x1  = add_node->src[0];
+    ggml_tensor * x2  = add_node->src[1];
+    ggml_tensor * mw  = get_mul_weight(mul_node, rms_norm_node);
+
+    acl_tensor_ptr acl_x1 = ggml_cann_create_tensor(x1);
+    acl_tensor_ptr acl_x2 = ggml_cann_create_tensor(x2);
+
+    float eps;
+    memcpy(&eps, rms_norm_node->op_params, sizeof(float));
+
+    // use actual norm weight as gamma
+    size_t acl_gamma_nb[GGML_MAX_DIMS];
+    acl_gamma_nb[0] = ggml_type_size(mw->type);
+    for (int i = 1; i < GGML_MAX_DIMS; i++) {
+        acl_gamma_nb[i] = acl_gamma_nb[i - 1] * mw->ne[i - 1];
+    }
+    acl_tensor_ptr acl_gamma = ggml_cann_create_tensor(mw, mw->ne, acl_gamma_nb, 1);
+
+    int64_t acl_rstd_ne[] = { 1, x1->ne[1], x1->ne[2], x1->ne[3] };
+    size_t  acl_rstd_nb[GGML_MAX_DIMS - 1];
+    acl_rstd_nb[0] = sizeof(float);
+    for (int i = 1; i < GGML_MAX_DIMS - 1; i++) {
+        acl_rstd_nb[i] = acl_rstd_nb[i - 1] * acl_rstd_ne[i - 1];
+    }
+    acl_tensor_ptr acl_rstd =
+        get_cache_acl_tensor(ctx, &ctx.rms_norm_zero_tensor_cache.cache,
+                             ctx.rms_norm_zero_tensor_cache.size,
+                             acl_rstd_ne, acl_rstd_nb, GGML_TYPE_F32, GGML_MAX_DIMS, 0.0f);
+
+    acl_tensor_ptr acl_xout = ggml_cann_create_tensor(add_node);
+    // yout goes to mul_node's buffer
+    acl_tensor_ptr acl_yout = ggml_cann_create_tensor(mul_node);
+
+    GGML_CANN_CALL_ACLNN_OP(ctx, AddRmsNorm, acl_x1.get(), acl_x2.get(), acl_gamma.get(),
+                            eps, acl_yout.get(), acl_rstd.get(), acl_xout.get());
+}
+
 void ggml_cann_gated_linear_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * k = dst->src[0];
     ggml_tensor * v = dst->src[1];
@@ -4498,9 +4583,8 @@ void ggml_cann_gated_linear_attn(ggml_backend_cann_context & ctx, ggml_tensor * 
                 aclnn_add(ctx, acl_s_new.get(), tmp_tensor.get(), nullptr);
                 // compute output
                 GGML_CANN_CALL_ACLNN_OP(ctx, Mv, acl_s_new_t.get(), acl_q.get(), acl_o.get(), 1);
-                aclnn_muls(ctx, acl_o.get(), scale, nullptr, true);
-            }
-        }
-    }
+               aclnn_muls(ctx, acl_o.get(), scale, nullptr, true);
+           }
+       }
+   }
 }
-
