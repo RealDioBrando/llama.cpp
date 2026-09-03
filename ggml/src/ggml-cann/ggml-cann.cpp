@@ -2660,9 +2660,63 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                float maxBias      = 0.0f;
+                float logitSoftcap = 0.0f;
+                memcpy(&maxBias, (const float *) (op->op_params) + 1, sizeof(float));
+                memcpy(&logitSoftcap, (const float *) (op->op_params) + 2, sizeof(float));
+                if (logitSoftcap != 0.0f) {
+                    return false;
+                }
 #ifdef ASCEND_310P
-                // FA not support on 310p device
-                return false;
+                // 310P uses aclnnPromptFlashAttentionV3 (prefill) / aclnnIncreFlashAttentionV4 (decode)
+                if (op->src[0]->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                // the implementation relies on the additive f16 mask
+                if (op->src[3] == nullptr || op->src[3]->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                // alibi bias cannot be fused on 310P (PFA rejects pseShift)
+                if (maxBias != 0.0f) {
+                    return false;
+                }
+                {
+                    const int64_t D  = op->src[0]->ne[0];
+                    const int64_t N  = op->src[0]->ne[2];
+                    const int64_t Nk = op->src[1]->ne[2];
+                    if (D > 512 || D % 16 != 0) {
+                        return false;
+                    }
+                    if (Nk > N || N % Nk != 0 || N / Nk > 64) {
+                        return false;
+                    }
+                    const int64_t q_len = op->src[0]->ne[1];
+                    const int64_t B     = op->src[0]->ne[3];
+                    const int64_t K     = op->src[1]->ne[1];
+                    if (K > 65536) {
+                        return false;
+                    }
+                    if (q_len == 1) {
+                        // decode: IncreFlashAttentionV4 supports batch >= 1
+                        if (B > 256) {
+                            return false;
+                        }
+                    } else {
+                        // prefill: PromptFlashAttentionV3 path only handles a single stream
+                        if (B != 1) {
+                            return false;
+                        }
+                        if (K % 16 != 0) {
+                            return false;
+                        }
+                        // actQ must stay in the verified set {K/2, K}; cap the compute waste
+                        const int64_t act_q = (2 * q_len <= K) ? K / 2 : K;
+                        if (act_q > 4 * q_len) {
+                            return false;
+                        }
+                    }
+                }
+                return true;
 #endif
                 // derived from [ggml-cuda.cu]
                 if (op->src[1]->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_F16) {
@@ -2681,11 +2735,6 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 }
                 if (op->src[1]->ne[0] != op->src[2]->ne[0]) {
                     // different head sizes of K and V are not supported yet
-                    return false;
-                }
-                float logitSoftcap = 0.0f;
-                memcpy(&logitSoftcap, (const float *) (op->op_params) + 2, sizeof(float));
-                if (logitSoftcap != 0.0f) {
                     return false;
                 }
                 return true;
