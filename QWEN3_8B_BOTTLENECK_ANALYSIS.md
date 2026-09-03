@@ -647,3 +647,351 @@ matmul 和 ACLNN runtime 内部 AsStrided.
 (如 F16 全链路计算, 算子融合, ACL Graph) 才能进一步突破.
  
 **Git**: commit `1ec8e559c` on `codex/cann-optimize-310p`.
+
+### 8.11 OPT-10: 后续优化方向分析 (2026-09-03, 基于 unified KV cache)
+
+> **注意**: 本节基于 unified KV cache 模式 (`-fa auto -kvu`) 的 profiling
+> 数据, 这是推荐的运行模式. non-unified 模式的分析见 8.10 节.
+
+#### 8.11.0 性能基线
+
+环境: Ascend 310P3 device 2, CANN 9.1.0, qwen3-8b-f16.gguf, 10 并发.
+
+| 模式 | PP t/s | TG t/s | Total t/s | FA 状态 |
+|---|---:|---:|---:|---|
+| non-unified (`-fa on`) | 987 | 28 | 126 | FA on |
+| unified (`-fa auto -kvu`) | 484 | 62 | 206 | auto -> disabled |
+
+unified 模式 TG 提升 2.2x (62 vs 28), 但 PP 下降 (484 vs 987).
+原因是 unified 模式 n_stream=1, prefill 无法并行处理多请求,
+但 TG 消除了 AsStrided 瓶颈, 整体吞吐提升 63%.
+
+#### 8.11.1 Device 侧瓶颈 (unified, 总 6487ms, 88412 ops)
+
+| Op | 次数 | 总耗时(ms) | 占比 | 说明 |
+|---|---:|---:|---:|---|
+| MatMulV2 | 7110 | 2107 | 32.5% | 核心矩阵乘法 (QK, AV, FFN) |
+| TransData | 20374 | 1110 | 17.1% | ND<->NZ 格式转换 |
+| Cast | 18478 | 602 | 9.3% | F32<->F16 (matmul 输入输出) |
+| Mul | 12353 | 475 | 7.3% | element-wise (RoPE, attention scale) |
+| BatchMatMulV2 | 2029 | 474 | 7.3% | attention QK matmul |
+| SoftmaxV2 | 1854 | 382 | 5.9% | attention softmax (无 FA 融合) |
+| Transpose | 4076 | 381 | 5.9% | attention KV 转置 |
+| Add | 5093 | 264 | 4.1% | 残差连接 |
+| RmsNorm | 4071 | 220 | 3.4% | 独立 RmsNorm (融合未生效) |
+| MemSet | 2031 | 130 | 2.0% | BatchMatMul 输出清零 |
+| ViewCopy | 4071 | 97 | 1.5% | KV cache copy |
+| AsStrided | 4053 | 95 | 1.5% | 非连续访问 (已大幅降低) |
+| Swish (Silu) | 1077 | 87 | 1.3% | SwiGLU fallback |
+
+非计算开销 (TransData + Cast + Mul + Transpose + Softmax + AsStrided +
+ViewCopy + MemSet) 占 ~50%, 与 matmul (32.5% + 7.3% = 39.8%) 接近.
+
+#### 8.11.2 non-unified vs unified 对比
+
+| Op | non-unified 占比 | unified 占比 | 变化 |
+|---|---:|---:|---|
+| MatMulV2 | 17.8% | 32.5% | +14.7% (成为主导) |
+| TransData | 19.3% | 17.1% | -2.2% |
+| Cast | 19.9% | 9.3% | -10.6% |
+| AsStrided | 44.8% | 1.5% | -43.3% (消除!) |
+| BatchMatMulV2 | 0% | 7.3% | 新增 (attention 拆分) |
+| SoftmaxV2 | 0% | 5.9% | 新增 (attention 拆分) |
+| Transpose | 0% | 5.9% | 新增 (attention 拆分) |
+| device 总耗时 | ~10.2s | ~6.5s | -36% |
+
+non-unified 模式下 attention 被 FA 融合为单算子, AsStrided 占 44.8%.
+unified 模式 FA 被禁用 (310P auto->disabled), attention 拆分为
+BatchMatMul + Softmax + Transpose, 但 AsStrided 消除, 总体更快.
+
+#### 8.11.3 关键发现: ADD+RMS_NORM 融合完全失效
+
+profiling 显示 0 次 aclnnAddRmsNorm (融合), 4071 次独立 RmsNorm.
+融合率 0%.
+
+根因: ggml_cann_can_fuse() 要求 ADD 和 RMS_NORM 在图节点数组中严格
+相邻 (nodes[i]=ADD, nodes[i+1]=RMS_NORM). 但图构建器在两者之间
+插入了 VIEW/RESHAPE/NONE 等 no-op 节点, 导致邻接检查失败.
+
+#### 8.11.4 关键发现: SwiGLU 快路径未命中
+
+Qwen3 使用 ggml_swiglu_split (parallel gate, 两个独立 tensor),
+导致 aclnnSwiGlu 快路径条件 dst->src[1]==nullptr 不满足,
+回退到独立 Silu + InplaceMul (2 次 kernel launch).
+
+profiling: 1077 次 Swish (Silu) + 对应 InplaceMul, 0 次 SwiGlu.
+
+#### 8.11.5 可行优化方向 (unified 模式)
+
+**OPT-10a: 修复 ADD+RMS_NORM 融合邻接检查 (EASY, P0)**
+
+修复融合检查逻辑, 跳过 no-op 节点 (VIEW/RESHAPE/TRANSPOSE/PERMUTE/NONE).
+预期: 4071 次独立 RmsNorm + 4071 次独立 Add -> ~2000 次融合调用.
+节省: ~0.5s host API + ~200ms device.
+
+**OPT-10b: Attention 算子融合 (MEDIUM, P0)**
+
+unified 模式下 attention 拆分为 BatchMatMul(7.3%) + Softmax(5.9%) +
+Transpose(5.9%) = 19.1%, 共 7959 次调用. 可用 aclnnFusedInferAttentionScore
+融合 (V5 已接入但 unified 模式下 FA 被 disable).
+排查 unified 模式下 FA 被 disable 的原因, 或实现手动 QK+Softmax+AV 融合.
+节省: ~800ms device + ~2s host API.
+
+**OPT-10c: Workspace Size 缓存 (MEDIUM, P1)**
+
+ACLNN 两段式调用每次都调 GetWorkspaceSize. 缓存 (op_type, shape) ->
+workspaceSize 可省 ~30% host API 开销.
+节省: ~2-3s host.
+
+**OPT-10d: SwiGLU split 融合 (EASY, P2)**
+
+为 split 输入 (src[1]!=nullptr) 实现融合路径, 用 aclnnSiluMul 或
+手动合并 Silu + InplaceMul 为单次 stream 提交.
+节省: ~50ms device + ~50ms host.
+
+**OPT-10e: TransData 优化 (HARD, P2)**
+
+TransData 17.1% (1110ms), 主要是:
+- matmul 输入 ND->NZ: shape "10,4096" 5310 次, 136ms
+- attention KV ND->NZ: shape "1,8,1,128,XXXX" ~1500 次, ~220ms
+- matmul 输出 NZ->ND: ~2700 次, ~71ms
+
+框架级改动: KV cache 直接存 NZ 格式, 或 hidden states 用 F16 (减少 Cast).
+节省: ~500ms device (框架级改动).
+
+**OPT-10f: F16 全链路 (HARD, P3)**
+
+Cast 9.3% (602ms), 根因: 框架用 F32 hidden states, matmul 需 F16 输入.
+改为 F16 全链路可消除大部分 Cast, 但影响精度.
+节省: ~400ms device (框架级改动).
+
+**OPT-10g: ACL Graph (N/A on 310P)**
+
+310P 硬件不支持. 可消除 host API + launch + sync 开销.
+需升级 910B.
+
+#### 8.11.6 优化优先级矩阵 (unified 模式)
+
+| 优化 | 难度 | 预期收益 | 优先级 |
+|---|---|---|---|
+| OPT-10a: 融合邻接修复 | Easy | ~0.7s | P0 |
+| OPT-10b: Attention 融合 | Medium | ~2.8s | P0 |
+| OPT-10c: WS 缓存 | Medium | ~2-3s | P1 |
+| OPT-10d: SwiGLU split | Easy | ~0.1s | P2 |
+| OPT-10e: TransData 优化 | Hard | ~0.5s | P2 |
+| OPT-10f: F16 全链路 | Hard | ~0.4s | P3 |
+| OPT-10g: ACL Graph | N/A | ~10s+ | N/A (310P) |
+
+#### 8.11.7 结论
+
+1. unified 模式下 MatMulV2 (32.5%) 是主导瓶颈, 其次是 attention
+   拆分算子 (19.1%) 和 TransData (17.1%).
+
+2. AsStrided 从 44.8% 降到 1.5%, unified KV cache 消除了最大瓶颈.
+   后续优化重点转向 attention 融合和格式转换.
+
+3. ADD+RMS_NORM 融合完全失效 (0%), 是最易修复的 P0 项.
+
+4. attention 拆分 (BatchMatMul + Softmax + Transpose = 19.1%) 是
+   unified 模式的新瓶颈. FA V5 已接入但 unified 模式下被 disable,
+   需排查原因或实现手动融合.
+
+5. backend 层面可优化 ~3.5s (OPT-10a + 10b + 10c), 相对于 6.5s
+   device 总耗时, 收益约 50%. 突破需框架级改动或 910B.
+
+6. ACL Graph 仍是终极优化, 310P 不支持, 这是与 MindIE/910B
+   性能差距的根本原因.
+
+### 8.11 OPT-10: 后续优化方向分析 (2026-09-03)
+
+基于 non-unified `-fa on` 模式的完整 host+device profiling 数据
+(`msprof_10c/`), 分析剩余优化方向.
+
+#### 8.11.1 Host 侧瓶颈 (主导)
+
+| Host API | 调用次数 | 总耗时 | 均值(us) | 说明 |
+|---|---:|---:|---:|---|
+| aclrtSynchronizeStream | 32628 | 97.2s | 2980 | host 等待 device, 含设备执行时间 |
+| aclrtMemcpy | 25790 | 27.1s | 1052 | 内存拷贝 (含 H2D/D2D) |
+| aclrtSetDevice | 6247 | 11.6s | 1861 | 设备切换, 方差极大 |
+| aclnnMm (host) | 35135 | 2.0s | 58 | matmul host API 开销 |
+| aclrtLaunchKernelWithHostArgs | 387116 | 2.4s | 6.3 | kernel launch 开销 |
+| aclnnRmsNorm + GetWorkspaceSize | 20008 | 1.0s | 50 | RmsNorm host 开销 |
+| aclnnInplaceIndexCopy + GetWS | 9216 | 0.9s | 98 | KV cache index copy |
+| aclnnInplaceCopy + GetWS | 20016 | 0.4s | 23 | tensor copy |
+| aclnnSilu + GetWorkspaceSize | 4996 | 0.2s | 44 | SwiGLU fallback |
+| aclnnMul + GetWorkspaceSize | 25143 | 0.5s | 21 | element-wise mul |
+| aclnnCast + GetWorkspaceSize | 10008 | 0.2s | 15 | type cast |
+| aclnnAdd + GetWorkspaceSize | 19869 | 0.3s | 16 | element-wise add |
+
+host 侧总 API 开销 (不含 sync 等待): ~8s. GetWorkspaceSize 占 ~30%,
+是 ACLNN 两段式调用 (GetWorkspaceSize + Execute) 的固有开销.
+
+#### 8.11.2 Device 侧瓶颈
+
+| Op | 次数 | 总耗时(ms) | 占比 | 说明 |
+|---|---:|---:|---:|---|
+| RmsNorm | 1668 | 2285 | 22.4% | 含未融合的独立 RmsNorm |
+| Cast | 7089 | 2026 | 19.9% | F32<->F16 (matmul 输入输出) |
+| TransData | 5859 | 1969 | 19.3% | ND<->NZ 格式转换 |
+| MatMulV2 | 2919 | 1815 | 17.8% | 核心矩阵乘法 |
+| Mul | 5004 | 1111 | 10.9% | element-wise (RoPE, attention) |
+| Cos | 417 | 282 | 2.8% | RoPE |
+| Add | 1668 | 194 | 1.9% | 残差连接 |
+| ViewCopy | 2562 | 161 | 1.6% | KV cache copy |
+| AsStrided | 2502 | 117 | 1.1% | 非连续访问 (已优化) |
+| Swish (Silu) | 417 | 47 | 0.5% | SwiGLU fallback |
+
+device 侧总耗时 ~10.2s. 非计算开销 (Cast + TransData + Mul + Cos +
+ViewCopy + AsStrided) 占 ~55%, 超过 matmul 本身 (17.8%).
+
+#### 8.11.3 关键发现: ADD+RMS_NORM 融合率极低
+
+profiling 显示仅 139 次 aclnnAddRmsNorm (融合), 而独立 aclnnRmsNorm
+有 20008 次. 融合率仅 0.7%.
+
+根因: ggml_cann_can_fuse() 要求 ADD 和 RMS_NORM 在图节点数组中严格
+相邻 (nodes[i]=ADD, nodes[i+1]=RMS_NORM). 但图构建器可能在两者之间
+插入 VIEW/RESHAPE/NONE 等无计算节点, 导致邻接检查失败.
+
+修复方向: 融合检查时跳过 no-op 节点, 查找下一个实际计算节点.
+
+#### 8.11.4 关键发现: SwiGLU 快路径未命中
+
+Qwen3 使用 ggml_swiglu_split (parallel gate, 两个独立 tensor),
+导致 aclnnSwiGlu 快路径条件 dst->src[1]==nullptr 不满足,
+回退到独立 Silu + InplaceMul (2 次 kernel launch).
+
+profiling 确认: 417 次 Swish (Silu) + 对应 InplaceMul, 0 次 SwiGlu.
+
+#### 8.11.5 可行优化方向
+
+**OPT-10a: 修复 ADD+RMS_NORM 融合邻接检查 (EASY, P0)**
+
+修复融合检查逻辑, 跳过 no-op 节点. 预期减少 1600+ 次独立调用,
+节省 ~0.7s.
+
+**OPT-10b: Workspace Size 缓存 (MEDIUM, P0)**
+
+缓存 (op_type, shape) -> workspaceSize, 避免重复 GetWorkspaceSize.
+预期节省 host 侧 ~2-3s.
+
+**OPT-10c: aclrtSetDevice 缓存修复 (EASY, P1)**
+
+g_current_cann_device 是 thread_local, 但 6247 次调用说明缓存失效.
+需排查重置路径. 预期节省 ~2-5s.
+
+**OPT-10d: aclrtMemcpy 来源排查 (INVESTIGATE, P1)**
+
+25790 次 memcpy 耗时 27.1s. 需排查来源 (KV cache, 框架传输, 权重).
+预期节省 ~5-10s.
+
+**OPT-10e: SwiGLU split 融合 (EASY, P2)**
+
+为 split 输入实现融合路径. 预期节省 ~0.1s.
+
+**OPT-10f: 更多算子融合 (MEDIUM, P2)**
+
+Mul+Add, RoPE Cos/Sin+Mul 等. 预期节省 ~0.5-1s.
+
+**OPT-10g: F16 全链路 (HARD, P3)**
+
+消除 Cast (19.9% device). 框架级改动, 影响精度.
+
+**OPT-10h: ACL Graph (N/A on 310P)**
+
+310P 硬件不支持. 需升级 910B. 可消除 ~10s+ host 开销.
+
+#### 8.11.6 优化优先级矩阵
+
+| 优化 | 难度 | 预期收益 | 优先级 |
+|---|---|---|---|
+| OPT-10a: 融合邻接修复 | Easy | ~0.7s | P0 |
+| OPT-10b: WS 缓存 | Medium | ~2-3s | P0 |
+| OPT-10c: SetDevice 缓存 | Easy | ~2-5s | P1 |
+| OPT-10d: Memcpy 排查 | Investigate | ~5-10s | P1 |
+| OPT-10e: SwiGLU split | Easy | ~0.1s | P2 |
+| OPT-10f: 更多融合 | Medium | ~0.5-1s | P2 |
+| OPT-10g: F16 全链路 | Hard | ~2s | P3 |
+| OPT-10h: ACL Graph | N/A | ~10s+ | N/A (310P) |
+
+#### 8.11.7 结论
+
+1. host 侧 ACLNN API 开销 ~8s (不含 sync 等待), device 执行 ~10s.
+   aclrtSynchronizeStream 97.2s 表明 host 大部分时间在等待 device.
+
+2. 非计算开销占 device 侧 55% (Cast + TransData + Mul), 超过 matmul.
+   这是框架设计 (F32 链路, ND 格式) 与 CANN 硬件 (NZ, F16) 不匹配导致.
+
+3. backend 层面可优化 ~3-4s (OPT-10a~10c), 相对于总开销收益有限.
+   真正突破需框架级改动 (F16 链路, ACL Graph) 或硬件升级 (910B).
+
+4. ACL Graph 是终极优化, 可消除 host API + launch + sync 开销,
+   但 310P 不支持, 这是 310P 与 MindIE/910B 性能差距的根本原因.
+
+### 8.12 OPT-10a/10b 实施结果 (2026-09-03)
+
+#### OPT-10a: ADD+RMS_NORM 融合修复 -- 已实施, 已提交
+
+**根因**: ggml_can_fuse() 要求非末尾节点只有 1 个使用者. 但 transformer
+残差 ADD (ffn_inp = add(attn_out, inpSA)) 被引用 2 次:
+1. RMS_NORM(ffn_inp) -- 归一化
+2. add(ffn_out, ffn_inp) -- 二次残差
+单引用检查失败, 融合率 0%.
+
+**修复**: 在 ggml_cann_can_fuse() 中, 对 ADD+RMS_NORM 模式绕过
+ggml_can_fuse(), 改为自定义检查:
+- 节点邻接且 op 类型匹配
+- COMPUTE flag 设置
+- RMS_NORM src[0] == ADD 节点
+- 无 broadcast
+aclnnAddRmsNorm 同时写出 ADD 结果和 RMS_NORM 结果, 多使用者安全.
+
+**验证**: profiling 确认 AddRmsNorm 调用从 0 -> 2502 次,
+融合率 0% -> 45%. 剩余 3058 次独立 RmsNorm 是 attn_norm/Q_norm/
+K_norm (前面没有 ADD, 无法融合).
+
+**性能**: TG 62.34 -> 62.43 t/s (+0.1%). 收益极小, 因为
+RmsNorm+Add 仅占 device 7.5%, 减少的调用对 31s 总时间只省 ~0.5%.
+
+**Git**: commit `0400a0095` on `codex/cann-optimize-310p`.
+
+#### OPT-10b: 310P 启用 FA -- 不可行, 已回退
+
+**尝试**: 移除 supports_op 中 310P 的 FA 硬编码禁用, 测试
+aclnnFusedInferAttentionScoreV5 和 V2.
+
+**结果**: 两者均失败:
+```
+Execution_Error(EZ1009): SoC version ascend310p verification failed.
+This SoC is not configured through the AddConfig API of the OpDef class.
+```
+CANN 9.1.0 toolkit 没有为 310P 编译 FusedInferAttentionScore 算子包.
+这是工具链限制, 非代码问题. 910B 有对应的算子包.
+
+**结论**: 310P 无法使用 FA, attention 只能拆分为 BatchMatMul +
+Softmax + Transpose (19.1% device). 这是 310P 与 910B/MindIE
+性能差距的重要原因之一.
+
+**回退**: 保留 310P 的 FA 禁用, 注释更新为说明原因.
+
+#### 后续优化方向更新
+
+基于 P0-1/P0-2 结果, 优化优先级调整:
+
+| 优化 | 状态 | 难度 | 收益 | 说明 |
+|---|---|---|---|---|
+| OPT-10a: 融合邻接修复 | 已完成 | Easy | ~0.1% | 融合率 0->45%, 收益小 |
+| OPT-10b: 310P FA | 不可行 | N/A | N/A | CANN toolkit 无算子包 |
+| OPT-10c: WS 缓存 | 待实施 | Medium | ~2-3s host | 缓存 GetWorkspaceSize |
+| OPT-10d: SwiGLU split | 待实施 | Easy | ~0.1s | 为 split 输入实现融合 |
+| OPT-10e: TransData 优化 | 待实施 | Hard | ~0.5s | KV cache NZ 格式 |
+| OPT-10f: F16 全链路 | 待实施 | Hard | ~0.4s | 框架级改动 |
+| OPT-10g: ACL Graph | N/A | N/A | ~10s+ | 310P 不支持 |
+
+关键结论: backend 层面剩余可优化空间有限 (WS 缓存 + SwiGLU ~2-3s).
+真正的瓶颈在:
+1. MatMul 32.5% -- 核心计算, 难以从 backend 优化
+2. Attention 19.1% -- FA 不可用, 无法融合
+3. TransData 17.1% -- NZ 格式转换, 需框架级改动
+4. Host sync 97.2s -- ACL Graph 可消除, 但 310P 不支持
