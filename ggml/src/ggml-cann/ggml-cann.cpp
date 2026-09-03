@@ -2224,19 +2224,40 @@ static void ggml_backend_cann_synchronize(ggml_backend_t backend) {
 static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
                                int                                 node_idx,
                                std::initializer_list<enum ggml_op> ops) {
-    if (!ggml_can_fuse(cgraph, node_idx, ops)) {
-        return false;
-    }
-
     // CANN backend supports fusing ADD + RMS_NORM operations
     if ((ops.size() == 2) && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_RMS_NORM) {
-        ggml_tensor * add_node = cgraph->nodes[node_idx];
+        // Bypass ggml_can_fuse() which requires single-use on ADD.
+        // aclnnAddRmsNorm writes both ADD result and RMS_NORM result,
+        // so fusing is safe even when ADD has multiple consumers
+        // (e.g. residual connection used by both norm and next ADD).
+        if (node_idx + 2 > cgraph->n_nodes) {
+            return false;
+        }
+
+        ggml_tensor * add_node  = cgraph->nodes[node_idx];
+        ggml_tensor * norm_node = cgraph->nodes[node_idx + 1];
+
+        if (add_node->op != GGML_OP_ADD || norm_node->op != GGML_OP_RMS_NORM) {
+            return false;
+        }
+        if (!(add_node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            !(norm_node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            return false;
+        }
+        // RMS_NORM must consume the ADD result
+        if (norm_node->src[0] != add_node) {
+            return false;
+        }
         // TODO: support broadcast for ADD + RMS_NORM
         if (add_node->src[0]->ne[0] != add_node->src[1]->ne[0] || add_node->src[0]->ne[1] != add_node->src[1]->ne[1] ||
             add_node->src[0]->ne[2] != add_node->src[1]->ne[2] || add_node->src[0]->ne[3] != add_node->src[1]->ne[3]) {
             return false;
         }
         return true;
+    }
+
+    if (!ggml_can_fuse(cgraph, node_idx, ops)) {
+        return false;
     }
 
     return false;
@@ -2651,10 +2672,10 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 return false;
             }
             return true;
-        case GGML_OP_FLASH_ATTN_EXT:
+       case GGML_OP_FLASH_ATTN_EXT:
             {
 #ifdef ASCEND_310P
-                // FA not support on 310p device
+                // FusedInferAttentionScore V2/V5 not available on 310P CANN toolkit
                 return false;
 #endif
                 // derived from [ggml-cuda.cu]
