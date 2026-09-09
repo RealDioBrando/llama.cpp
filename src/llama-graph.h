@@ -1253,6 +1253,22 @@ struct llm_graph_context {
 
     llm_graph_input_attn_kv * build_attn_inp_kv() const;
 
+    llm_graph_input_i * build_attn_inp_kv_auto() const;
+
+    ggml_tensor * build_attn(
+            llm_graph_input_i    * inp,
+            ggml_tensor          * wo,
+            ggml_tensor          * wo_b,
+            ggml_tensor          * wo_s,
+            ggml_tensor          * q_cur,
+            ggml_tensor          * k_cur,
+            ggml_tensor          * v_cur,
+            ggml_tensor          * kq_b,
+            ggml_tensor          * sinks,
+            ggml_tensor          * v_mla,
+            float                  kq_scale,
+            int                    il) const;
+
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,
             ggml_tensor * wo,
@@ -1343,7 +1359,6 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
-    llm_graph_input_attn_kv_paged * build_attn_inp_kv_paged() const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv_paged * inp,

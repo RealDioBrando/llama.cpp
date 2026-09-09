@@ -14,6 +14,7 @@
 #include "llama-kv-cache-dsa-iswa.h"
 #include "llama-kv-cache-msa.h"
 #include "llama-kv-cache-dsv4.h"
+#include "llama-kv-cache-paged.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid-idx.h"
@@ -2704,13 +2705,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     reuse,
                                     share);
                         }
-                    } else {
                     } else if (cparams.kv_paged) {
                         GGML_ASSERT(!hparams.is_swa_any());
 
                         const uint32_t head_dim   = hparams.n_embd_head_v();
                         const uint32_t n_head     = hparams.n_head_kv();
-                        const uint32_t n_layers   = hparams.n_layer;
+                        const uint32_t n_layers   = hparams.n_layer();
                         const uint32_t block_size = cparams.block_size;
 
                         const uint32_t n_gpu_blocks = cparams.n_gpu_blocks;

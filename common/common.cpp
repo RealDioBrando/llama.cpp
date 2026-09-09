@@ -1392,7 +1392,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         common_fit_paged_kv_blocks(params, pimpl->model.get());
         cparams = common_context_params_to_llama(params);
     }
-    }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 

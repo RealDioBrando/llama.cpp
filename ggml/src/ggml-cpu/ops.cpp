@@ -12160,6 +12160,7 @@ void ggml_compute_forward_lightning_indexer(
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
             }
         }
+}
     }
 
 void ggml_compute_forward_paged_attn(const ggml_compute_params * params, ggml_tensor * dst) {
