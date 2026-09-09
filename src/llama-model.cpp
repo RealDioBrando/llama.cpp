@@ -2705,8 +2705,42 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     share);
                         }
                     } else {
+                    } else if (cparams.kv_paged) {
                         GGML_ASSERT(!hparams.is_swa_any());
 
+                        const uint32_t head_dim   = hparams.n_embd_head_v();
+                        const uint32_t n_head     = hparams.n_head_kv();
+                        const uint32_t n_layers   = hparams.n_layer;
+                        const uint32_t block_size = cparams.block_size;
+
+                        const uint32_t n_gpu_blocks = cparams.n_gpu_blocks;
+                        const uint32_t n_cpu_blocks = cparams.n_cpu_blocks;
+                        const float    watermark    = cparams.kv_paged_watermark;
+
+                        const uint32_t n_ubatch  = cparams.n_ubatch;
+                        const uint32_t n_seq_max = cparams.n_seq_max;
+
+                        auto * paged_cache = new llama_kv_cache_paged(head_dim, n_head, block_size, n_layers, n_ubatch, n_seq_max);
+                        GGML_ASSERT(paged_cache && "unable to create paged KV cache.");
+
+                        ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+                        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                        GGML_ASSERT(cpu_dev && "no CPU device found for paged KV cache.");
+
+                        ggml_backend_t backend_gpu = gpu_dev ? ggml_backend_dev_init(gpu_dev, nullptr) : ggml_backend_dev_init(cpu_dev, nullptr);
+                        ggml_backend_t backend_cpu = ggml_backend_dev_init(cpu_dev, nullptr);
+
+                        paged_cache->init(
+                            backend_gpu,
+                            backend_cpu,
+                            params.type_k,
+                            n_gpu_blocks,
+                            n_cpu_blocks,
+                            watermark);
+
+                        res = paged_cache;
+                    } else {
+                        GGML_ASSERT(!hparams.is_swa_any());
                         res = new llama_kv_cache(
                                 *this,
                                 hparams,
@@ -3310,3 +3344,4 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
 
     return (uint32_t) nelements;
 }
+

@@ -29,6 +29,7 @@ class llama_kv_cache_msa_context;
 class llama_kv_cache_dsv4_raw_context;
 class llama_kv_cache_dsv4_context;
 class llama_kv_cache_iswa_context;
+class llama_kv_cache_paged_context;
 class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
@@ -564,6 +565,36 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
+};
+
+class llm_graph_input_attn_kv_paged : public llm_graph_input_i {
+public:
+    llm_graph_input_attn_kv_paged(
+            const llama_hparams & hparams,
+            const llama_cparams & cparams,
+            const llama_kv_cache_paged_context * mctx) :
+        hparams(hparams),
+        cparams(cparams),
+        mctx(mctx) {
+    }
+    ~llm_graph_input_attn_kv_paged() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    // The tensors the attention kernel will actually use
+    ggml_tensor * paged_write_slots   = nullptr;
+    ggml_tensor * paged_block_table   = nullptr;
+    ggml_tensor * paged_context_lens  = nullptr;
+    ggml_tensor * paged_batch_offsets = nullptr;
+    ggml_tensor * paged_batch_lens    = nullptr;
+
+    const llama_hparams hparams;
+    const llama_cparams cparams;
+
+    int32_t last_n_tokens;
+
+    const llama_kv_cache_paged_context * mctx;
 };
 
 // DSV4 raw graph inputs are SWA-only, but their mask may be stream-shaped
@@ -1177,6 +1208,21 @@ struct llm_graph_context {
     // attention
     //
 
+    ggml_tensor * build_attn_mha_paged(
+             ggml_tensor * q,               // [n_embd_head, n_head, n_tokens]
+             ggml_tensor * k_cur,           // [n_embd_head, n_head_kv, n_tokens]
+             ggml_tensor * v_cur,           // [n_embd_head, n_head_kv, n_tokens]
+             ggml_tensor * k_cache,         // master K buffer
+             ggml_tensor * v_cache,         // master V buffer
+             ggml_tensor * block_table,     // [max_blocks, batch_size]
+             ggml_tensor * write_slots,     // [n_tokens]
+             ggml_tensor * context_lens,    // [batch_size]
+             ggml_tensor * batch_offsets,   // [batch_size]
+             ggml_tensor * batch_lens,      // [batch_size]
+                   float   kq_scale,
+                     int   block_size,
+                     int   max_blocks) const;
+
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]
@@ -1260,6 +1306,8 @@ struct llm_graph_context {
 
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
 
+    llm_graph_input_attn_kv_paged * build_attn_inp_kv_paged() const;
+
     llm_graph_input_dsv4 * build_inp_dsv4() const;
 
     // note: if k_cur or v_cur are not provided, they will not be stored in the memory
@@ -1283,6 +1331,22 @@ struct llm_graph_context {
     // note: the K cache is used as V (MLA-style attention)
     ggml_tensor * build_attn(
             llm_graph_input_attn_k_iswa * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens] optional
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens] optional
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks, // [n_head_q]
+            ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+                  float   kq_scale,
+                    int   il) const;
+
+    llm_graph_input_attn_kv_paged * build_attn_inp_kv_paged() const;
+
+    ggml_tensor * build_attn(
+            llm_graph_input_attn_kv_paged * inp,
             ggml_tensor * wo,
             ggml_tensor * wo_b,
             ggml_tensor * wo_s,
@@ -1388,3 +1452,4 @@ struct llm_graph_context {
 
 // TODO: better name
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional);
+
