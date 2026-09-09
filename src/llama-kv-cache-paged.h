@@ -44,7 +44,8 @@ class llama_kv_cache_paged : public llama_memory_i {
     llama_memory_context_ptr init_full() override;
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
-    struct ggml_tensor * get_kv_tensor(int layer_idx) const;
+    struct ggml_tensor * get_k_tensor(int layer_idx) const;
+    struct ggml_tensor * get_v_tensor(int layer_idx) const;
 
     bool get_can_shift() const override { return false; }
 
@@ -88,11 +89,14 @@ class llama_kv_cache_paged : public llama_memory_i {
     void concat_block_ids(llama_block_ids & to_block_table, const llama_block_ids & from_block_table);
     void do_block_copy(const llama_block_ids & src_ids, const llama_block_ids & new_ids, bool to_gpu);
 
-    // Master physical buffer
-    // For CUDA: memory is interleaved
-    // For other backends: we treat the exact same memory buffer as two virtual views
-    std::vector<struct ggml_tensor *> kv_gpu_layers;
-    std::vector<struct ggml_tensor *> kv_cpu_layers;
+    // Master physical buffers. One K pool and one V pool per layer, both with
+    // ND shape [num_blocks, n_heads_kv, block_size, head_dim]. Backends are
+    // free to interpret the raw bytes differently (e.g. NZ on CANN); the
+    // element count and byte size are identical either way.
+    std::vector<struct ggml_tensor *> k_gpu_layers;
+    std::vector<struct ggml_tensor *> v_gpu_layers;
+    std::vector<struct ggml_tensor *> k_cpu_layers;
+    std::vector<struct ggml_tensor *> v_cpu_layers;
 
     enum ggml_type kv_type;
 

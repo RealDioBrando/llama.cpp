@@ -51,10 +51,9 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     kv_type        = type;
     gpu_backend    = backend_gpu;
     cpu_backend    = backend_cpu;
-    block_bytes    = 2 * block_size * n_heads_kv * head_dim * ggml_type_size(kv_type);
+    block_bytes    = block_size * n_heads_kv * head_dim * ggml_type_size(kv_type);
 
-    // Set up GPU context and tensor
-    // Interleaved shape: [num_blocks, 2, n_heads_kv, block_size, head_dim] (5D)
+    // Set up GPU context and tensors. One K pool and one V pool per layer.
     struct ggml_init_params gpu_params;
     gpu_params.mem_size   = ggml_tensor_overhead() * 5 * n_layers;
     gpu_params.mem_buffer = NULL;
@@ -63,10 +62,12 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     struct ggml_context * ctx_gpu = ggml_init(gpu_params);
 
     for (uint32_t il = 0; il < n_layers; ++il) {
-        // Since GGML_MAX_DIMS is set to 4, we flatten the layout to be 4D: [num_blocks, 2 * n_heads_kv, block_size, head_dim]
-        ggml_tensor * kv_layer_gpu =
-            ggml_new_tensor_4d(ctx_gpu, type, head_dim, block_size, 2 * n_heads_kv, n_gpu_blocks);
-        kv_gpu_layers.push_back(kv_layer_gpu);
+        ggml_tensor * k_layer_gpu =
+            ggml_new_tensor_4d(ctx_gpu, type, head_dim, block_size, n_heads_kv, n_gpu_blocks);
+        ggml_tensor * v_layer_gpu =
+            ggml_new_tensor_4d(ctx_gpu, type, head_dim, block_size, n_heads_kv, n_gpu_blocks);
+        k_gpu_layers.push_back(k_layer_gpu);
+        v_gpu_layers.push_back(v_layer_gpu);
     }
 
     // Allocate on GPU backend
@@ -74,10 +75,8 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     GGML_ASSERT(buf_gpu && "Failed to allocate GPU KV cache buffer");
     ggml_backend_buffer_clear(buf_gpu, 0);  // zero out the cache
     for (uint32_t il = 0; il < n_layers; ++il) {
-        GGML_ASSERT(kv_gpu_layers[il]->buffer && "GPU layer tensor has null buffer");
+        GGML_ASSERT(k_gpu_layers[il]->buffer && v_gpu_layers[il]->buffer && "GPU layer tensor has null buffer");
     }
-
-    // For non CUDA backends, we would split views to allow for standard ggml operators to work out of the box
 
     // Set up CPU context and tensor (for swapping)
     struct ggml_init_params cpu_params;
@@ -86,9 +85,12 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     cpu_params.no_alloc           = true;
     struct ggml_context * ctx_cpu = ggml_init(cpu_params);
     for (uint32_t il = 0; il < n_layers; ++il) {
-        ggml_tensor * kv_layer_cpu =
-            ggml_new_tensor_4d(ctx_cpu, type, head_dim, block_size, 2 * n_heads_kv, n_cpu_blocks);
-        kv_cpu_layers.push_back(kv_layer_cpu);
+        ggml_tensor * k_layer_cpu =
+            ggml_new_tensor_4d(ctx_cpu, type, head_dim, block_size, n_heads_kv, n_cpu_blocks);
+        ggml_tensor * v_layer_cpu =
+            ggml_new_tensor_4d(ctx_cpu, type, head_dim, block_size, n_heads_kv, n_cpu_blocks);
+        k_cpu_layers.push_back(k_layer_cpu);
+        v_cpu_layers.push_back(v_layer_cpu);
     }
 
     // Allocate on the CPU backend (using pinned memory for faster PCIe transfer)
@@ -96,7 +98,7 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     GGML_ASSERT(buf_cpu && "Failed to allocate CPU KV cache buffer");
     ggml_backend_buffer_clear(buf_cpu, 0);  // zero out the cache
     for (uint32_t il = 0; il < n_layers; ++il) {
-        GGML_ASSERT(kv_cpu_layers[il]->buffer && "CPU layer tensor has null buffer");
+        GGML_ASSERT(k_cpu_layers[il]->buffer && v_cpu_layers[il]->buffer && "CPU layer tensor has null buffer");
     }
 
     // Setting up our block accountant
@@ -159,11 +161,13 @@ void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,
     LLAMA_LOG_DEBUG("%s: num_blocks_size=%d, new_ids_size=%ld\n", __func__, num_blocks, new_ids.size());
     GGML_ASSERT(num_blocks == new_ids.size() && "src_ids and new_ids do not have the same size.");
 
-    const auto & src_layers = to_gpu ? kv_cpu_layers : kv_gpu_layers;
-    const auto & dst_layers = to_gpu ? kv_gpu_layers : kv_cpu_layers;
+    const auto & src_k = to_gpu ? k_cpu_layers : k_gpu_layers;
+    const auto & dst_k = to_gpu ? k_gpu_layers : k_cpu_layers;
+    const auto & src_v = to_gpu ? v_cpu_layers : v_gpu_layers;
+    const auto & dst_v = to_gpu ? v_gpu_layers : v_cpu_layers;
 
-    GGML_ASSERT(src_layers.size() == n_layers && "src layer count mismatch.");
-    GGML_ASSERT(dst_layers.size() == n_layers && "src layer count mismatch.");
+    GGML_ASSERT(src_k.size() == n_layers && src_v.size() == n_layers && "src layer count mismatch.");
+    GGML_ASSERT(dst_k.size() == n_layers && dst_v.size() == n_layers && "dst layer count mismatch.");
 
     // Buffer on HOST to faciliate block data transfer
     // Note: an optimization would be to use views and async copies. Beware of
@@ -171,9 +175,6 @@ void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,
     std::vector<uint8_t> staging(block_bytes);
 
     for (uint32_t il = 0; il < n_layers; ++il) {
-        struct ggml_tensor * src_main = src_layers[il];
-        struct ggml_tensor * dst_main = dst_layers[il];
-
         for (uint32_t i = 0; i < num_blocks; ++i) {
             const uint32_t src_global = src_ids[i];
             const uint32_t dst_global = new_ids[i];
@@ -187,9 +188,11 @@ void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,
             const size_t dst_offset = (size_t) dst_local * block_bytes;
 
             // Put src tensor into HOST staging buffer
-            ggml_backend_tensor_get(src_main, staging.data(), src_offset, block_bytes);
             // Put tensor from HOST staging into dst tensor
-            ggml_backend_tensor_set(dst_main, staging.data(), dst_offset, block_bytes);
+            ggml_backend_tensor_get(src_k[il], staging.data(), src_offset, block_bytes);
+            ggml_backend_tensor_set(dst_k[il], staging.data(), dst_offset, block_bytes);
+            ggml_backend_tensor_get(src_v[il], staging.data(), src_offset, block_bytes);
+            ggml_backend_tensor_set(dst_v[il], staging.data(), dst_offset, block_bytes);
         }
     }
 }
@@ -308,8 +311,12 @@ llama_memory_context_ptr llama_kv_cache_paged::init_update(llama_context * /*lct
     return ctx;
 }
 
-struct ggml_tensor * llama_kv_cache_paged::get_kv_tensor(int layer_idx) const {
-    return kv_gpu_layers[layer_idx];
+struct ggml_tensor * llama_kv_cache_paged::get_k_tensor(int layer_idx) const {
+    return k_gpu_layers[layer_idx];
+}
+
+struct ggml_tensor * llama_kv_cache_paged::get_v_tensor(int layer_idx) const {
+    return v_gpu_layers[layer_idx];
 }
 
 void llama_kv_cache_paged::clear(bool /*data*/) {
@@ -333,17 +340,25 @@ llama_pos llama_kv_cache_paged::seq_pos_max(llama_seq_id seq_id) const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_paged::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> breakdown;
-    const size_t                                 n_gpu_kvs = kv_gpu_layers.size();
-    const size_t                                 n_cpu_kvs = kv_cpu_layers.size();
+    const size_t                                 n_gpu_kvs = k_gpu_layers.size();
+    const size_t                                 n_cpu_kvs = k_cpu_layers.size();
 
     for (size_t il = 0; il < n_layers; ++il) {
-        auto * kv_gpu = (il < n_gpu_kvs) ? kv_gpu_layers[il] : nullptr;
-        if (kv_gpu) {
-            breakdown[ggml_backend_buffer_get_type(kv_gpu->buffer)] = ggml_nbytes(kv_gpu);
+        auto * k_gpu = (il < n_gpu_kvs) ? k_gpu_layers[il] : nullptr;
+        auto * v_gpu = (il < n_gpu_kvs) ? v_gpu_layers[il] : nullptr;
+        if (k_gpu) {
+            breakdown[ggml_backend_buffer_get_type(k_gpu->buffer)] += ggml_nbytes(k_gpu);
         }
-        auto * kv_cpu = (il < n_cpu_kvs) ? kv_cpu_layers[il] : nullptr;
-        if (kv_cpu) {
-            breakdown[ggml_backend_buffer_get_type(kv_cpu->buffer)] = ggml_nbytes(kv_cpu);
+        if (v_gpu) {
+            breakdown[ggml_backend_buffer_get_type(v_gpu->buffer)] += ggml_nbytes(v_gpu);
+        }
+        auto * k_cpu = (il < n_cpu_kvs) ? k_cpu_layers[il] : nullptr;
+        auto * v_cpu = (il < n_cpu_kvs) ? v_cpu_layers[il] : nullptr;
+        if (k_cpu) {
+            breakdown[ggml_backend_buffer_get_type(k_cpu->buffer)] += ggml_nbytes(k_cpu);
+        }
+        if (v_cpu) {
+            breakdown[ggml_backend_buffer_get_type(v_cpu->buffer)] += ggml_nbytes(v_cpu);
         }
     }
     return breakdown;
@@ -390,12 +405,12 @@ const llama_ubatch & llama_kv_cache_paged_context::get_ubatch() const {
 
 struct ggml_tensor * llama_kv_cache_paged_context::get_k(int layer_idx) const {
     GGML_ASSERT(manager && "manager has not been initialized.");
-    return manager->get_kv_tensor(layer_idx);
+    return manager->get_k_tensor(layer_idx);
 }
 
 struct ggml_tensor * llama_kv_cache_paged_context::get_v(int layer_idx) const {
     GGML_ASSERT(manager && "manager has not been initialized.");
-    return manager->get_kv_tensor(layer_idx);
+    return manager->get_v_tensor(layer_idx);
 }
 
 int32_t llama_kv_cache_paged_context::get_n_tokens() const {
