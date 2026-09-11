@@ -2090,6 +2090,8 @@ ggml_backend_buffer_type_t ggml_backend_cann_host_buffer_type() {
  */
 static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct ggml_tensor * dst) {
     static const bool op_debug = getenv("GGML_CANN_OP_DEBUG") != nullptr;
+    static const bool op_timing = getenv("GGML_CANN_OP_TIMING") != nullptr;
+    const int64_t op_t0 = op_timing ? ggml_time_us() : 0;
     if (op_debug) {
         GGML_LOG_INFO("[CANN op] %s\n", ggml_op_desc(dst));
     }
@@ -2354,6 +2356,10 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
             return false;
     }
 
+    if (op_timing) {
+        GGML_LOG_ERROR("[cann op time] %s us=%lld\n", ggml_op_desc(dst),
+                       (long long) (ggml_time_us() - op_t0));
+    }
     return true;
 }
 

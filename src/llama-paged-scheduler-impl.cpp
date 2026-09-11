@@ -55,7 +55,6 @@ llama_scheduler_status llama_paged_scheduler_impl::step(llama_batch & batch) {
     llama_sequence_group_raw_list candidates;
     process_running_list(candidates);
     process_swapped_list(candidates);
-
     const int32_t remaining = n_batch - get_curr_decode_tokens();
     process_waiting_list(candidates, remaining);
 
@@ -279,7 +278,11 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
         GGML_ASSERT(group && "the waiting group is nullptr.");
 
         const int32_t tokens_needed = group->n_prompt + 1;
-        if (tokens_needed > remaining_token_budget) {
+        // The extra token reserves one decode slot in KV, but is not part of
+        // the prompt-processing graph budget. Counting it here serializes
+        // prompts that would otherwise fit in n_batch.
+        const int32_t prompt_tokens = (int32_t) group->n_prompt;
+        if (prompt_tokens > remaining_token_budget) {
             break;
         }
 
@@ -291,7 +294,7 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
             break;
         }
         candidates.push_back(group);
-        remaining_token_budget -= tokens_needed;
+        remaining_token_budget -= prompt_tokens;
         llama_sequence_group_ptr group_ptr = std::move(*it);
         LLAMA_LOG_DEBUG("%s: (start) request_id=%d sent for processing.\n", __func__, group_ptr->request_id);
         set_running(std::move(group_ptr));
@@ -423,7 +426,7 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
         for (int block = 0; block < max_blocks; ++block) {
             int  flattened_id                   = (seq_id * max_blocks) + block;  // row-major
             bool need_padding                   = block >= curr_block_table_size;
-            curr_info.block_table[flattened_id] = need_padding ? -1 : group->block_table[block];
+            curr_info.block_table[flattened_id] = need_padding ? 0 : group->block_table[block];
         }
 
         curr_info.context_lens[seq_id]  = group->n_past + new_tokens;
@@ -467,7 +470,12 @@ void llama_paged_scheduler_impl::update(const llama_batch &              batch,
         kv_cache_manager->set_seq_max_pos(group->request_id, batch.pos[last_token_in_batch_idx]);
 
         group->n_past += curr_info.batch_lens[i];
-        group->n_decoded += curr_info.batch_lens[i];
+        if (curr_info.batch_lens[i] == 1) {
+            group->n_decoded++;
+        } else {
+            // The sampled token from the prefill's final position is the first output.
+            group->n_decoded = 1;
+        }
         group->logical_seq.push_back(new_tokens[i]);
 
         // Default stop flags are n_seq_max

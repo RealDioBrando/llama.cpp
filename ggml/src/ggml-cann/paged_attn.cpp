@@ -9,10 +9,9 @@
 
 #include <aclnnop/aclnn_cast.h>
 #include <aclnnop/aclnn_copy.h>
-#include <aclnnop/aclnn_prompt_flash_attention.h>
-
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -50,26 +49,38 @@ struct atb_tensor_maker {
 struct atb_paged_state {
     atb::Context *   ctx       = nullptr;
     atb::Operation * rac       = nullptr;  // ReshapeCacheOperation
+    atb::Operation * sa        = nullptr;  // SelfAttention (uncached prefill)
     atb::Operation * pa        = nullptr;  // PagedAttention (decode)
     atb::Operation * sf        = nullptr;  // PagedAttention (multi-token query)
     void *           ws_rac    = nullptr;
     uint64_t         ws_rac_sz = 0;
+    void *           ws_sa     = nullptr;
+    uint64_t         ws_sa_sz  = 0;
     void *           ws_pa     = nullptr;
     uint64_t         ws_pa_sz  = 0;
     void *           ws_sf     = nullptr;
     uint64_t         ws_sf_sz  = 0;
     int64_t          rac_tokens = -1;
+    int64_t          sa_heads   = -1;
+    int64_t          sa_kv_heads = -1;
+    int64_t          sa_head_dim = -1;
+    float            sa_scale    = 0.0f;
+    void *           prefill_mask = nullptr;
+    int64_t          prefill_mask_len = -1;
     aclrtContext     saved_ctx  = nullptr;
     std::mutex       mtx;
 
     ~atb_paged_state() {
         if (rac)  atb::DestroyOperation((atb::Operation *) rac);
+        if (sa)   atb::DestroyOperation((atb::Operation *) sa);
         if (pa)   atb::DestroyOperation((atb::Operation *) pa);
         if (sf)   atb::DestroyOperation((atb::Operation *) sf);
         if (ctx)  atb::DestroyContext(ctx);
         if (ws_rac) aclrtFree(ws_rac);
+        if (ws_sa)  aclrtFree(ws_sa);
         if (ws_pa)  aclrtFree(ws_pa);
         if (ws_sf)  aclrtFree(ws_sf);
+        if (prefill_mask) aclrtFree(prefill_mask);
     }
 };
 
@@ -110,6 +121,32 @@ atb::Operation * create_pa_op(int num_heads, int num_kv_heads, int head_dim, boo
     return op;
 }
 
+atb::Operation * create_sa_op(int num_heads, int num_kv_heads, int head_dim, float scale) {
+    atb::infer::SelfAttentionParam param;
+    param.calcType             = atb::infer::SelfAttentionParam::PA_ENCODER;
+    param.kernelType           = atb::infer::SelfAttentionParam::KERNELTYPE_DEFAULT;
+    param.clampType            = atb::infer::SelfAttentionParam::CLAMP_TYPE_UNDEFINED;
+    param.maskType             = atb::infer::SelfAttentionParam::MASK_TYPE_NORM;
+    param.kvcacheCfg           = atb::infer::SelfAttentionParam::K_CACHE_V_CACHE;
+    param.scaleType            = atb::infer::SelfAttentionParam::SCALE_TYPE_TOR;
+    param.quantType            = atb::infer::SelfAttentionParam::TYPE_QUANT_UNDEFINED;
+    param.cacheType            = atb::infer::SelfAttentionParam::CACHE_TYPE_NORM;
+    param.outDataType          = ACL_DT_UNDEFINED;
+    param.headNum              = num_heads;
+    param.kvHeadNum            = num_kv_heads;
+    param.qScale               = 1.0f;
+    param.qkScale              = scale;
+    param.batchRunStatusEnable = false;
+    param.isTriuMask           = 0;
+    param.inputLayout          = atb::infer::TYPE_BSND;
+    param.mlaVHeadSize         = 0;
+    param.windowSize           = 0;
+
+    atb::Operation * op = nullptr;
+    ATB_CHECK(atb::CreateOperation(param, &op));
+    return op;
+}
+
 void setup_op(atb::Operation * op, const atb::VariantPack & vp, void ** ws, uint64_t * ws_sz,
               atb::Context * atb_ctx, aclrtStream stream) {
     uint64_t needed = 0;
@@ -117,7 +154,11 @@ void setup_op(atb::Operation * op, const atb::VariantPack & vp, void ** ws, uint
         std::lock_guard<std::mutex> lk(g_atb.mtx);
         ATB_CHECK(op->Setup(vp, needed, atb_ctx));
     }
-    if (needed > *ws_sz) {
+    const bool resize_ws = needed > *ws_sz;
+    if (resize_ws) {
+        aclrtSynchronizeStream(stream);
+    }
+    if (resize_ws) {
         if (*ws) {
             aclrtFree(*ws);
             *ws = nullptr;
@@ -130,7 +171,45 @@ void setup_op(atb::Operation * op, const atb::VariantPack & vp, void ** ws, uint
         ACL_CHECK(ret);
         *ws_sz = needed;
     }
-    aclrtSynchronizeStream(stream);
+}
+
+// The full-prompt causal mask only depends on the padded prompt length, so it
+// can be reused by every layer and by later requests with the same length.
+void * get_prefill_causal_mask(int64_t max_len, aclrtStream stream) {
+    GGML_ASSERT(max_len > 0);
+    if (g_atb.prefill_mask && g_atb.prefill_mask_len == max_len) {
+        return g_atb.prefill_mask;
+    }
+
+    if (g_atb.prefill_mask) {
+        aclrtSynchronizeStream(stream);
+        ACL_CHECK(aclrtFree(g_atb.prefill_mask));
+        g_atb.prefill_mask     = nullptr;
+        g_atb.prefill_mask_len = -1;
+    }
+
+    const size_t mask_elems = (size_t) max_len * (size_t) max_len;
+    const size_t mask_bytes = mask_elems * sizeof(uint16_t);
+    void *       mask_dev   = nullptr;
+    ACL_CHECK(aclrtMalloc(&mask_dev, mask_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+
+    std::vector<uint16_t> mask_host(mask_elems);
+    const float    neg_big = -10000.0f;
+    const ggml_fp16_t neg_fp16 = ggml_fp32_to_fp16(neg_big);
+    uint16_t neg_bits;
+    memcpy(&neg_bits, &neg_fp16, sizeof(neg_bits));
+    mask_host.assign(mask_elems, neg_bits);
+    for (int64_t row = 0; row < max_len; ++row) {
+        for (int64_t col = 0; col <= row; ++col) {
+            mask_host[(size_t) row * max_len + col] = 0;
+        }
+    }
+
+    ACL_CHECK(aclrtMemcpyAsync(mask_dev, mask_bytes, mask_host.data(), mask_bytes,
+                               ACL_MEMCPY_HOST_TO_DEVICE, stream));
+    g_atb.prefill_mask     = mask_dev;
+    g_atb.prefill_mask_len = max_len;
+    return mask_dev;
 }
 
 // Pool wrap: ggml K/V pool [num_blocks, n_heads_kv, block_size, head_dim] f16
@@ -174,36 +253,108 @@ void cast_back_to_dst(ggml_backend_cann_context & ctx, const void * src_buf, ggm
     GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_src.get(), ACL_FLOAT, acl_dst.get());
 }
 
-// PromptFlashAttention over one sequence's contiguous chunk KV (BSH, packed
-// kv dim), mirroring the qwen35-engine prefill path. Causal via nextTokens=0.
-void prompt_flash_attention_seq(ggml_backend_cann_context & ctx, const void * q_slice, const void * k_slice,
-                                const void * v_slice, void * out_slice, int64_t len, int64_t n_heads,
-                                int64_t n_heads_kv, int64_t head_dim, float scale, aclrtStream stream) {
-    const int64_t q_size    = n_heads * head_dim;
-    const int64_t kv_size   = n_heads_kv * head_dim;
-    const int64_t pre_tokens  = 2147483647LL;
-    const int64_t next_tokens = 0;
-    char layout[4]            = { 'B', 'S', 'H', 0 };
-    // The 310P PFA without a mask is non-causal, while masked tiling requires
-    // aligned Q/KV lengths. Per-token prefix calls keep the semantics correct.
-    for (int64_t token = 0; token < len; ++token) {
-        char * q_ptr = (char *) (uintptr_t) q_slice + token * q_size * sizeof(uint16_t);
-        char * o_ptr = (char *) out_slice + token * q_size * sizeof(uint16_t);
-        const int64_t kv_len = token + 1;
-        int64_t  ne3[3] = { q_size, 1, 1 };
-        size_t   nb3[3] = { sizeof(uint16_t), (size_t) q_size * sizeof(uint16_t), (size_t) q_size * sizeof(uint16_t) };
-        int64_t  nekv[3] = { kv_size, kv_len, 1 };
-        size_t   nbkv[3] = { sizeof(uint16_t), (size_t) kv_size * sizeof(uint16_t), (size_t) kv_len * kv_size * sizeof(uint16_t) };
-        acl_tensor_ptr acl_q = ggml_cann_create_tensor(q_ptr, ACL_FLOAT16, sizeof(uint16_t), ne3, nb3, 3);
-        acl_tensor_ptr acl_k = ggml_cann_create_tensor((void *) (uintptr_t) k_slice, ACL_FLOAT16, sizeof(uint16_t), nekv, nbkv, 3);
-        acl_tensor_ptr acl_v = ggml_cann_create_tensor((void *) (uintptr_t) v_slice, ACL_FLOAT16, sizeof(uint16_t), nekv, nbkv, 3);
-        acl_tensor_ptr acl_o = ggml_cann_create_tensor(o_ptr, ACL_FLOAT16, sizeof(uint16_t), ne3, nb3, 3);
-        GGML_CANN_CALL_ACLNN_OP(ctx, PromptFlashAttention, acl_q.get(), acl_k.get(), acl_v.get(), nullptr, nullptr,
-                                nullptr, n_heads, (double) scale, pre_tokens, next_tokens, layout, n_heads_kv,
-                                acl_o.get());
+// ATB SelfAttention for uncached prompt chunks. Q/K/V are packed [T,N,D] and
+// 310P PA_ENCODER requires the packed token count to be 16-aligned.
+void self_attention_prefill(ggml_backend_cann_context & ctx, void * q_f16, void * k_f16, void * v_f16,
+                            void * out_f16, const std::vector<int32_t> & lengths,
+                            const std::vector<int32_t> & offsets, int64_t n_heads, int64_t n_heads_kv,
+                            int64_t head_dim, float scale, aclrtStream stream) {
+    const int64_t q_size  = n_heads * head_dim;
+    const int64_t kv_size = n_heads_kv * head_dim;
+    const int64_t n_seq   = (int64_t) lengths.size();
+    GGML_ASSERT(n_seq > 0);
+
+    int64_t total = 0;
+    int64_t max_len = 0;
+    std::vector<int32_t> op_lengths(lengths);
+    for (int64_t len : op_lengths) {
+        total += len;
+        max_len = std::max(max_len, (int64_t) len);
     }
-    ACL_CHECK(aclrtSynchronizeStream(stream));
-    (void) stream;
+    const int64_t aligned = ((total + 15) / 16) * 16;
+    if (aligned != total) {
+        op_lengths.back() += (int32_t) (aligned - total);
+        max_len = std::max(max_len, (int64_t) op_lengths.back());
+    }
+
+    std::vector<int32_t> op_offsets(n_seq);
+    int32_t cursor = 0;
+    for (int64_t s = 0; s < n_seq; ++s) {
+        op_offsets[s] = cursor;
+        cursor += op_lengths[s];
+    }
+
+    void * q_attn = q_f16;
+    void * k_attn = k_f16;
+    void * v_attn = v_f16;
+    void * o_attn = out_f16;
+    ggml_cann_pool_alloc q_alloc(ctx.pool(), aligned * q_size * sizeof(uint16_t));
+    ggml_cann_pool_alloc k_alloc(ctx.pool(), aligned * kv_size * sizeof(uint16_t));
+    ggml_cann_pool_alloc v_alloc(ctx.pool(), aligned * kv_size * sizeof(uint16_t));
+    ggml_cann_pool_alloc o_alloc(ctx.pool(), aligned * q_size * sizeof(uint16_t));
+    const size_t q_pad_bytes  = aligned * q_size * sizeof(uint16_t);
+    const size_t kv_pad_bytes = aligned * kv_size * sizeof(uint16_t);
+    if (aligned != total) {
+        q_attn = q_alloc.get();
+        k_attn = k_alloc.get();
+        v_attn = v_alloc.get();
+        o_attn = o_alloc.get();
+        ACL_CHECK(aclrtMemsetAsync(q_attn, q_pad_bytes, 0, q_pad_bytes, stream));
+        ACL_CHECK(aclrtMemsetAsync(k_attn, kv_pad_bytes, 0, kv_pad_bytes, stream));
+        ACL_CHECK(aclrtMemsetAsync(v_attn, kv_pad_bytes, 0, kv_pad_bytes, stream));
+        for (int64_t s = 0; s < n_seq; ++s) {
+            const size_t q_bytes  = lengths[s] * q_size * sizeof(uint16_t);
+            const size_t kv_bytes = lengths[s] * kv_size * sizeof(uint16_t);
+            ACL_CHECK(aclrtMemcpyAsync((char *) q_attn + op_offsets[s] * q_size * sizeof(uint16_t), q_bytes,
+                                       (char *) q_f16 + offsets[s] * q_size * sizeof(uint16_t), q_bytes,
+                                       ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
+            ACL_CHECK(aclrtMemcpyAsync((char *) k_attn + op_offsets[s] * kv_size * sizeof(uint16_t), kv_bytes,
+                                       (char *) k_f16 + offsets[s] * kv_size * sizeof(uint16_t), kv_bytes,
+                                       ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
+            ACL_CHECK(aclrtMemcpyAsync((char *) v_attn + op_offsets[s] * kv_size * sizeof(uint16_t), kv_bytes,
+                                       (char *) v_f16 + offsets[s] * kv_size * sizeof(uint16_t), kv_bytes,
+                                       ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
+        }
+    }
+
+    void * mask_dev = get_prefill_causal_mask(max_len, stream);
+
+    bool sa_valid = g_atb.sa && g_atb.sa_heads == n_heads && g_atb.sa_kv_heads == n_heads_kv &&
+                    g_atb.sa_head_dim == head_dim && g_atb.sa_scale == scale;
+    if (!sa_valid) {
+        if (g_atb.sa) {
+            atb::DestroyOperation((atb::Operation *) g_atb.sa);
+            g_atb.sa = nullptr;
+        }
+        g_atb.sa = create_sa_op((int) n_heads, (int) n_heads_kv, (int) head_dim, scale);
+        g_atb.sa_heads    = n_heads;
+        g_atb.sa_kv_heads = n_heads_kv;
+        g_atb.sa_head_dim = head_dim;
+        g_atb.sa_scale    = scale;
+    }
+
+    atb::Tensor q_t  = atb_tensor_maker::make(q_attn, {aligned, n_heads, head_dim}, ACL_FLOAT16);
+    atb::Tensor k_t  = atb_tensor_maker::make(k_attn, {aligned, n_heads_kv, head_dim}, ACL_FLOAT16);
+    atb::Tensor v_t  = atb_tensor_maker::make(v_attn, {aligned, n_heads_kv, head_dim}, ACL_FLOAT16);
+    atb::Tensor mk_t = atb_tensor_maker::make(mask_dev, {1, max_len, max_len}, ACL_FLOAT16);
+    atb::Tensor sl_t = atb_tensor_maker::make(nullptr, {n_seq}, ACL_INT32, ACL_FORMAT_ND, op_lengths.data());
+    atb::Tensor o_t  = atb_tensor_maker::make(o_attn, {aligned, n_heads, head_dim}, ACL_FLOAT16);
+
+    atb::VariantPack vp;
+    vp.inTensors  = { q_t, k_t, v_t, mk_t, sl_t };
+    vp.outTensors = { o_t };
+    setup_op(g_atb.sa, vp, &g_atb.ws_sa, &g_atb.ws_sa_sz, (atb::Context *) g_atb.ctx, stream);
+    ATB_CHECK(((atb::Operation *) g_atb.sa)->Execute(vp, (uint8_t *) g_atb.ws_sa, g_atb.ws_sa_sz,
+                                                     (atb::Context *) g_atb.ctx));
+
+    if (aligned != total) {
+        for (int64_t s = 0; s < n_seq; ++s) {
+            const size_t out_bytes = lengths[s] * q_size * sizeof(uint16_t);
+            ACL_CHECK(aclrtMemcpyAsync((char *) out_f16 + offsets[s] * q_size * sizeof(uint16_t), out_bytes,
+                                       (char *) o_attn + op_offsets[s] * q_size * sizeof(uint16_t), out_bytes,
+                                       ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
+        }
+    }
 }
 
 }  // namespace
@@ -215,6 +366,8 @@ void ggml_cann_paged_attn(ggml_backend_cann_context &, ggml_tensor *) {
 #else
 
 void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+    static const bool paged_timing = std::getenv("GGML_CANN_PAGED_TIMING") != nullptr;
+    const int64_t total_t0 = paged_timing ? ggml_time_us() : 0;
     const ggml_tensor * q             = dst->src[0];
     const ggml_tensor * k_new         = dst->src[1];
     const ggml_tensor * v_new         = dst->src[2];
@@ -230,8 +383,6 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     const float   scale       = op_params_f[0];
     const int     block_size  = ((const int32_t *) (op_params_f + 1))[0];
     const int     max_blocks  = ((const int32_t *) (op_params_f + 2))[0];
-    (void) scale;  // ATB derives qkScale from head_dim, matching the reference kernel
-
     const int64_t head_dim   = q->ne[0];
     const int64_t n_heads    = q->ne[1];
     const int64_t n_tokens   = q->ne[2];
@@ -251,15 +402,19 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
 
     ggml_cann_pool_alloc q_alloc(ctx.pool(), n_tokens * n_heads * head_dim * sizeof(uint16_t));
     void * q_f16 = q_alloc.get();
+    const int64_t q_cast_t0 = paged_timing ? ggml_time_us() : 0;
     cast_permute_to_f16_tnd(ctx, q, q_f16, n_tokens, n_heads, head_dim);
+    const int64_t q_cast_us = paged_timing ? ggml_time_us() - q_cast_t0 : 0;
 
     // ---- write new KV into the pools ----
     ggml_cann_pool_alloc k_alloc(ctx.pool(), n_tokens * n_heads_kv * head_dim * sizeof(uint16_t));
     ggml_cann_pool_alloc v_alloc(ctx.pool(), n_tokens * n_heads_kv * head_dim * sizeof(uint16_t));
     void * k_f16 = k_alloc.get();
     void * v_f16 = v_alloc.get();
+    const int64_t kv_cast_t0 = paged_timing ? ggml_time_us() : 0;
     cast_permute_to_f16_tnd(ctx, k_new, k_f16, n_tokens, n_heads_kv, head_dim);
     cast_permute_to_f16_tnd(ctx, v_new, v_f16, n_tokens, n_heads_kv, head_dim);
+    const int64_t kv_cast_us = paged_timing ? ggml_time_us() - kv_cast_t0 : 0;
 
     atb::Tensor k_in = atb_tensor_maker::make(k_f16, {n_tokens, n_heads_kv, head_dim}, ACL_FLOAT16);
     atb::Tensor v_in = atb_tensor_maker::make(v_f16, {n_tokens, n_heads_kv, head_dim}, ACL_FLOAT16);
@@ -268,6 +423,7 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     atb::Tensor sm   = atb_tensor_maker::make((void *) write_slots->data, {n_tokens}, ACL_INT32);
 
     {
+        const int64_t rac_t0 = paged_timing ? ggml_time_us() : 0;
         atb::VariantPack vp;
         vp.inTensors  = { k_in, v_in, kc, vc, sm };
         vp.outTensors = { kc, vc };
@@ -305,6 +461,11 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         }
         ATB_CHECK(((atb::Operation *) g_atb.rac)->Execute(vp, (uint8_t *) g_atb.ws_rac, needed,
                                                           (atb::Context *) g_atb.ctx));
+        const int64_t rac_us = paged_timing ? ggml_time_us() - rac_t0 : 0;
+        if (paged_timing) {
+            GGML_LOG_ERROR("[paged timing] rac n_tokens=%d n_seq=%d us=%lld\n", (int) n_tokens, (int) n_seq,
+                           (long long) rac_us);
+        }
     }
 
     // ---- attention ----
@@ -312,39 +473,54 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     void * out_f16 = out_alloc.get();
 
     ggml_cann_pool_alloc cl_alloc(ctx.pool(), n_seq * sizeof(int32_t));
-    ACL_CHECK(aclrtMemcpyAsync(cl_alloc.get(), n_seq * sizeof(int32_t), context_lens->data,
-                               n_seq * sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
+    const int64_t meta_t0 = paged_timing ? ggml_time_us() : 0;
+    // set_input keeps the scheduler's host arrays in tensor->extra. This avoids
+    // a synchronous D2H read on every layer; ATB tiling needs those host values.
+    const auto * cl_fast = (const int32_t *) context_lens->extra;
+    const auto * bl_fast = (const int32_t *) batch_lens->extra;
+    const auto * bo_fast = (const int32_t *) batch_offsets->extra;
+    const bool   use_fast_meta = cl_fast && bl_fast && bo_fast;
 
-    // Host copies for ATB tiling (310P reads context_lens/batch_lens from host)
     std::vector<int32_t> cl_host(n_seq);
     std::vector<int32_t> bl_host(n_seq);
     std::vector<int32_t> bo_host(n_seq);
-    ACL_CHECK(aclrtMemcpy(cl_host.data(), cl_host.size() * sizeof(int32_t), context_lens->data,
-                          n_seq * sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_HOST));
-    ACL_CHECK(aclrtMemcpy(bl_host.data(), bl_host.size() * sizeof(int32_t), batch_lens->data,
-                          n_seq * sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_HOST));
-    ACL_CHECK(aclrtMemcpy(bo_host.data(), bo_host.size() * sizeof(int32_t), batch_offsets->data,
-                          n_seq * sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_HOST));
+    void * cl_dev = cl_alloc.get();
+    if (use_fast_meta) {
+        cl_host.assign(cl_fast, cl_fast + n_seq);
+        bl_host.assign(bl_fast, bl_fast + n_seq);
+        bo_host.assign(bo_fast, bo_fast + n_seq);
+        cl_dev = const_cast<void *>(context_lens->data);
+    } else {
+        ACL_CHECK(aclrtMemcpyAsync(cl_alloc.get(), n_seq * sizeof(int32_t), context_lens->data,
+                                   n_seq * sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
+        ACL_CHECK(aclrtMemcpy(cl_host.data(), cl_host.size() * sizeof(int32_t), context_lens->data,
+                              n_seq * sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_HOST));
+        ACL_CHECK(aclrtMemcpy(bl_host.data(), bl_host.size() * sizeof(int32_t), batch_lens->data,
+                              n_seq * sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_HOST));
+        ACL_CHECK(aclrtMemcpy(bo_host.data(), bo_host.size() * sizeof(int32_t), batch_offsets->data,
+                              n_seq * sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_HOST));
+    }
 
-    ggml_cann_pool_alloc bt_alloc(ctx.pool(), n_seq * max_blocks * sizeof(int32_t));
-    void * bt_dev = bt_alloc.get();
-    {
-        // Host-side transpose of the [max_blocks, n_seq] ggml block table plus a
-        // defensive zero of entries beyond each sequence's allocated blocks:
-        // stale block ids must never reach the kernel as addresses.
-        std::vector<int32_t> bt_host(n_seq * max_blocks, 0);
-        ACL_CHECK(aclrtMemcpy(bt_host.data(), bt_host.size() * sizeof(int32_t), block_table->data,
-                              bt_host.size() * sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_HOST));
+    ggml_cann_pool_alloc bt_alloc(ctx.pool());
+    void * bt_dev = nullptr;
+    const auto * bt_fast = (const int32_t *) block_table->extra;
+    if (bt_fast) {
+        bt_dev = const_cast<void *>(block_table->data);
+    } else {
+        bt_dev = bt_alloc.alloc(n_seq * max_blocks * sizeof(int32_t));
         std::vector<int32_t> bt_lin(n_seq * max_blocks, 0);
+        ACL_CHECK(aclrtMemcpy(bt_lin.data(), bt_lin.size() * sizeof(int32_t), block_table->data,
+                              bt_lin.size() * sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_HOST));
         for (int64_t s = 0; s < n_seq; ++s) {
             const int64_t used = std::min(max_blocks, (cl_host[s] + block_size - 1) / block_size);
-            for (int64_t m = 0; m < used; ++m) {
-                bt_lin[s * max_blocks + m] = bt_host[m * n_seq + s];
+            for (int64_t m = used; m < max_blocks; ++m) {
+                bt_lin[s * max_blocks + m] = 0;
             }
         }
-        ACL_CHECK(aclrtMemcpyAsync(bt_dev, bt_host.size() * sizeof(int32_t), bt_lin.data(),
-                                   bt_host.size() * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE, stream));
+        ACL_CHECK(aclrtMemcpyAsync(bt_dev, bt_lin.size() * sizeof(int32_t), bt_lin.data(),
+                                   bt_lin.size() * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE, stream));
     }
+    const int64_t meta_us = paged_timing ? ggml_time_us() - meta_t0 : 0;
 
     const bool decode = (n_tokens == n_seq);
     GGML_LOG_INFO("[CANN paged] op: %s n_tokens=%d n_seq=%d n_heads=%d n_kv=%d hd=%d bs=%d max_blocks=%d\n",
@@ -354,7 +530,7 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     if (decode) {
         atb::Tensor qa  = atb_tensor_maker::make(q_f16, {n_seq, n_heads, head_dim}, ACL_FLOAT16);
         atb::Tensor btt = atb_tensor_maker::make(bt_dev, {n_seq, max_blocks}, ACL_INT32);
-        atb::Tensor clt = atb_tensor_maker::make(cl_alloc.get(), {n_seq}, ACL_INT32, ACL_FORMAT_ND, cl_host.data());
+        atb::Tensor clt = atb_tensor_maker::make(cl_dev, {n_seq}, ACL_INT32, ACL_FORMAT_ND, cl_host.data());
         atb::Tensor out = atb_tensor_maker::make(out_f16, {n_seq, n_heads, head_dim}, ACL_FLOAT16);
 
         if (!g_atb.pa) {
@@ -364,22 +540,48 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         atb::VariantPack vp;
         vp.inTensors  = { qa, kc, vc, btt, clt };
         vp.outTensors = { out };
+        const int64_t pa_setup_t0 = paged_timing ? ggml_time_us() : 0;
         GGML_LOG_INFO("[CANN paged] PA call: cl_host min/max = %d/%d\n",
                       *std::min_element(cl_host.begin(), cl_host.end()),
                       *std::max_element(cl_host.begin(), cl_host.end()));
         setup_op(g_atb.pa, vp, &g_atb.ws_pa, &g_atb.ws_pa_sz, (atb::Context *) g_atb.ctx, stream);
+        const int64_t pa_setup_us = paged_timing ? ggml_time_us() - pa_setup_t0 : 0;
+        const int64_t pa_exec_t0 = paged_timing ? ggml_time_us() : 0;
         ATB_CHECK(((atb::Operation *) g_atb.pa)->Execute(vp, (uint8_t *) g_atb.ws_pa, g_atb.ws_pa_sz,
                                                          (atb::Context *) g_atb.ctx));
+        const int64_t pa_exec_us = paged_timing ? ggml_time_us() - pa_exec_t0 : 0;
+        if (paged_timing) {
+            GGML_LOG_ERROR("[paged timing] pa n_seq=%d setup_us=%lld exec_us=%lld meta_us=%lld fast=%d bt=%d q_cast_us=%lld kv_cast_us=%lld\n",
+                           (int) n_seq, (long long) pa_setup_us, (long long) pa_exec_us, (long long) meta_us,
+                           use_fast_meta ? 1 : 0, block_table->extra ? 1 : 0,
+                           (long long) q_cast_us, (long long) kv_cast_us);
+        }
     } else {
-        // Prefill: per-sequence. Chunks without past context compute attention
-        // over the contiguous chunk KV with PromptFlashAttention (the proven
-        // qwen35-engine path); ReshapeCache above already staged the same data
-        // into the NZ pools for later decode. Chunks with past context need a
-        // multi-token query over the paged pool, which is the Splitfuse op.
+        // Prefill: uncached chunks use the vLLM 310P SelfAttention path.
+        // ReshapeCache above has already staged the same K/V into the NZ pools.
+        // Chunks with past context need a multi-token query over the paged
+        // pool, which is the Splitfuse op.
         ggml_cann_pool_alloc sl_alloc(ctx.pool(), sizeof(int32_t));
 
         if (!g_atb.sf) {
             g_atb.sf = create_pa_op(n_heads, n_heads_kv, head_dim, /*spec=*/true);
+        }
+
+        std::vector<int32_t> prefill_lengths;
+        std::vector<int32_t> prefill_offsets;
+        for (int64_t seq = 0; seq < n_seq; ++seq) {
+            const int32_t len     = bl_host[seq];
+            const int32_t offset  = bo_host[seq];
+            const int32_t ctx_len = cl_host[seq];
+            if (len <= 0 || ctx_len != len) {
+                continue;
+            }
+            prefill_lengths.push_back(len);
+            prefill_offsets.push_back(offset);
+        }
+        if (!prefill_lengths.empty()) {
+            self_attention_prefill(ctx, q_f16, k_f16, v_f16, out_f16, prefill_lengths, prefill_offsets,
+                                   n_heads, n_heads_kv, head_dim, scale, stream);
         }
 
         for (int64_t seq = 0; seq < n_seq; ++seq) {
@@ -393,14 +595,9 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
             int32_t len_host = len;
 
             if (past_len == 0) {
-                prompt_flash_attention_seq(ctx,
-                                           (char *) q_f16 + offset * n_heads * head_dim * sizeof(uint16_t),
-                                           (char *) k_f16 + offset * n_heads_kv * head_dim * sizeof(uint16_t),
-                                           (char *) v_f16 + offset * n_heads_kv * head_dim * sizeof(uint16_t),
-                                           (char *) out_f16 + offset * n_heads * head_dim * sizeof(uint16_t),
-                                           len, n_heads, n_heads_kv, head_dim, scale, stream);
                 continue;
             }
+            const int64_t sf_t0 = paged_timing ? ggml_time_us() : 0;
 
             // Causal mask in NZ layout: [1, mask_ms/16, tokens_pad, 16]
             const int64_t mask_ms    = ((ctx_len + 15) / 16) * 16;
@@ -433,7 +630,7 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
                                                      {len, n_heads, head_dim}, ACL_FLOAT16);
             atb::Tensor btt = atb_tensor_maker::make((char *) bt_dev + seq * max_blocks * sizeof(int32_t),
                                                      {1, max_blocks}, ACL_INT32);
-            atb::Tensor clt = atb_tensor_maker::make((char *) cl_alloc.get() + seq * sizeof(int32_t), {1}, ACL_INT32,
+            atb::Tensor clt = atb_tensor_maker::make((char *) cl_dev + seq * sizeof(int32_t), {1}, ACL_INT32,
                                                      ACL_FORMAT_ND, &cl_host[seq]);
             atb::Tensor mk  = atb_tensor_maker::make(mask_alloc.get(), {1, mask_ms / 16, tokens_pad, 16},
                                                      ACL_FLOAT16, ACL_FORMAT_FRACTAL_NZ);
@@ -447,10 +644,20 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
             setup_op(g_atb.sf, vp, &g_atb.ws_sf, &g_atb.ws_sf_sz, (atb::Context *) g_atb.ctx, stream);
             ATB_CHECK(((atb::Operation *) g_atb.sf)->Execute(vp, (uint8_t *) g_atb.ws_sf, g_atb.ws_sf_sz,
                                                              (atb::Context *) g_atb.ctx));
+            if (paged_timing) {
+                GGML_LOG_ERROR("[paged timing] sf seq=%d len=%d us=%lld\n", (int) seq, (int) len,
+                               (long long) (ggml_time_us() - sf_t0));
+            }
         }
     }
 
+    const int64_t cast_back_t0 = paged_timing ? ggml_time_us() : 0;
     cast_back_to_dst(ctx, out_f16, dst, n_tokens, n_heads, head_dim);
+    if (paged_timing) {
+        GGML_LOG_ERROR("[paged timing] total n_tokens=%d n_seq=%d us=%lld cast_back_us=%lld\n",
+                       (int) n_tokens, (int) n_seq, (long long) (ggml_time_us() - total_t0),
+                       (long long) (ggml_time_us() - cast_back_t0));
+    }
 }
 
 #endif  // GGML_CANN_HAS_ATB

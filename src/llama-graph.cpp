@@ -1060,15 +1060,19 @@ void llm_graph_input_attn_kv_paged::set_input(const llama_ubatch* ubatch) {
     }
     if (paged_block_table) {
         ggml_backend_tensor_set(paged_block_table, mctx->get_block_table(), 0, ggml_nbytes(paged_block_table));
+        paged_block_table->extra = mctx->get_block_table();
     }
     if (paged_context_lens) {
         ggml_backend_tensor_set(paged_context_lens, mctx->get_context_lens(), 0, ggml_nbytes(paged_context_lens));
+        paged_context_lens->extra = mctx->get_context_lens();
     }
     if (paged_batch_offsets) {
         ggml_backend_tensor_set(paged_batch_offsets, mctx->get_batch_offsets(), 0, ggml_nbytes(paged_batch_offsets));
+        paged_batch_offsets->extra = mctx->get_batch_offsets();
     }
     if (paged_batch_lens) {
         ggml_backend_tensor_set(paged_batch_lens, mctx->get_batch_lens(), 0, ggml_nbytes(paged_batch_lens));
+        paged_batch_lens->extra = mctx->get_batch_lens();
     }
 }
 
@@ -3538,6 +3542,11 @@ llm_graph_input_attn_kv_paged * llm_graph_context::build_attn_inp_kv_paged() con
     inp->paged_context_lens  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, batch_size);
     inp->paged_batch_offsets = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, batch_size);
     inp->paged_batch_lens    = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, batch_size);
+
+    ggml_set_name(inp->paged_block_table, "paged_block_table");
+    ggml_set_name(inp->paged_context_lens, "paged_context_lens");
+    ggml_set_name(inp->paged_batch_offsets, "paged_batch_offsets");
+    ggml_set_name(inp->paged_batch_lens, "paged_batch_lens");
 
     ggml_set_input(inp->paged_write_slots);
     ggml_set_input(inp->paged_block_table);

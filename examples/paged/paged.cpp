@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <clocale>
+#include <cstdlib>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -52,6 +53,23 @@ static void add_request_from_pool(struct llama_paged_scheduler * scheduler,
                                   int                            seq_id) {
     const std::string        input_prompt = k_prompts[pool_index % k_n_prompts];
     std::vector<llama_token> tokens       = common_tokenize(ctx, input_prompt, true);
+
+    // Optional bench knob: pad or trim the tokenized prompt to a fixed length.
+    if (const char * env = getenv("LLAMA_PAGED_PROMPT_TOKENS")) {
+        const int target = atoi(env);
+        if (target > 0) {
+            if ((size_t) target < tokens.size()) {
+                tokens.resize(target);
+            } else {
+                const std::vector<llama_token> filler = common_tokenize(
+                    ctx, " the quick brown fox jumps over the lazy dog", false);
+                while (tokens.size() < (size_t) target) {
+                    tokens.insert(tokens.end(), filler.begin(), filler.end());
+                }
+                tokens.resize(target);
+            }
+        }
+    }
 
     bool success = llama_paged_scheduler_add_request(scheduler, tokens.data(), tokens.size(), seq_id);
     if (!success) {
@@ -137,6 +155,8 @@ int main(int argc, char ** argv) {
         __func__, params.n_sequences, params.n_predict, params.n_gpu_blocks, params.n_cpu_blocks);
 
     const int64_t t_start_us = ggml_time_us();
+    int64_t       t_tg_start_us = 0;
+    bool          tg_started = false;
 
     while (true) {
         const bool success = llama_paged_scheduler_prepare_batch(scheduler, &batch);
@@ -159,6 +179,15 @@ int main(int argc, char ** argv) {
 
         const llama_paged_batch_info * info = llama_paged_scheduler_get_batch_info(scheduler);
         GGML_ASSERT(info != nullptr && "llama_paged_batch_info is nullptr.");
+
+        bool all_decode = info->n_seq > 0;
+        for (int i = 0; i < info->n_seq; ++i) {
+            all_decode = all_decode && info->batch_lens[i] == 1;
+        }
+        if (all_decode && !tg_started) {
+            t_tg_start_us = ggml_time_us();
+            tg_started = true;
+        }
         for (int i = 0; i < info->n_seq; ++i) {
             int32_t request_id = batch.seq_id[info->batch_offsets[i]][0];
 
@@ -265,6 +294,11 @@ int main(int argc, char ** argv) {
     LOG_INF("  n_gpu_blocks         : %d\n", params.n_gpu_blocks);
     LOG_INF("  n_cpu_blocks         : %d\n", params.n_cpu_blocks);
     LOG_INF("  total elapsed        : %.2f s\n", elapsed_s);
+    if (tg_started) {
+        const float tg_s = (ggml_time_us() - t_tg_start_us) / 1e6f;
+        LOG_INF("  decode elapsed       : %.3f s\n", tg_s);
+        LOG_INF("  decode aggregate tps : %.2f tokens/s\n", total_decoded_tokens / tg_s);
+    }
     LOG_INF("  total prompt tokens  : %d\n", total_prompt_tokens);
     LOG_INF("  total decoded tokens : %d\n", total_decoded_tokens);
     LOG_INF("  aggregate tps        : %.2f tokens/s\n", agg_tps);

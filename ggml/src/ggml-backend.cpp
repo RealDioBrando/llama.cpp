@@ -919,6 +919,16 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
+    // Paged attention has many tiny CPU control inputs; keep it with its KV cache backend.
+    if (tensor->op == GGML_OP_PAGED_ATTN) {
+        for (int b = 0; b < sched->n_backends - 1; b++) {
+            if (ggml_backend_supports_op(sched->backends[b], tensor)) {
+                SET_CAUSE(tensor, "1.pged");
+                return b;
+            }
+        }
+    }
+
     // assign pre-allocated nodes to their backend
     int cur_backend_id = ggml_backend_sched_backend_from_buffer(sched, tensor, tensor);
     if (cur_backend_id != -1) {
@@ -1670,6 +1680,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+            if (input->extra && strncmp(input->name, "paged_", 6) == 0) {
+                input_cpy->extra = input->extra;
+            }
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
