@@ -1,6 +1,7 @@
 #include "ggml-backend.h"
 #include "llama-block-manager.h"
 #include "llama-kv-cache-paged.h"
+#include "llama-paged-prefix-cache.h"
 #include "llama-paged-scheduler-impl.h"
 
 #include <cassert>
@@ -388,6 +389,166 @@ TEST(test_scheduler_rejects_oversized_prompt) {
     EXPECT_TRUE(queued);
 }
 
+// Testing prefix cache
+
+TEST(test_block_manager_add_ref) {
+    llama_block_manager bm;
+    bm.init(/*n_gpu=*/4, /*n_cpu=*/2, 0.0f);
+
+    auto ids = bm.checkout_gpu_blocks(2);
+    EXPECT_EQ(ids.size(), 2u);
+
+    EXPECT_TRUE(bm.add_ref_block(ids[0]));
+    EXPECT_EQ(bm.block_ref_count(ids[0]), 2u);
+    EXPECT_EQ(bm.n_free_gpu_blocks(), 2u);
+
+    EXPECT_FALSE(bm.add_ref_block(999));
+    bm.release_gpu_blocks({ids[1]});
+    EXPECT_EQ(bm.block_ref_count(ids[1]), 0u);
+    EXPECT_FALSE(bm.add_ref_block(ids[1]));
+
+    bm.release_gpu_blocks({ids[0]});
+    EXPECT_EQ(bm.block_ref_count(ids[0]), 1u);
+    EXPECT_EQ(bm.n_free_gpu_blocks(), 3u);
+    bm.release_gpu_blocks({ids[0]});
+    EXPECT_EQ(bm.block_ref_count(ids[0]), 0u);
+    EXPECT_EQ(bm.n_free_gpu_blocks(), 4u);
+}
+
+TEST(test_prefix_cache_register_find) {
+    llama_paged_prefix_cache pc;
+    pc.register_block(100, /*block_id=*/7, /*owner=*/0, /*idx=*/0, /*first=*/1, /*last=*/2);
+
+    const auto * e = pc.find_block(100, 1, 2);
+    EXPECT_TRUE(e != nullptr);
+    EXPECT_EQ(e->block_id, 7u);
+    EXPECT_TRUE(pc.find_block(100, 9, 9) == nullptr);
+
+    pc.update_block_id(100, 8);
+    EXPECT_EQ(pc.find_block(100, 1, 2)->block_id, 8u);
+}
+
+TEST(test_prefix_cache_cached_lifecycle) {
+    llama_paged_prefix_cache pc;
+    pc.register_block(1, 10, 0, 0, 1, 1);
+    pc.register_block(2, 11, 0, 1, 1, 1);
+    pc.set_cached_state(1, true);
+    pc.set_cached_state(2, true);
+    pc.set_cached_state(2, false);
+
+    uint64_t h    = 0;
+    uint32_t id   = 0;
+    EXPECT_TRUE(pc.pop_lru_cached(h, id));
+    EXPECT_EQ(h, 1ull);
+    EXPECT_EQ(id, 10u);
+    EXPECT_FALSE(pc.pop_lru_cached(h, id));
+}
+
+TEST(test_prefix_cache_ckpt_slots) {
+    llama_paged_prefix_cache pc;
+    pc.set_ckpt_slots(/*base=*/6, /*n=*/2);
+    EXPECT_TRUE(pc.seq_reserved(6));
+    EXPECT_TRUE(pc.seq_reserved(7));
+    EXPECT_FALSE(pc.seq_reserved(5));
+    EXPECT_FALSE(pc.seq_reserved(8));
+
+    EXPECT_EQ(pc.acquire_ckpt_slot(42, 64), 6);
+    EXPECT_EQ(pc.acquire_ckpt_slot(43, 128), 7);
+    EXPECT_EQ(pc.acquire_ckpt_slot(42, 64), 6);
+    EXPECT_EQ(pc.acquire_ckpt_slot(44, 192), 6);
+    EXPECT_TRUE(pc.find_ckpt(43) != nullptr);
+    EXPECT_TRUE(pc.find_ckpt(44) != nullptr);
+}
+
+TEST(test_scheduler_prefix_cache_hit) {
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/8, /*n_cpu_blocks=*/2);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(0, /*n_prompt=*/32)));
+    llama_batch            batch  = {};
+    llama_scheduler_status status = fixture.sched->step(batch);
+    EXPECT_TRUE(status == llama_scheduler_status::OK);
+    EXPECT_EQ(batch.n_tokens, 32);
+
+    const auto * info0 = fixture.sched->get_curr_batch_info();
+    const uint32_t blk0 = (uint32_t) info0->block_table[0];
+    const uint32_t blk1 = (uint32_t) info0->block_table[1];
+    std::vector<llama_token> sampled(info0->n_seq, 7);
+    std::vector<int8_t>      stop(info0->n_seq, 1);
+    fixture.sched->update(batch, sampled, stop.data());
+
+    // Finalizing the request keeps its registered blocks cache-resident.
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_EQ(fixture.kv->block_ref_count(blk0), 1u);
+    EXPECT_EQ(fixture.kv->block_ref_count(blk1), 1u);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(1, /*n_prompt=*/48)));
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    auto * g1 = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(g1 != nullptr);
+    EXPECT_EQ(g1->n_past, 32u);
+    EXPECT_EQ(g1->n_prompt, 16u);
+    EXPECT_EQ(g1->block_table[0], blk0);
+    EXPECT_EQ(g1->block_table[1], blk1);
+    EXPECT_EQ(fixture.kv->block_ref_count(blk0), 2u);
+
+    const llama_block_ids table1 = g1->block_table;
+    std::vector<llama_token> sampled1(1, 8);
+    fixture.sched->update(batch, sampled1, stop.data());
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_EQ(fixture.kv->block_ref_count(blk0), 1u);
+    EXPECT_EQ(fixture.kv->block_ref_count(blk1), 1u);
+    // Req1 registered its first fresh block before finishing; it stays
+    // cache-resident while the remaining fresh blocks go back to the pool.
+    EXPECT_EQ(fixture.kv->block_ref_count(table1[2]), 1u);
+    EXPECT_EQ(fixture.kv->block_ref_count(table1[3]), 0u);
+}
+
+TEST(test_scheduler_prefix_cache_zero_suffix) {
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/8, /*n_cpu_blocks=*/2);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(0, /*n_prompt=*/32)));
+    llama_batch batch = {};
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    std::vector<llama_token> sampled(1, 7);
+    std::vector<int8_t>      stop(1, 1);
+    fixture.sched->update(batch, sampled, stop.data());
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+
+    // An exact prompt match cannot replay the last token, so one block
+    // stays unshared to keep a non-empty suffix.
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(1, /*n_prompt=*/32)));
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    auto * g1 = fixture.sched->get_group_from_id(1);
+    EXPECT_TRUE(g1 != nullptr);
+    EXPECT_EQ(g1->n_past, 16u);
+    EXPECT_EQ(g1->n_prompt, 16u);
+}
+
+TEST(test_scheduler_prefix_cache_eviction) {
+    auto fixture = make_fixture(/*n_ctx=*/256, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/5, /*n_cpu_blocks=*/2);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(0, /*n_prompt=*/32)));
+    llama_batch batch = {};
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    std::vector<llama_token> sampled(1, 7);
+    std::vector<int8_t>      stop(1, 1);
+    fixture.sched->update(batch, sampled, stop.data());
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+
+    // Only 3 blocks are free; the fresh request needs 5, so the cache
+    // must release its resident blocks for admission to succeed.
+    auto group1 = make_group(1, /*n_prompt=*/33);
+    for (auto & t : group1.logical_seq) {
+        t = 9;  // unrelated tokens: no prefix match
+    }
+    EXPECT_TRUE(fixture.sched->queue_request(group1));
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_EQ(batch.n_tokens, 33);
+}
+
 int main(int /*argc*/, char ** /*argv*/) {
     fprintf(stderr, "test-paged-kv: block_manager\n");
     RUN(test_block_manager_leak_simple);
@@ -411,6 +572,15 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_scheduler_no_deadlock_on_empty);
     RUN(test_scheduler_deadlock_oversize_waiting_request);
     RUN(test_scheduler_rejects_oversized_prompt);
+
+    fprintf(stderr, "test-paged-kv: prefix cache\n");
+    RUN(test_block_manager_add_ref);
+    RUN(test_prefix_cache_register_find);
+    RUN(test_prefix_cache_cached_lifecycle);
+    RUN(test_prefix_cache_ckpt_slots);
+    RUN(test_scheduler_prefix_cache_hit);
+    RUN(test_scheduler_prefix_cache_zero_suffix);
+    RUN(test_scheduler_prefix_cache_eviction);
 
     fprintf(stderr, "test-paged-kv: ALL PASSED\n");
     return 0;
