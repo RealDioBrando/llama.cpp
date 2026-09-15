@@ -26,6 +26,8 @@
 #include "acl_tensor.h"
 #include "common.h"
 
+#include <cstdlib>
+
 #include <aclnnop/aclnn_abs.h>
 #include <aclnnop/aclnn_arange.h>
 #include <aclnnop/aclnn_argsort.h>
@@ -999,6 +1001,159 @@ static bool is_matmul_weight(const ggml_tensor * tensor) {
         }
     }
     return false;
+}
+
+/**
+ * @brief   K-quant (Q4_K/Q5_K/Q6_K) NPU matmul path selection (310P).
+ *
+ * @details Decides how a K-quant matmul weight is handled on the CANN backend:
+ *            - GGML_CANN_KQ_W8A8: Q5_K/Q6_K dequantized + re-quantized to int8
+ *              (K-axis group size GGML_CANN_W8A8_GROUP_SIZE) at load time, and
+ *              mul_mat runs via aclnnDynamicQuantV2 + aclnnQuantMatmulV5 (W8A8 KG).
+ *            - GGML_CANN_KQ_W4A8: Q4_K re-quantized to packed int4 (group 256,
+ *              with x2Scale/u64 + yOffset), for the W4A8 kernel.
+ *          The SAME decision must drive: buffer alloc size, set_tensor transform,
+ *          and supports_op / mul_mat dispatch. Never call this with different
+ *          env settings in one process (all helpers cache env once).
+ *
+ * @param tensor The weight tensor (src0 of MUL_MAT).
+ * @return 0 = no NPU path (fallback), 1 = W8A8, 2 = W4A8.
+ */
+enum ggml_cann_kq_path {
+    GGML_CANN_KQ_NONE = 0,
+    GGML_CANN_KQ_W8A8 = 1,
+    GGML_CANN_KQ_W4A8 = 2,
+};
+
+static bool ggml_cann_env_off(const char * name) {
+    const char * e = getenv(name);
+    return e != nullptr && (e[0] == '0' || e[0] == 'o' || e[0] == 'f' || e[0] == 'O' || e[0] == 'F');
+}
+
+static bool ggml_cann_env_on(const char * name) {
+    const char * e = getenv(name);
+    return e != nullptr && (e[0] == '1' || e[0] == 'o' || e[0] == 't' || e[0] == 'O' || e[0] == 'T');
+}
+
+static bool ggml_cann_quant_matmul_enabled() {
+    // Master switch for Q5_K/Q6_K -> W8A8. Default ON.
+    static const bool enabled = !ggml_cann_env_off("GGML_CANN_QUANT_MATMUL");
+    return enabled;
+}
+
+static int ggml_cann_w8_group_size() {
+    // W8A8 K-axis group size for weight re-quantization. Default 32 (Q8_0 native).
+    static const int gs = [] {
+        int v = 32;
+        if (const char * e = getenv("GGML_CANN_W8A8_GROUP_SIZE")) {
+            v = atoi(e);
+        }
+        if (v != 32 && v != 64 && v != 128 && v != 256) {
+            v = 32;
+        }
+        return v;
+    }();
+    return gs;
+}
+
+static bool ggml_cann_w8a8_enabled() {
+    // Q5_K/Q6_K -> W8A8 path-specific switch, symmetric to GGML_CANN_W4A8_MATMUL.
+    // Default ON (opt-out): the W8A8 KG kernel ships in the baseline vendor package
+    // and is ppl-compliant; set GGML_CANN_W8A8_MATMUL=0 to fall back to CPU for
+    // Q5_K/Q6_K layers. The legacy master switch GGML_CANN_QUANT_MATMUL=0 also
+    // disables this path (backward compatibility).
+    static const bool enabled = !ggml_cann_env_off("GGML_CANN_W8A8_MATMUL") &&
+                                ggml_cann_quant_matmul_enabled();
+    return enabled;
+}
+
+static bool ggml_cann_w4a8_enabled() {
+    // Q4_K -> packed-int4 W4A8 path. Default OFF: requires the W4A8 operator
+    // (310P A8W4Int kernel) to be present in the deployed vendor package.
+    static const bool enabled = ggml_cann_env_on("GGML_CANN_W4A8_MATMUL");
+    return enabled;
+}
+
+static bool ggml_cann_qmat_debug() {
+    static const bool on = ggml_cann_env_on("GGML_CANN_QMAT_DEBUG");
+    return on;
+}
+
+static int ggml_cann_kq_matmul_path(const ggml_tensor * tensor) {
+    if (!is_matmul_weight(tensor)) {
+        return GGML_CANN_KQ_NONE;
+    }
+    if (tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+        return GGML_CANN_KQ_NONE;
+    }
+    const int64_t k = tensor->ne[0];
+    const int64_t n = tensor->ne[1];
+    if (k <= 0 || n <= 0) {
+        return GGML_CANN_KQ_NONE;
+    }
+    switch (tensor->type) {
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            if (!ggml_cann_w8a8_enabled()) {
+                return GGML_CANN_KQ_NONE;
+            }
+            if (k % 256 != 0 || n % 16 != 0) {
+                return GGML_CANN_KQ_NONE;  // 256 = QK_K block; 16 = NPU fractal n0
+            }
+            if (k % ggml_cann_w8_group_size() != 0) {
+                return GGML_CANN_KQ_NONE;
+            }
+            return GGML_CANN_KQ_W8A8;
+        case GGML_TYPE_Q8_0:
+            // Q8_0 -> W8A8: LOSSLESS (int8 quants copied verbatim, half scale
+            // widened exactly to fp32). Native block = QK8_0 = 32, so the
+            // re-quantized layout only exists when the configured group size
+            // is exactly 32 — otherwise fall back to CPU (no re-grouping).
+            if (!ggml_cann_w8a8_enabled()) {
+                return GGML_CANN_KQ_NONE;
+            }
+            if (ggml_cann_w8_group_size() != 32) {
+                return GGML_CANN_KQ_NONE;  // only the native, lossless grouping
+            }
+            if (k % 32 != 0 || n % 16 != 0) {
+                return GGML_CANN_KQ_NONE;  // 32 = QK8_0 block; 16 = NPU fractal n0
+            }
+            return GGML_CANN_KQ_W8A8;
+        case GGML_TYPE_Q4_K:
+            if (!ggml_cann_w4a8_enabled()) {
+                return GGML_CANN_KQ_NONE;
+            }
+            if (k % 256 != 0 || n % 8 != 0) {
+                return GGML_CANN_KQ_NONE;  // 256 = W4A8 groupSize; 8 = int32 packing
+            }
+            return GGML_CANN_KQ_W4A8;
+        default:
+            return GGML_CANN_KQ_NONE;
+    }
+}
+
+/**
+ * @brief   Device-side buffer size of a K-quant weight after NPU transform.
+ *
+ * @details Must be used consistently in get_alloc_size (buffer reservation) and
+ *          set_tensor (upload size):
+ *            W8A8 layout: [quants n*k int8][scales (k/gs) x n fp32]
+ *            W4A8 layout: [quants k x (n/8) int32 (8 x int4 each)]
+ *                         [scales (k/256) x n uint64 (fp32 bits in low word)]
+ *                         [yOffset n x fp32]
+ */
+static size_t ggml_cann_kq_layout_size(const ggml_tensor * tensor, int path) {
+    const int64_t k = tensor->ne[0];
+    const int64_t n = tensor->ne[1];
+    if (path == GGML_CANN_KQ_W8A8) {
+        const int64_t gs = ggml_cann_w8_group_size();
+        return (size_t) (n * k) + (size_t) ((k / gs) * n) * sizeof(float);
+    }
+    if (path == GGML_CANN_KQ_W4A8) {
+        return (size_t) (k * (n / 8)) * sizeof(int32_t) + (size_t) ((k / 256) * n) * sizeof(uint64_t) +
+               (size_t) (n) * sizeof(float);
+    }
+    return 0;
 }
 
 /**
