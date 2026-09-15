@@ -991,7 +991,11 @@ static bool is_matmul_weight(const ggml_tensor * tensor) {
     static const std::unordered_set<std::string> weight_suffixes{ "output.weight",      "attn_q.weight",
                                                                   "attn_k.weight",      "attn_v.weight",
                                                                   "attn_output.weight", "ffn_gate.weight",
-                                                                  "ffn_up.weight",      "ffn_down.weight" };
+                                                                  "ffn_up.weight",      "ffn_down.weight",
+                                                                  // linear attention (GatedDeltaNet) projections
+                                                                  "attn_qkv.weight",    "attn_gate.weight",
+                                                                  "ssm_out.weight",     "ssm_beta.weight",
+                                                                  "ssm_alpha.weight" };
 
     for (const auto & suffix : weight_suffixes) {
         if (name.find(suffix) != std::string::npos) {
