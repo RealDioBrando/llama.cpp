@@ -2,8 +2,10 @@
 
 #include "llama-kv-cache-paged.h"
 #include "llama-memory-hybrid-paged.h"
+#include "llama-paged-prefix-cache.h"
 
 #include <clocale>
+#include <cstdlib>
 #include <vector>
 
 enum class llama_scheduler_status {
@@ -53,6 +55,14 @@ class llama_paged_scheduler_impl {
     void clear_batch(llama_batch & batch);
     void populate_batch_from(const llama_sequence_group_raw_list & candidates, llama_batch & batch);
 
+    // Prefix cache
+    void try_apply_prefix_cache(llama_sequence_group & group);
+    void register_completed_blocks(llama_sequence_group & group);
+    void maybe_create_checkpoint(llama_sequence_group & group);
+    bool evict_cached_blocks();
+    static uint64_t hash_block(uint64_t prev, const std::vector<llama_token> & tokens, uint32_t block_idx,
+                               uint32_t block_size);
+
     llama_sequence_group_list running;
     llama_sequence_group_list swapped;
     llama_sequence_group_list waiting;
@@ -66,6 +76,10 @@ class llama_paged_scheduler_impl {
     llama_kv_cache_paged * kv_cache_manager = nullptr;
     llama_memory_hybrid_paged * hybrid_memory_manager = nullptr;
     llama_paged_batch_info curr_info;
+
+    llama_paged_prefix_cache prefix_cache;
+    bool                     prefix_cache_enabled = true;
+    uint32_t                 n_ckpt_requested     = 4;
 
     uint32_t n_livelock_steps   = 0;
     uint32_t prev_n_swapped     = 0;

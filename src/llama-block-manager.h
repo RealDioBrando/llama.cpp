@@ -38,6 +38,13 @@ class llama_block_manager {
     physical_block_ids checkout_gpu_blocks(uint32_t num_blocks);
     physical_block_ids checkout_cpu_blocks(uint32_t num_blocks);
 
+    // Share an already allocated block: ref_count++, no data copy.
+    // Returns false when the block is not currently allocated.
+    bool add_ref_block(uint32_t id);
+
+    // 0 means the block is free (or unknown).
+    uint32_t block_ref_count(uint32_t id) const;
+
     void release_gpu_blocks(const physical_block_ids & freed_blocks);
     void release_cpu_blocks(const physical_block_ids & freed_blocks);
 

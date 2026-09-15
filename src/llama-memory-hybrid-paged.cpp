@@ -151,17 +151,18 @@ void llama_memory_hybrid_paged::seq_cp(
         llama_seq_id seq_id_dst,
         llama_pos    p0,
         llama_pos    p1) {
-    GGML_UNUSED(seq_id_src);
-    GGML_UNUSED(seq_id_dst);
-    GGML_UNUSED(p0);
-    GGML_UNUSED(p1);
-
-    throw std::runtime_error("seq_cp is not supported by hybrid-paged memory");
+    // The paged scheduler drives attention-side block sharing via
+    // llama_kv_cache_paged::share_blocks; seq_cp only forks the GDN
+    // state (used by prefix-cache checkpoint slots).
+    mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
 void llama_memory_hybrid_paged::seq_keep(llama_seq_id seq_id) {
-    GGML_UNUSED(seq_id);
-    throw std::runtime_error("seq_keep is not supported by hybrid-paged memory");
+    mem_recr->seq_keep(seq_id);
+}
+
+uint32_t llama_memory_hybrid_paged::get_n_seq_max() const {
+    return mem_recr->get_n_seq_max();
 }
 
 void llama_memory_hybrid_paged::seq_add(

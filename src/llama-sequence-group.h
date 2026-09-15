@@ -19,11 +19,13 @@ struct llama_sequence_group {
     int64_t t_first_token_us = 0;
 
     uint32_t n_prompt  = 0;
+    uint32_t n_prompt_total = 0;  // prompt length before any prefix-cache split
     uint32_t n_decoded = 0;
     uint32_t n_past    = 0;
 
     std::vector<llama_token> logical_seq;
     llama_block_ids          block_table;
+    std::vector<uint64_t>    block_hashes;  // per completed block, prefix cache chain
 };
 
 using llama_sequence_group_raw_list = std::vector<llama_sequence_group *>;

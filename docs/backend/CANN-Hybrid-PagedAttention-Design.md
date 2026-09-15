@@ -715,3 +715,127 @@ strict token window: passed
 
 这说明 dense 分支的 paged metadata、GDN state 和 graph input 生命周期
 没有错位。
+
+## 17. Qwen3.5-9B F16 prefill/decode 分相瓶颈 (2026-09-15)
+
+### 17.1 测量口径
+
+- 基准命令: `llama-paged -kvp -np 1 -ns 1 -n 64 -c 4096 -b 2048 -ub 512
+  -ngpub 256 -ncpub 64 -kvbls 64`, 2048 token prompt, FP16。
+- 重跑确认: TTFT 4002 ms, TPOT 149.2 ms, decode elapsed 9.22 s / 64 tok。
+- 旧 msprof trace 存在事件截断: 设备轨道 8.01 s, 约 30.6k 算子,
+  覆盖全部 prefill + 仅 8/64 个 decode 步。旧结论 "decode MatMulV2 57%"
+  实际混入了 prefill 分段, 本节按 step 边界重新归相。
+- step 边界用 CPU 轨道 `aclrtMemcpyAsync` (每步 1-2 次 logits D2H) 定位;
+  prefill/decode 用 matmul 的 M 维 (M=512 vs M=1) 区分。
+
+### 17.2 prefill (2048 tok, TTFT 约 4.0 s)
+
+结构: 4 个 512-token ubatch。ubatch 1 作为单一 CANN 段执行 (902 ms,
+设备忙约 550 ms); ubatch 2-4 的图被切成每 ubatch 约 8 个 CANN 段,
+每段约 112 ms (忙约 65 ms), 段内含一个 full-attn 层的 SplitFuse 调用
+(24 次 SF = 3 ubatch x 8 层)。
+
+每个 ubatch 约 900 ms, 其中设备忙约 60%, host 空泡约 40%。设备忙构成:
+
+```text
+MatMulV2 (M=512)    约 230 ms   平均约 930 us/次, 比带宽理想值慢 3-4x
+Transpose/Cast/
+TransData/AsStrided 约 155 ms
+RmsNorm/Swish/Mul/
+Add                 约 146 ms   RmsNorm 390 us/次, 比理想值慢 10-20x
+attention (PFA/SF)  约 2.5 ms   非瓶颈
+```
+
+### 17.3 decode (TPOT 约 149-157 ms)
+
+每步 2231 个设备算子, 249 次 M=1 matmul, 8 次 PA:
+
+```text
+MatMulV2 (M=1)     约 93 ms/步  59%
+  - lm_head 一次约 11.7 ms (约 1.0 GB 权重, 慢 4-5x)
+  - 50 MB 级 GEMV 约 600 us/次, 慢 4-5x
+host 空泡          约 64 ms/步  41% (418 个 >0.5 ms gap)
+PA (8 层)          约 0.63 ms/步  非瓶颈
+```
+
+host 空泡主因: `GGML_OP_SSM_SCAN` 未实现 CANN 后端, 每层 GDN 的
+scan 走 CPU, 把每步图切成约 17 个 CPU/CANN 段 (全 run 约 1148 段),
+每段切换有 2-13 ms 同步开销 (trace 中大量 `Sigmoid -> TensorMove` gap)。
+
+### 17.4 结论与优先级
+
+1. decode 最大收益: 让 SSM_SCAN 上 CANN 或把 GDN 段与 CANN 段合并,
+   消除每步约 64 ms 空泡 (理论 TPOT 可到约 90 ms)。
+2. decode 次优: M=1 GEMV 走 NZ 权重效率 2-5x 差, 可评估 W8A8/W4 量化
+   或 GEMV 专用路径, 目标把 93 ms 压到约 40-50 ms。
+3. prefill: 消除 ubatch 2-4 的分段 (对齐 ubatch 1 的单段模式),
+   融合 RmsNorm/SwiGLU, 减少 Transpose/Cast; PA 本身不是瓶颈。
+
+## 18. Prefix Cache 可行性分析 (2026-09-15)
+
+完整接入方案已单独成文:
+`docs/backend/CANN-Hybrid-PagedAttention-PrefixCache-Design.md`。
+本节保留可行性结论。
+
+### 18.1 已有基础
+
+- `llama_block_manager` 的物理块已带 `ref_count`, 释放按引用计数归零,
+  块共享只需在共享时 `ref_count++`, 无需新增数据结构。
+- KV 块按 sequence 追加写入, 写入永远发生在已有内容之后; 只共享
+  "整块" 时被共享块天然不可变, 不需要 CoW 数据拷贝。
+  `do_block_copy` (swap in/out 使用) 已提供块级搬移能力。
+- `llama_memory_recurrent::seq_cp` 已实现 (cell 共享), hybrid-paged
+  graph 已接线 `s_copy` 输入, GDN 状态复制机制存在。
+- PA kernel 按 per-seq block table + context_lens 读取, 共享块只是
+  block table 里的重复条目, CANN 后端注意力零改动。
+
+### 18.2 方案 (块粒度前缀共享)
+
+1. 内容索引: 每个 block 维护 token hash 链
+   `hash[i] = H(hash[i-1], block_tokens[i])`, 由 scheduler 维护
+   `chain -> 物理块 id` 索引; decode 采样的 token 追加进链。
+2. 准入: `add_request` 时按 prompt 的块 hash 链匹配, 得到最长匹配块数
+   `k`; 新 group 的 block_table 前 k 项指向共享物理块 (`ref_count++`),
+   只 prefill 后缀, 后缀 pos 基准 = `k * block_size`。
+3. GDN 状态分叉 (hybrid 特有难点): 优先复用 recurrent memory 已有的
+   seq_cp + cell COW + `s_copy` 图输入机制。做法: seq 跨越块边界 B 时
+   `seq_cp(seq -> checkpoint slot)`, checkpoint slot 与 seq 共享当前
+   tail cell; seq 推进下一个 ubatch 时, prepare() 检测到 cell 共享会
+   "copy old tail into the empty cell", 图内 `s_copy` 自动把 state@B
+   留在 checkpoint slot, 快照零新增代码。分叉时反向
+   `seq_cp(checkpoint -> new seq)` 恢复 state@B, 再跑后缀 prefill。
+   注意本 fork 的 recurrent 已带 `n_rs_seq` 回滚快照 (状态张量按
+   `(1 + n_rs_seq)` 加宽), 快照基础设施存在, 只需给 checkpoint 分配
+   seq id / cell 预算。不做 per-block 全量快照 (状态体积是 KV 的
+   上百倍, 不可行); 无 checkpoint 命中时回退为从最近 checkpoint 重扫
+   GDN 前缀尾部。
+4. 驱逐: 复用现有 free list FIFO + `ref_count` (共享块在 ref>0 时
+   不可回收, 天然受保护); v1 不做 LRU 重排。
+
+### 18.3 改动点与工作量
+
+```text
+llama-paged-scheduler-impl.cpp  块 hash 链维护 / 准入匹配 / 后缀 prefill
+                                / pos 基准 / 边界快照触发
+llama-kv-cache-paged.cpp        share_blocks API (ref++ 不拷数据)
+                                seq_cp/seq_keep 落地
+llama-memory-recurrent.cpp      checkpoint slot 生命周期 (seq id /
+                                cell 预算), 无需新增快照池
+llama-memory-hybrid-paged.cpp   seq_cp 去掉 throw, attn 侧块共享 +
+                                recr 侧透传
+新增 (可选) llama-prefix-index  hash 索引独立成文件
+```
+
+dense 全注意力模型 (如 Qwen3-8B PA 路径) 无 GDN 状态问题, 只需 1/2 条,
+估计 300-400 行; hybrid 完整版再加 300-500 行。全部改动落在 paged
+生态文件, 不触碰 ggml-cann kernel 和模型/graph 构建层。
+
+### 18.4 风险与验证
+
+- 快照时点差一: 快照必须是"处理完第 B 块最后一个 token 之后"的状态。
+- pos/n_decoded 记账: 后缀 prefill 的 RoPE pos、context_lens、块分配
+  余量必须把共享前缀计入。
+- 共享块换出: 两个 group 可分别持有 GPU/CPU 副本, 块不可变所以一致。
+- 验证: 同 system prompt 双请求 argmax 对齐非缓存路径; 共享块同时
+  decode 正确性; 缓存命中下 TTFT 对比; 池压力下的驱逐行为。

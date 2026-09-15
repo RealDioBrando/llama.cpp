@@ -1,5 +1,7 @@
 #include "llama-kv-cache-paged.h"
 
+#include <algorithm>
+
 #include "llama-impl.h"
 
 //
@@ -107,7 +109,9 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
 
 bool llama_kv_cache_paged::allocate(int32_t num_tokens, llama_sequence_group & group) {
     uint32_t curr_block_count     = group.block_table.size();
-    uint32_t total_num_tokens     = group.n_prompt + group.n_decoded + num_tokens;
+    // n_past counts tokens already covered by block_table (including a
+    // prefix shared through the prefix cache).
+    uint32_t total_num_tokens     = group.n_past + (group.n_decoded > 0 ? 0u : group.n_prompt) + num_tokens;
     uint32_t num_requested_blocks = std::ceil((float) total_num_tokens / block_size) - curr_block_count;
     LLAMA_LOG_DEBUG("%s: curr_block_count=%d, total_num_tokens=%d, num_requested_blocks=%d\n", __func__,
                     curr_block_count, total_num_tokens, num_requested_blocks);
@@ -128,6 +132,10 @@ bool llama_kv_cache_paged::allocate(int32_t num_tokens, llama_sequence_group & g
 }
 
 void llama_kv_cache_paged::free_blocks(llama_sequence_group & group) {
+    free_blocks(group, {});
+}
+
+void llama_kv_cache_paged::free_blocks(llama_sequence_group & group, const llama_block_ids & keep) {
     if (group.block_table.empty()) {
         return;
     }
@@ -136,6 +144,9 @@ void llama_kv_cache_paged::free_blocks(llama_sequence_group & group) {
     llama_block_ids blocks_to_free_cpu;
 
     for (uint32_t block_id : group.block_table) {
+        if (std::find(keep.begin(), keep.end(), block_id) != keep.end()) {
+            continue;
+        }
         if (block_manager.is_gpu(block_id)) {
             blocks_to_free_gpu.push_back(block_id);
         } else {
@@ -152,6 +163,19 @@ void llama_kv_cache_paged::free_blocks(llama_sequence_group & group) {
 
     group.block_table.clear();
     seq_rm(group.request_id, llama_pos{}, llama_pos{});
+}
+
+bool llama_kv_cache_paged::release_block(uint32_t block_id) {
+    if (block_manager.is_gpu(block_id)) {
+        block_manager.release_gpu_blocks({block_id});
+    } else {
+        block_manager.release_cpu_blocks({block_id});
+    }
+    return true;
+}
+
+uint32_t llama_kv_cache_paged::n_free_gpu_blocks() const {
+    return (uint32_t) block_manager.n_free_gpu_blocks();
 }
 
 void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,
@@ -214,6 +238,11 @@ bool llama_kv_cache_paged::swap_in(llama_sequence_group & group) {
 
     free_blocks(group);
     group.block_table = new_ids;
+    for (size_t i = 0; i < group.block_hashes.size() && i < group.block_table.size(); ++i) {
+        if (block_move_cb) {
+            block_move_cb(group.block_hashes[i], group.block_table[i]);
+        }
+    }
     return true;
 }
 
@@ -232,6 +261,11 @@ bool llama_kv_cache_paged::swap_out(llama_sequence_group & group) {
 
     free_blocks(group);
     group.block_table = new_ids;
+    for (size_t i = 0; i < group.block_hashes.size() && i < group.block_table.size(); ++i) {
+        if (block_move_cb) {
+            block_move_cb(group.block_hashes[i], group.block_table[i]);
+        }
+    }
     return true;
 }
 
@@ -259,6 +293,31 @@ uint32_t llama_kv_cache_paged::get_num_gpu_blocks() const {
 void llama_kv_cache_paged::concat_block_ids(llama_block_ids &       to_block_table,
                                             const llama_block_ids & from_block_table) {
     to_block_table.insert(to_block_table.end(), from_block_table.begin(), from_block_table.end());
+}
+
+bool llama_kv_cache_paged::share_blocks(llama_sequence_group & group, const llama_block_ids & src_ids) {
+    if (!add_ref_blocks(src_ids)) {
+        return false;
+    }
+    concat_block_ids(group.block_table, src_ids);
+    return true;
+}
+
+bool llama_kv_cache_paged::add_ref_blocks(const llama_block_ids & ids) {
+    for (const uint32_t id : ids) {
+        if (!block_manager.add_ref_block(id)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+uint32_t llama_kv_cache_paged::block_ref_count(uint32_t block_id) const {
+    return block_manager.block_ref_count(block_id);
+}
+
+bool llama_kv_cache_paged::is_block_gpu(uint32_t block_id) const {
+    return block_manager.is_gpu(block_id);
 }
 
 // llama_memory_i

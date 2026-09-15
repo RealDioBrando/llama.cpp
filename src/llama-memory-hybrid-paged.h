@@ -65,6 +65,8 @@ public:
         return mem_attn.get();
     }
 
+    uint32_t get_n_seq_max() const;
+
 private:
     const std::unique_ptr<llama_kv_cache_paged> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;

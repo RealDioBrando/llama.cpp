@@ -8,7 +8,9 @@
 #include <cfloat>
 #include <clocale>
 #include <cstdlib>
+#include <chrono>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -51,12 +53,21 @@ static void add_request_from_pool(struct llama_paged_scheduler * scheduler,
                                   llama_context *                ctx,
                                   size_t                         pool_index,
                                   int                            seq_id) {
-    const std::string        input_prompt = k_prompts[pool_index % k_n_prompts];
+    // LLAMA_PAGED_SAME_PROMPT=1 makes every sequence use prompt 0, which
+    // is the workload to exercise the prefix cache.
+    static const bool   same_prompt   = getenv("LLAMA_PAGED_SAME_PROMPT") && atoi(getenv("LLAMA_PAGED_SAME_PROMPT")) != 0;
+    static const size_t prompt_index = same_prompt ? 0 : pool_index % k_n_prompts;
+    const std::string   input_prompt = k_prompts[prompt_index];
     std::vector<llama_token> tokens       = common_tokenize(ctx, input_prompt, true);
 
     // Optional bench knob: pad or trim the tokenized prompt to a fixed length.
     if (const char * env = getenv("LLAMA_PAGED_PROMPT_TOKENS")) {
-        const int target = atoi(env);
+        int target = atoi(env);
+        if (const char * genv = getenv("LLAMA_PAGED_PROMPT_TOKENS_GROWTH")) {
+            // Per-sequence growth builds same-prefix prompts of increasing
+            // length, which is the hitting workload for the prefix cache.
+            target += seq_id * atoi(genv);
+        }
         if (target > 0) {
             if ((size_t) target < tokens.size()) {
                 tokens.resize(target);
@@ -107,8 +118,8 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (params.n_sequences != params.n_parallel) {
-        LOG_INF("%s: n_sequences (%d) needs to be equal to n_parallel (%d)\n", __func__, params.n_sequences,
+    if (params.n_sequences > params.n_parallel) {
+        LOG_INF("%s: n_sequences (%d) cannot exceed n_parallel (%d)\n", __func__, params.n_sequences,
                 params.n_parallel);
         return 1;
     }
@@ -140,11 +151,6 @@ int main(int argc, char ** argv) {
     llama_paged_scheduler_set_on_finish(scheduler, log_output, &cb_ctx);
 
     std::unordered_map<int32_t, common_sampler *> samplers;
-    for (int i = 0; i < params.n_sequences; ++i) {
-        add_request_from_pool(scheduler, ctx, (size_t) i, i);
-        samplers[i] = common_sampler_init(model, params.sampling);
-    }
-
     std::vector<request_result>              results;
     std::unordered_map<int32_t, std::string> accumulated_responses;
 
@@ -154,14 +160,34 @@ int main(int argc, char ** argv) {
         "n_gpu_blocks=%d, n_cpu_blocks=%d\n",
         __func__, params.n_sequences, params.n_predict, params.n_gpu_blocks, params.n_cpu_blocks);
 
-    const int64_t t_start_us = ggml_time_us();
+    const int64_t t_start_us     = ggml_time_us();
     int64_t       t_tg_start_us = 0;
     bool          tg_started = false;
 
+    // LLAMA_PAGED_SEQ_DELAY_MS: test knob that queues seq i at
+    // i * delay_ms so arrivals can be staggered across scheduler steps.
+    int32_t seq_delay_ms = 0;
+    if (const char * env = getenv("LLAMA_PAGED_SEQ_DELAY_MS")) {
+        seq_delay_ms = atoi(env);
+    }
+    int32_t next_request = 0;
+
     while (true) {
+        while (next_request < params.n_sequences &&
+               (seq_delay_ms <= 0 ||
+                ggml_time_us() - t_start_us >= (int64_t) next_request * seq_delay_ms * 1000)) {
+            add_request_from_pool(scheduler, ctx, (size_t) next_request, next_request);
+            samplers[next_request] = common_sampler_init(model, params.sampling);
+            ++next_request;
+        }
+
         const bool success = llama_paged_scheduler_prepare_batch(scheduler, &batch);
-        if (!success || batch.n_tokens == 0) {
+        if (!success || (batch.n_tokens == 0 && next_request >= params.n_sequences)) {
             break;
+        }
+        if (batch.n_tokens == 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
         }
 
         LOG_DBG("prepared batch: batch.n_tokens=%d, n_batch=%d, n_sequences=%d, n_parallel=%d\n", batch.n_tokens,

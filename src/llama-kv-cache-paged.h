@@ -7,6 +7,7 @@
 #include "llama-sequence-group.h"
 
 #include <cmath>
+#include <functional>
 
 //
 // llama_kv_cache_paged
@@ -30,8 +31,21 @@ class llama_kv_cache_paged : public llama_memory_i {
 
     bool allocate(int32_t num_tokens, llama_sequence_group & group);
     void free_blocks(llama_sequence_group & group);
+    void free_blocks(llama_sequence_group & group, const llama_block_ids & keep);
+    bool release_block(uint32_t block_id);
+    uint32_t n_free_gpu_blocks() const;
     bool swap_in(llama_sequence_group & group);
     bool swap_out(llama_sequence_group & group);
+
+    // Prefix cache support: share already populated blocks by reference.
+    bool share_blocks(llama_sequence_group & group, const llama_block_ids & src_ids);
+    bool add_ref_blocks(const llama_block_ids & ids);
+    uint32_t block_ref_count(uint32_t block_id) const;
+    bool is_block_gpu(uint32_t block_id) const;
+
+    // Notified with (chain_hash, new_block_id) whenever a swap moves a
+    // registered block between the GPU and CPU pools.
+    void set_block_move_cb(std::function<void(uint64_t, uint32_t)> cb) { block_move_cb = std::move(cb); }
 
     void     set_paged_batch_info(const llama_paged_batch_info * info);
     uint32_t get_num_gpu_blocks() const;
@@ -124,6 +138,8 @@ class llama_kv_cache_paged : public llama_memory_i {
 
     ggml_backend_t gpu_backend;
     ggml_backend_t cpu_backend;
+
+    std::function<void(uint64_t, uint32_t)> block_move_cb;
 
     struct seq_range {
         llama_pos min = -1;

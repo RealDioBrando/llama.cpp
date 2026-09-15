@@ -107,3 +107,30 @@ void llama_block_manager::release_cpu_blocks(const physical_block_ids & freed_bl
 bool llama_block_manager::is_gpu(uint32_t block_id) const {
     return block_id < total_num_gpu_blocks;
 }
+
+bool llama_block_manager::add_ref_block(uint32_t id) {
+    if (id < total_num_gpu_blocks) {
+        if (gpu_registry[id].ref_count == 0) {
+            return false;
+        }
+        gpu_registry[id].ref_count += 1;
+        return true;
+    }
+    const uint32_t cpu_id = id - total_num_gpu_blocks;
+    if (cpu_id >= total_num_cpu_blocks || cpu_registry[cpu_id].ref_count == 0) {
+        return false;
+    }
+    cpu_registry[cpu_id].ref_count += 1;
+    return true;
+}
+
+uint32_t llama_block_manager::block_ref_count(uint32_t id) const {
+    if (id < total_num_gpu_blocks) {
+        return gpu_registry[id].ref_count;
+    }
+    const uint32_t cpu_id = id - total_num_gpu_blocks;
+    if (cpu_id >= total_num_cpu_blocks) {
+        return 0;
+    }
+    return cpu_registry[cpu_id].ref_count;
+}
