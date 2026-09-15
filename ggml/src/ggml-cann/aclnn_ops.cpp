@@ -4864,6 +4864,45 @@ void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->nb[0] == sizeof(float));
     GGML_ASSERT(src1->nb[0] == sizeof(float));
 
+    // Small depthwise kernels are cheaper as shifted mul-add than convolution,
+    // which triggers a large weight layout conversion on 310P.
+    if (nc <= 16) {
+        ggml_cann_pool_alloc prod_alloc(ctx.pool(), n_t * nr * n_s * sizeof(float));
+        float alphaValue = 1.0f;
+        acl_scalar_ptr alpha = ggml_cann_create_scalar(&alphaValue, ACL_FLOAT);
+
+        int64_t slice_ne[3] = { n_t, nr, n_s };
+        size_t  prod_nb[3]  = { sizeof(float), n_t * sizeof(float), nr * n_t * sizeof(float) };
+        size_t  y_nb[3]     = { dst->nb[1], dst->nb[0], dst->nb[2] };
+        int64_t w_ne[3]     = { 1, nr, 1 };
+        size_t  w_nb[3]     = { src1->nb[0], src1->nb[1], src1->nb[1] };
+
+        acl_tensor_ptr acl_prod = ggml_cann_create_tensor(
+            prod_alloc.get(), ggml_cann_type_mapping(dst->type), sizeof(float),
+            slice_ne, prod_nb, 3);
+
+        for (int64_t k = 0; k < nc; ++k) {
+            char * x_ptr = (char *) src0->data + k * src0->nb[0];
+            char * w_ptr = (char *) src1->data + k * src1->nb[0];
+            size_t x_nb[3] = { src0->nb[0], src0->nb[1], src0->nb[2] };
+
+            acl_tensor_ptr acl_x = ggml_cann_create_tensor(
+                x_ptr, ggml_cann_type_mapping(src0->type), sizeof(float), slice_ne, x_nb, 3);
+            acl_tensor_ptr acl_w = ggml_cann_create_tensor(
+                w_ptr, ggml_cann_type_mapping(src1->type), sizeof(float), w_ne, w_nb, 3);
+            acl_tensor_ptr acl_y = ggml_cann_create_tensor(
+                dst->data, ggml_cann_type_mapping(dst->type), sizeof(float), slice_ne, y_nb, 3);
+
+            if (k == 0) {
+                GGML_CANN_CALL_ACLNN_OP(ctx, Mul, acl_x.get(), acl_w.get(), acl_y.get());
+            } else {
+                GGML_CANN_CALL_ACLNN_OP(ctx, Mul, acl_x.get(), acl_w.get(), acl_prod.get());
+                GGML_CANN_CALL_ACLNN_OP(ctx, InplaceAdd, acl_y.get(), acl_prod.get(), alpha.get());
+            }
+        }
+        return;
+    }
+
     // --- Build CANN tensors ---
 
     // 1) Input: conv_x as NCL

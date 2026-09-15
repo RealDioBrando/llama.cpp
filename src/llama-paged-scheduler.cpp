@@ -6,8 +6,10 @@
 struct llama_paged_scheduler {
     llama_paged_scheduler_impl impl;
 
-    llama_paged_scheduler(uint32_t n_ctx, uint32_t block_sz, uint32_t n_batch, llama_kv_cache_paged * kv_manager) :
-        impl(n_ctx, block_sz, n_batch, kv_manager) {}
+    llama_paged_scheduler(uint32_t n_ctx, uint32_t block_sz, uint32_t n_batch,
+                          llama_kv_cache_paged * kv_manager,
+                          llama_memory_hybrid_paged * hybrid_memory) :
+        impl(n_ctx, block_sz, n_batch, kv_manager, hybrid_memory) {}
 };
 
 LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama_context * ctx) {
@@ -15,8 +17,11 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
         return nullptr;
     }
 
-    // Get the paged kv cache
-    auto * paged_kv = dynamic_cast<llama_kv_cache_paged *>(ctx->get_memory());
+    // Get the paged kv cache, either directly or through the hybrid wrapper.
+    auto * memory = ctx->get_memory();
+    auto * hybrid_memory = dynamic_cast<llama_memory_hybrid_paged *>(memory);
+    auto * paged_kv = hybrid_memory ? hybrid_memory->get_paged_mem()
+                                    : dynamic_cast<llama_kv_cache_paged *>(memory);
     if (!paged_kv) {
         LLAMA_LOG_ERROR(
             "%s: context does not have a paged KV cache. "
@@ -31,10 +36,12 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
     const uint32_t n_ctx    = ctx->n_ctx();
     const uint32_t block_sz = ctx->block_size();
     const uint32_t n_batch  = ctx->n_batch();
-    GGML_ASSERT(n_batch == ctx->n_ubatch() && "kv_paged requires n_batch == n_ubatch.");
+    if (!hybrid_memory) {
+        GGML_ASSERT(n_batch == ctx->n_ubatch() && "kv_paged requires n_batch == n_ubatch.");
+    }
 
     try {
-        return new llama_paged_scheduler(n_ctx, block_sz, n_batch, paged_kv);
+        return new llama_paged_scheduler(n_ctx, block_sz, n_batch, paged_kv, hybrid_memory);
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("%s: Error when creating llama_paged_scheduler: %s\n", __func__, e.what());
         return nullptr;

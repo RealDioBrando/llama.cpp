@@ -52,6 +52,12 @@ struct atb_paged_state {
     atb::Operation * sa        = nullptr;  // SelfAttention (uncached prefill)
     atb::Operation * pa        = nullptr;  // PagedAttention (decode)
     atb::Operation * sf        = nullptr;  // PagedAttention (multi-token query)
+    int64_t pa_heads    = -1;
+    int64_t pa_kv_heads = -1;
+    int64_t pa_head_dim = -1;
+    int64_t sf_heads    = -1;
+    int64_t sf_kv_heads = -1;
+    int64_t sf_head_dim = -1;
     void *           ws_rac    = nullptr;
     uint64_t         ws_rac_sz = 0;
     void *           ws_sa     = nullptr;
@@ -367,6 +373,7 @@ void ggml_cann_paged_attn(ggml_backend_cann_context &, ggml_tensor *) {
 
 void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     static const bool paged_timing = std::getenv("GGML_CANN_PAGED_TIMING") != nullptr;
+    static const bool paged_debug  = std::getenv("GGML_CANN_PAGED_DEBUG") != nullptr;
     const int64_t total_t0 = paged_timing ? ggml_time_us() : 0;
     const ggml_tensor * q             = dst->src[0];
     const ggml_tensor * k_new         = dst->src[1];
@@ -523,9 +530,24 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     const int64_t meta_us = paged_timing ? ggml_time_us() - meta_t0 : 0;
 
     const bool decode = (n_tokens == n_seq);
-    GGML_LOG_INFO("[CANN paged] op: %s n_tokens=%d n_seq=%d n_heads=%d n_kv=%d hd=%d bs=%d max_blocks=%d\n",
-                  decode ? "PA" : "SF", (int) n_tokens, (int) n_seq, (int) n_heads, (int) n_heads_kv,
-                  (int) head_dim, block_size, max_blocks);
+    if (paged_debug) {
+        GGML_LOG_INFO("[CANN paged] op: %s n_tokens=%d n_seq=%d n_heads=%d n_kv=%d hd=%d bs=%d max_blocks=%d\n",
+                      decode ? "PA" : "SF", (int) n_tokens, (int) n_seq, (int) n_heads, (int) n_heads_kv,
+                      (int) head_dim, block_size, max_blocks);
+        std::vector<int32_t> ws_host(n_tokens);
+        ACL_CHECK(aclrtMemcpy(ws_host.data(), ws_host.size() * sizeof(int32_t), write_slots->data,
+                              ws_host.size() * sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_HOST));
+        std::vector<int32_t> bt_host(n_seq * max_blocks);
+        ACL_CHECK(aclrtMemcpy(bt_host.data(), bt_host.size() * sizeof(int32_t), block_table->data,
+                              bt_host.size() * sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_HOST));
+        ACL_CHECK(aclrtSynchronizeStream(stream));
+        for (int64_t s = 0; s < n_seq; ++s) {
+            GGML_LOG_INFO("[CANN paged] meta seq=%d bo=%d bl=%d cl=%d ws=[%d..%d] bt0=%d\n",
+                          (int) s, (int) bo_host[s], (int) bl_host[s], (int) cl_host[s],
+                          (int) ws_host[bo_host[s]], (int) ws_host[bo_host[s] + bl_host[s] - 1],
+                          (int) bt_host[s * max_blocks]);
+        }
+    }
 
     if (decode) {
         atb::Tensor qa  = atb_tensor_maker::make(q_f16, {n_seq, n_heads, head_dim}, ACL_FLOAT16);
@@ -533,8 +555,16 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         atb::Tensor clt = atb_tensor_maker::make(cl_dev, {n_seq}, ACL_INT32, ACL_FORMAT_ND, cl_host.data());
         atb::Tensor out = atb_tensor_maker::make(out_f16, {n_seq, n_heads, head_dim}, ACL_FLOAT16);
 
-        if (!g_atb.pa) {
+        if (!g_atb.pa || g_atb.pa_heads != n_heads || g_atb.pa_kv_heads != n_heads_kv ||
+                g_atb.pa_head_dim != head_dim) {
+            if (g_atb.pa) {
+                atb::DestroyOperation((atb::Operation *) g_atb.pa);
+                g_atb.pa = nullptr;
+            }
             g_atb.pa = create_pa_op(n_heads, n_heads_kv, head_dim, /*spec=*/false);
+            g_atb.pa_heads    = n_heads;
+            g_atb.pa_kv_heads = n_heads_kv;
+            g_atb.pa_head_dim = head_dim;
         }
 
         atb::VariantPack vp;
@@ -563,8 +593,16 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         // pool, which is the Splitfuse op.
         ggml_cann_pool_alloc sl_alloc(ctx.pool(), sizeof(int32_t));
 
-        if (!g_atb.sf) {
+        if (!g_atb.sf || g_atb.sf_heads != n_heads || g_atb.sf_kv_heads != n_heads_kv ||
+                g_atb.sf_head_dim != head_dim) {
+            if (g_atb.sf) {
+                atb::DestroyOperation((atb::Operation *) g_atb.sf);
+                g_atb.sf = nullptr;
+            }
             g_atb.sf = create_pa_op(n_heads, n_heads_kv, head_dim, /*spec=*/true);
+            g_atb.sf_heads    = n_heads;
+            g_atb.sf_kv_heads = n_heads_kv;
+            g_atb.sf_head_dim = head_dim;
         }
 
         std::vector<int32_t> prefill_lengths;

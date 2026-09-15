@@ -3366,7 +3366,8 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     // Reshape to [n_embd, n_tokens] (just a view)
-    cur = ggml_reshape_2d(ctx0, cur, hparams.n_embd, n_tokens);
+    const int64_t attn_width = q_cur->ne[0] * q_cur->ne[1];
+    cur = ggml_reshape_2d(ctx0, cur, attn_width, n_tokens);
 
     if (wo) {
         cur = build_lora_mm(wo, cur, wo_s);

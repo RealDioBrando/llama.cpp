@@ -5,11 +5,13 @@
 llama_paged_scheduler_impl::llama_paged_scheduler_impl(uint32_t               n_ctx,
                                                        uint32_t               block_sz,
                                                        int32_t                n_batch,
-                                                       llama_kv_cache_paged * kv_manager) :
+                                                       llama_kv_cache_paged * kv_manager,
+                                                       llama_memory_hybrid_paged * hybrid_memory) :
     n_seq_max_ctx(n_ctx),
     block_size(block_sz),
     n_batch(n_batch),
-    kv_cache_manager(kv_manager) {}
+    kv_cache_manager(kv_manager),
+    hybrid_memory_manager(hybrid_memory) {}
 
 bool llama_paged_scheduler_impl::check_deadlock(uint32_t n_candidates, uint32_t n_swapped, uint32_t n_waiting) const {
     if (n_candidates == 0 && (n_swapped > 0 || n_waiting > 0)) {
@@ -139,6 +141,9 @@ void llama_paged_scheduler_impl::finish(llama_sequence_group & group) {
         LLAMA_LOG_DEBUG("%s: Request: %d generated %d tokens.\n", __func__, group.request_id, group.n_decoded);
     }
     kv_cache_manager->free_blocks(group);
+    if (hybrid_memory_manager) {
+        hybrid_memory_manager->seq_rm(group.request_id, -1, -1);
+    }
     group.status = llama_sequence_group_status::FINISHED;
     id_to_group.erase(group.request_id);
 }
@@ -166,6 +171,9 @@ void llama_paged_scheduler_impl::swap_out_or_recompute(llama_sequence_group_ptr 
     // There was not enough CPU memory to swap the request (recomputation)
     kv_cache_manager->free_blocks(*group_ptr);
     kv_cache_manager->seq_rm(rid, -1, -1);
+    if (hybrid_memory_manager) {
+        hybrid_memory_manager->seq_rm(rid, -1, -1);
+    }
     group_ptr->n_past    = 0;
     group_ptr->n_decoded = 0;
     group_ptr->logical_seq.resize(group_ptr->n_prompt);

@@ -58,6 +58,8 @@ static path_result run_non_paged(const std::string & model_path) {
     params.sampling.temp = 0.0f;  // greedy
     params.warmup        = false;
     params.kv_paged      = false;
+    params.cpuparams.n_threads       = 1;
+    params.cpuparams_batch.n_threads = 1;
 
     auto            init  = common_init_from_params(params);
     llama_model *   model = init->model();
@@ -119,6 +121,11 @@ static path_result run_paged(const std::string & model_path) {
     params.n_cpu_blocks  = 16;
     params.n_sequences   = 1;
     params.n_parallel    = 1;
+    params.fit_params    = false;
+    params.n_gpu_blocks  = 4096;
+    params.n_cpu_blocks  = 512;
+    params.cpuparams.n_threads       = 1;
+    params.cpuparams_batch.n_threads = 1;
 
     auto            init  = common_init_from_params(params);
     llama_model *   model = init->model();

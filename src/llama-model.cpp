@@ -15,6 +15,7 @@
 #include "llama-kv-cache-msa.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-kv-cache-paged.h"
+#include "llama-memory-hybrid-paged.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-hybrid-idx.h"
@@ -2563,7 +2564,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
-                    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+                    if (cparams.kv_paged &&
+                            (res = llama_paged_memory_try_create(*this, params, cparams))) {
+                        // Hybrid-paged memory selected by the paged plugin.
+                    } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
                             /* model             */ *this,
@@ -3344,4 +3348,3 @@ uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out)
 
     return (uint32_t) nelements;
 }
-

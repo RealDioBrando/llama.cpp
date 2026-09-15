@@ -44,6 +44,9 @@ class llama_kv_cache_paged : public llama_memory_i {
     llama_memory_context_ptr init_full() override;
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
+    // Used by composite memories that need equal ubatches, not paged cache's simple split.
+    llama_memory_context_ptr create_batch_context(const std::vector<llama_ubatch> & ubatches);
+
     struct ggml_tensor * get_k_tensor(int layer_idx) const;
     struct ggml_tensor * get_v_tensor(int layer_idx) const;
 
@@ -176,15 +179,26 @@ class llama_kv_cache_paged_context : public llama_memory_context_i {
     std::vector<llama_ubatch> ubatches;
     size_t                    i_cur = 0;      // index of ubatch to process
 
+    const llama_paged_batch_info * batch_info = nullptr;
+
     int32_t * paged_write_slots   = nullptr;  // [n_tokens]
     int32_t * paged_block_table   = nullptr;  // [batch_size, max_blocks]
     int32_t * paged_context_lens  = nullptr;  // [batch_size]
     int32_t * paged_batch_offsets = nullptr;  // [batch_size]
     int32_t * paged_batch_lens    = nullptr;  // [batch_size]
+    std::vector<int32_t> local_write_slots;
+    std::vector<int32_t> local_context_lens;
+    std::vector<int32_t> local_batch_offsets;
+    std::vector<int32_t> local_batch_lens;
 
     int32_t n_tokens   = 0;
     int32_t batch_size = 0;
     int32_t max_blocks = 0;
 
     llama_memory_status status = LLAMA_MEMORY_STATUS_SUCCESS;
+
+public:
+    void derive_current_batch_data();
+
+private:
 };

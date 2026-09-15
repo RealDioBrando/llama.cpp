@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama-kv-cache-paged.h"
+#include "llama-memory-hybrid-paged.h"
 
 #include <clocale>
 #include <vector>
@@ -12,7 +13,12 @@ enum class llama_scheduler_status {
 
 class llama_paged_scheduler_impl {
   public:
-    llama_paged_scheduler_impl(uint32_t n_ctx, uint32_t block_sz, int32_t n_batch, llama_kv_cache_paged * kv_manager);
+    llama_paged_scheduler_impl(
+            uint32_t n_ctx,
+            uint32_t block_sz,
+            int32_t n_batch,
+            llama_kv_cache_paged * kv_manager,
+            llama_memory_hybrid_paged * hybrid_memory = nullptr);
 
     llama_scheduler_status step(llama_batch & batch);
     bool                   queue_request(llama_sequence_group group);
@@ -58,6 +64,7 @@ class llama_paged_scheduler_impl {
     const uint32_t         block_size;
     const int32_t          n_batch;
     llama_kv_cache_paged * kv_cache_manager = nullptr;
+    llama_memory_hybrid_paged * hybrid_memory_manager = nullptr;
     llama_paged_batch_info curr_info;
 
     uint32_t n_livelock_steps   = 0;

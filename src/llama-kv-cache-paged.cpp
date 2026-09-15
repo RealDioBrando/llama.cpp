@@ -239,6 +239,19 @@ void llama_kv_cache_paged::set_paged_batch_info(const llama_paged_batch_info * i
     last_paged_info = info;
 }
 
+llama_memory_context_ptr llama_kv_cache_paged::create_batch_context(
+        const std::vector<llama_ubatch> & ubatches) {
+    if (!last_paged_info) {
+        return std::make_unique<llama_kv_cache_paged_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
+    }
+
+    auto ctx = std::make_unique<llama_kv_cache_paged_context>(this, ubatches);
+    ctx->set_batch_data(*last_paged_info);
+    ctx->derive_current_batch_data();
+
+    return ctx;
+}
+
 uint32_t llama_kv_cache_paged::get_num_gpu_blocks() const {
     return num_gpu_blocks;
 }
@@ -375,6 +388,7 @@ void llama_kv_cache_paged::set_seq_max_pos(llama_seq_id seq_id, llama_pos new_ma
 // llama_kv_cache_paged_context
 
 void llama_kv_cache_paged_context::set_batch_data(const llama_paged_batch_info & info) {
+    batch_info          = &info;
     paged_write_slots   = info.write_slots;
     paged_block_table   = info.block_table;
     paged_context_lens  = info.context_lens;
@@ -385,11 +399,52 @@ void llama_kv_cache_paged_context::set_batch_data(const llama_paged_batch_info &
     batch_size          = info.n_seq;
 }
 
+void llama_kv_cache_paged_context::derive_current_batch_data() {
+    if (!batch_info || ubatches.empty()) {
+        return;
+    }
+
+    const llama_ubatch & cur = ubatches[i_cur];
+    const int32_t n_seq_tokens = (int32_t) cur.n_seq_tokens;
+
+    local_write_slots.resize(cur.n_tokens);
+    local_context_lens.resize(cur.n_seqs);
+    local_batch_offsets.resize(cur.n_seqs);
+    local_batch_lens.resize(cur.n_seqs);
+
+    int32_t local_offset = 0;
+    for (int32_t s = 0; s < (int32_t) cur.n_seqs; ++s) {
+        const int32_t src_offset = batch_info->batch_offsets[s] + (int32_t) i_cur * n_seq_tokens;
+        GGML_ASSERT(src_offset + n_seq_tokens <= batch_info->n_tokens && "paged metadata does not match ubatch");
+
+        local_batch_offsets[s] = local_offset;
+        local_batch_lens[s]    = n_seq_tokens;
+        local_context_lens[s]  = cur.pos[(s + 1) * n_seq_tokens - 1] + 1;
+
+        for (int32_t t = 0; t < n_seq_tokens; ++t) {
+            local_write_slots[local_offset + t] = batch_info->write_slots[src_offset + t];
+        }
+
+        local_offset += n_seq_tokens;
+    }
+
+    n_tokens   = cur.n_tokens;
+    batch_size = cur.n_seqs;
+
+    paged_write_slots   = local_write_slots.data();
+    paged_block_table   = batch_info->block_table;
+    paged_context_lens  = local_context_lens.data();
+    paged_batch_offsets = local_batch_offsets.data();
+    paged_batch_lens    = local_batch_lens.data();
+}
+
 bool llama_kv_cache_paged_context::next() {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     if (++i_cur >= ubatches.size()) {
         return false;
     }
+
+    derive_current_batch_data();
     return true;
 }
 
