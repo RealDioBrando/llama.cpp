@@ -38,6 +38,7 @@
 #include <aclnnop/aclnn_convolution.h>
 #include <aclnnop/aclnn_copy.h>
 #include <aclnnop/aclnn_div.h>
+#include <aclnnop/aclnn_dynamic_quant_v2.h>
 #include <aclnnop/aclnn_elu.h>
 #include <aclnnop/aclnn_embedding.h>
 #include <aclnnop/aclnn_eq_tensor.h>
@@ -67,6 +68,7 @@
 #include <aclnnop/aclnn_mv.h>
 #include <aclnnop/aclnn_permute.h>
 #include <aclnnop/aclnn_pow.h>
+#include <aclnnop/aclnn_quant_matmul_v5.h>
 #include <aclnnop/aclnn_pow_tensor_tensor.h>
 #include <aclnnop/aclnn_recurrent_gated_delta_rule.h>
 #include <aclnnop/aclnn_reduce_sum.h>
@@ -90,6 +92,7 @@
 #include <aclnnop/aclnn_zero.h>
 #include <float.h>
 
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <exception>
@@ -2493,6 +2496,189 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
     }
 }
 
+/**
+ * @brief K-quant (Q4_K/Q5_K/Q6_K) matrix multiplication on 310P (W8A8/W4A8).
+ *
+ * @details The weight (src0) was re-quantized at load time into the device
+ *          layout (see ggml_backend_cann_buffer_set_tensor in ggml-cann.cpp):
+ *
+ *          W8A8 (Q5_K/Q6_K):
+ *            [quants n x k int8][scales (k/gs) x n fp32]
+ *          W4A8 (Q4_K):
+ *            [quants k x (n/8) int32][scales (k/256) x n uint64][yOffset n fp32]
+ *
+ *          Activation pipeline (per call):
+ *            src1 (F32/F16, k contiguous) -> [cast F16] ->
+ *            aclnnDynamicQuantV2(dstType=2, symmetric) -> x1 int8 (m,k) +
+ *            x1Scale fp32 (m,) -> aclnnQuantMatmulV5 -> out F16 (m,n) ->
+ *            [cast dst type]
+ */
+#ifdef ASCEND_310P
+static void ggml_cann_mul_mat_kquant(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * src0 = dst->src[0];  // weight (re-quantized device layout)
+    ggml_tensor * src1 = dst->src[1];  // activation (k, m1, m2, ...)
+
+    const int path = ggml_cann_kq_matmul_path(src0);
+    GGML_ASSERT(path != GGML_CANN_KQ_NONE);
+
+    const int64_t k = src0->ne[0];
+    const int64_t n = src0->ne[1];
+    const int64_t m = ggml_nelements(src1) / k;  // flattened token rows
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1));
+    GGML_ASSERT(src1->ne[0] == k);
+
+    static std::atomic<int> call_counter{ 0 };
+    const int call_no = call_counter.fetch_add(1);
+    if (call_no == 0 || ggml_cann_qmat_debug()) {
+        GGML_LOG_DEBUG("cann kq mul_mat #%d: '%s' path=%s m=%lld k=%lld n=%lld gs=%d src1=%s\n", call_no,
+                       ggml_get_name(src0), path == GGML_CANN_KQ_W8A8 ? "W8A8" : "W4A8", (long long) m,
+                       (long long) k, (long long) n, path == GGML_CANN_KQ_W8A8 ? ggml_cann_w8_group_size() : 256,
+                       ggml_type_name(src1->type));
+    }
+
+    // ---- 1. activation -> F16 (m, k), k contiguous ----
+    size_t               input_elem_size = sizeof(uint16_t);
+    int64_t              input_ne[2]     = { k, m };  // ggml order (inner first)
+    size_t               input_nb[2]     = { input_elem_size, (size_t) k * input_elem_size };
+    ggml_cann_pool_alloc input_allocator(ctx.pool());
+    void *               input_buffer = src1->data;
+
+    if (src1->type != GGML_TYPE_F16) {
+        if (src1->type != GGML_TYPE_F32) {
+            GGML_LOG_ERROR("cann kq mul_mat: unsupported activation type %s (only F32/F16)\n",
+                           ggml_type_name(src1->type));
+            GGML_ABORT("unsupported kq mul_mat activation type");
+        }
+        input_buffer = input_allocator.alloc((size_t) (m * k) * input_elem_size);
+        int64_t      cast_ne[GGML_MAX_DIMS];
+        size_t       cast_nb[GGML_MAX_DIMS];
+        memcpy(cast_ne, src1->ne, sizeof(cast_ne));
+        // NOTE: strides in bytes of the DST (F16) tensor, not the F32 source —
+        // ggml_cann_create_tensor divides nb by the dst element size.
+        cast_nb[0] = input_elem_size;
+        for (int i = 1; i < GGML_MAX_DIMS; i++) {
+            cast_nb[i] = cast_nb[i - 1] * cast_ne[i - 1];
+        }
+        acl_tensor_ptr acl_src1_tensor = ggml_cann_create_tensor(src1);
+        acl_tensor_ptr acl_f16_tensor =
+            ggml_cann_create_tensor(input_buffer, ACL_FLOAT16, input_elem_size, cast_ne, cast_nb, GGML_MAX_DIMS);
+        aclnn_cast(ctx, acl_src1_tensor.get(), acl_f16_tensor.get(), ACL_FLOAT16);
+    }
+
+    // ---- 2. DynamicQuantV2: F16 (m,k) -> int8 (m,k) + scale fp32 (m,) ----
+    ggml_cann_pool_alloc x1q_allocator(ctx.pool());
+    ggml_cann_pool_alloc x1s_allocator(ctx.pool());
+    void *               x1q_buffer = x1q_allocator.alloc((size_t) (m * k));
+    void *               x1s_buffer = x1s_allocator.alloc((size_t) m * sizeof(float));
+
+    {
+        // x: F16 (m, k)
+        acl_tensor_ptr acl_x = ggml_cann_create_tensor(input_buffer, ACL_FLOAT16, input_elem_size, input_ne,
+                                                        input_nb, 2);
+        // yOut: int8 (m, k)
+        int64_t      yq_ne[2] = { k, m };
+        size_t       yq_nb[2] = { 1, (size_t) k };
+        acl_tensor_ptr acl_yq = ggml_cann_create_tensor(x1q_buffer, ACL_INT8, (size_t) 1, yq_ne, yq_nb, 2);
+        // scaleOut: fp32 (m,)
+        int64_t        ys_ne[1] = { m };
+        size_t         ys_nb[1] = { sizeof(float) };
+        acl_tensor_ptr acl_ys  = ggml_cann_create_tensor(x1s_buffer, ACL_FLOAT, sizeof(float), ys_ne, ys_nb, 1);
+        // symmetric quantization: offsetOut = nullptr; dstType 2 = INT8
+        GGML_CANN_CALL_ACLNN_OP(ctx, DynamicQuantV2, acl_x.get(), nullptr, nullptr, (int64_t) 2, acl_yq.get(),
+                                acl_ys.get(), nullptr);
+    }
+
+    // ---- 3. weight tensors from the device layout ----
+    char * weight_base = (char *) src0->data;
+    acl_tensor_ptr acl_x2;
+    acl_tensor_ptr acl_x2_scale;
+    acl_tensor_ptr acl_yoffset;
+    int64_t         group_size = 0;
+    bool            transpose_x2 = false;
+
+    if (path == GGML_CANN_KQ_W8A8) {
+        group_size = ggml_cann_w8_group_size();
+        transpose_x2 = true;  // x2 is (n, k) row-major
+        // quants: int8 (n, k)
+        int64_t      w_ne[2] = { k, n };
+        size_t       w_nb[2] = { 1, (size_t) k };
+        acl_x2 = ggml_cann_create_tensor(weight_base, ACL_INT8, (size_t) 1, w_ne, w_nb, 2);
+        // scales: fp32 (k/gs, n)
+        char *        scale_base = weight_base + (size_t) (n * k);
+        int64_t       sc_ne[2]   = { n, k / group_size };
+        size_t        sc_nb[2]   = { sizeof(float), (size_t) n * sizeof(float) };
+        acl_x2_scale = ggml_cann_create_tensor(scale_base, ACL_FLOAT, sizeof(float), sc_ne, sc_nb, 2);
+        acl_yoffset  = nullptr;
+    } else {
+        group_size = 256;
+        transpose_x2 = false;  // x2 is (k, n/8) int32 packed
+        const int64_t n8 = n / 8;
+        // quants: int32 (k, n/8), 8 x int4 each
+        int64_t      w_ne[2] = { n8, k };
+        size_t       w_nb[2] = { sizeof(int32_t), (size_t) n8 * sizeof(int32_t) };
+        acl_x2 = ggml_cann_create_tensor(weight_base, ACL_INT32, sizeof(int32_t), w_ne, w_nb, 2);
+        // scales: uint64 (k/256, n), fp32 bits in low word
+        char *        scale_base = weight_base + (size_t) (k * n8) * sizeof(int32_t);
+        int64_t       sc_ne[2]   = { n, k / 256 };
+        size_t        sc_nb[2]   = { sizeof(uint64_t), (size_t) n * sizeof(uint64_t) };
+        acl_x2_scale = ggml_cann_create_tensor(scale_base, ACL_UINT64, sizeof(uint64_t), sc_ne, sc_nb, 2);
+        // yOffset: fp32 (n,)
+        char *        yo_base = scale_base + (size_t) ((k / 256) * n) * sizeof(uint64_t);
+        int64_t       yo_ne[1] = { n };
+        size_t       yo_nb[1] = { sizeof(float) };
+        acl_yoffset = ggml_cann_create_tensor(yo_base, ACL_FLOAT, sizeof(float), yo_ne, yo_nb, 1);
+    }
+
+    // ---- 4. aclnnQuantMatmulV5 ----
+    {
+        size_t               output_elem_size = sizeof(uint16_t);
+        ggml_cann_pool_alloc output_allocator(ctx.pool());
+        void *               output_buffer = output_allocator.alloc((size_t) (m * n) * output_elem_size);
+
+        int64_t      out_ne[2] = { n, m };
+        size_t       out_nb[2] = { output_elem_size, (size_t) n * output_elem_size };
+        acl_tensor_ptr acl_out = ggml_cann_create_tensor(output_buffer, ACL_FLOAT16, output_elem_size, out_ne, out_nb, 2);
+
+        acl_tensor_ptr acl_x1;
+        {
+            int64_t      xq_ne[2] = { k, m };
+            size_t       xq_nb[2] = { 1, (size_t) k };
+        acl_x1 = ggml_cann_create_tensor(x1q_buffer, ACL_INT8, (size_t) 1, xq_ne, xq_nb, 2);
+        }
+        acl_tensor_ptr acl_x1_scale;
+        if (path == GGML_CANN_KQ_W8A8) {
+            int64_t      xs_ne[1] = { m };
+            size_t       xs_nb[1] = { sizeof(float) };
+            acl_x1_scale = ggml_cann_create_tensor(x1s_buffer, ACL_FLOAT, sizeof(float), xs_ne, xs_nb, 1);
+        } else {
+            // A8W4Int path requires x1Scale dims == x2Scale dims (2D): view (m, 1)
+            int64_t      xs_ne[2] = { 1, m };
+            size_t       xs_nb[2] = { sizeof(float), sizeof(float) };
+            acl_x1_scale = ggml_cann_create_tensor(x1s_buffer, ACL_FLOAT, sizeof(float), xs_ne, xs_nb, 2);
+        }
+
+        GGML_CANN_CALL_ACLNN_OP(ctx, QuantMatmulV5, acl_x1.get(), acl_x2.get(), acl_x1_scale.get(),
+                                acl_x2_scale.get(), nullptr, nullptr, nullptr, acl_yoffset.get(), nullptr,
+                                /*transposeX1=*/false, /*transposeX2=*/transpose_x2, group_size, acl_out.get());
+
+        // ---- 5. cast out F16 -> dst type ----
+        if (dst->type != GGML_TYPE_F16) {
+            int64_t      cast_ne[GGML_MAX_DIMS];
+            size_t       cast_nb[GGML_MAX_DIMS];
+            memcpy(cast_ne, dst->ne, sizeof(cast_ne));
+            cast_nb[0] = output_elem_size;
+            for (int i = 1; i < GGML_MAX_DIMS; i++) {
+                cast_nb[i] = cast_nb[i - 1] * cast_ne[i - 1];
+            }
+            acl_tensor_ptr acl_out_full =
+                ggml_cann_create_tensor(output_buffer, ACL_FLOAT16, output_elem_size, cast_ne, cast_nb, GGML_MAX_DIMS);
+            acl_tensor_ptr acl_dst_tensor = ggml_cann_create_tensor(dst);
+            aclnn_cast(ctx, acl_out_full.get(), acl_dst_tensor.get(), ggml_cann_type_mapping(dst->type));
+        }
+    }
+}
+#endif  // ASCEND_310P
+
 void ggml_cann_mul_mat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     const enum ggml_type type = dst->src[0]->type;
     switch (type) {
@@ -2504,9 +2690,30 @@ void ggml_cann_mul_mat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
             ggml_cann_mat_mul_fp(ctx, dst);
             break;
         case GGML_TYPE_Q4_0:
+            ggml_cann_mul_mat_quant(ctx, dst, type);
+            break;
+#ifdef ASCEND_310P
+        // Q8_0 on 310P: supports_op only lets the op through when the W8A8
+        // K-quant path claimed it (ggml_cann_kq_matmul_path != NONE), so the
+        // legacy WeightQuantBatchMatmulV2 route (unavailable on 310P) is
+        // never valid here — dispatch to the K-quant handler instead.
+        case GGML_TYPE_Q8_0:
+            ggml_cann_mul_mat_kquant(ctx, dst);
+            break;
+#else
         case GGML_TYPE_Q8_0:
             ggml_cann_mul_mat_quant(ctx, dst, type);
             break;
+#endif
+#ifdef ASCEND_310P
+        // Re-quantized weights (device layout written at load time);
+        // reachable only when ggml_cann_kq_matmul_path(src0) != NONE.
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            ggml_cann_mul_mat_kquant(ctx, dst);
+            break;
+#endif
         default:
             GGML_ABORT("Unsupported type for mul_mat");
             break;

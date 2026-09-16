@@ -210,8 +210,12 @@ struct ggml_cann_pool_buf_prio : public ggml_cann_pool {
 
     /**
      * @brief The alignment for buffer allocation.
+     *
+     * 512B: NPU MTE2 burst efficiency requires 512B-aligned GM base for
+     * large contiguous loads (W8A8 fractal-layout weights); misaligned base
+     * costs +21~60% mte2 time (measured, see doc 14/15 X2_MISALIGN).
      */
-    static const size_t alignment = 128;
+    static const size_t alignment = 512;
 
     /**
      * @brief The device ID associated with this buffer pool.
@@ -399,9 +403,9 @@ struct ggml_cann_pool_buf : public ggml_cann_pool {
     static const size_t min_free_margin = 1ull << 20;  // 1MB
 
     /**
-     * @brief The alignment for buffer allocation.
+     * @brief The alignment for buffer allocation (512B, see W8A8 mte2 note).
      */
-    static const size_t alignment = 128;
+    static const size_t alignment = 512;
 
     /**
      * @brief The maximum number of buffers in the pool.
@@ -668,7 +672,7 @@ struct ggml_cann_pool_vmm : public ggml_cann_pool {
     void * alloc(size_t size, size_t * actual_size) override {
         // round up the allocation size to the alignment to ensure that all
         // allocations are aligned for all data types
-        const size_t alignment = 128;
+        const size_t alignment = 512;  // 512B GM alignment (W8A8 mte2 burst)
         size                   = GGML_PAD(size, alignment);
         if (size == 0) {
             size = alignment;
@@ -1088,6 +1092,250 @@ static void ggml_backend_cann_transform(ggml_tensor * tensor, const void * src, 
     }
 }
 
+#ifdef ASCEND_310P
+// ============================================================================
+// K-quant (Q4_K/Q5_K/Q6_K) host-side re-quantization for NPU quantized matmul
+// (310P W8A8 KG / W4A8 paths, see aclnn_ops.h ggml_cann_kq_matmul_path)
+// ============================================================================
+
+// 6-bit scale/min interleave decoder; identical to ggml-quants.c get_scale_min_k4
+// (static there, so a local copy is required).
+static inline void kq_get_scale_min_k4(int j, const uint8_t * q, uint8_t * d, uint8_t * m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+    }
+}
+
+// Dequantize one 256-element super-block (QK_K) into y[256].
+static void kq_dequant_q4_k_block(const block_q4_K * x, float * y) {
+    const uint8_t * q = x->qs;
+    const float d   = GGML_FP16_TO_FP32(x->d);
+    const float min = GGML_FP16_TO_FP32(x->dmin);
+    int is = 0;
+    uint8_t sc, m;
+    for (int j = 0; j < QK_K; j += 64) {
+        kq_get_scale_min_k4(is + 0, x->scales, &sc, &m);
+        const float d1 = d * sc;
+        const float m1 = min * m;
+        kq_get_scale_min_k4(is + 1, x->scales, &sc, &m);
+        const float d2 = d * sc;
+        const float m2 = min * m;
+        for (int l = 0; l < 32; ++l) *y++ = d1 * (q[l] & 0xF) - m1;
+        for (int l = 0; l < 32; ++l) *y++ = d2 * (q[l] >> 4) - m2;
+        q += 32;
+        is += 2;
+    }
+}
+
+static void kq_dequant_q5_k_block(const block_q5_K * x, float * y) {
+    const uint8_t * ql = x->qs;
+    const uint8_t * qh = x->qh;
+    const float d   = GGML_FP16_TO_FP32(x->d);
+    const float min = GGML_FP16_TO_FP32(x->dmin);
+    int is = 0;
+    uint8_t sc, m;
+    uint8_t u1 = 1, u2 = 2;
+    for (int j = 0; j < QK_K; j += 64) {
+        kq_get_scale_min_k4(is + 0, x->scales, &sc, &m);
+        const float d1 = d * sc;
+        const float m1 = min * m;
+        kq_get_scale_min_k4(is + 1, x->scales, &sc, &m);
+        const float d2 = d * sc;
+        const float m2 = min * m;
+        for (int l = 0; l < 32; ++l) *y++ = d1 * ((ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - m1;
+        for (int l = 0; l < 32; ++l) *y++ = d2 * ((ql[l] >> 4) + (qh[l] & u2 ? 16 : 0)) - m2;
+        ql += 32;
+        is += 2;
+        u1 <<= 2;
+        u2 <<= 2;
+    }
+}
+
+static void kq_dequant_q6_k_block(const block_q6_K * x, float * y) {
+    const float d = GGML_FP16_TO_FP32(x->d);
+    const uint8_t * ql = x->ql;
+    const uint8_t * qh = x->qh;
+    const int8_t * sc = x->scales;
+    for (int n = 0; n < QK_K; n += 128) {
+        for (int l = 0; l < 32; ++l) {
+            int is = l / 16;
+            const int8_t q1 = (int8_t)((ql[l + 0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+            const int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            const int8_t q3 = (int8_t)((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+            const int8_t q4 = (int8_t)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+            y[l + 0] = d * sc[is + 0] * q1;
+            y[l + 32] = d * sc[is + 2] * q2;
+            y[l + 64] = d * sc[is + 4] * q3;
+            y[l + 96] = d * sc[is + 6] * q4;
+        }
+        y += 128;
+        ql += 64;
+        qh += 32;
+        sc += 8;
+    }
+}
+
+/**
+ * @brief Q5_K/Q6_K -> W8A8 device layout (lossy re-quantization).
+ *
+ * Dequantize to float, then re-quantize symmetric int8 per K-axis group of
+ * `GGML_CANN_W8A8_GROUP_SIZE` (default 32). Output layout (matches the
+ * aclnnQuantMatmulV5 W8A8 KG contract, x2 with transposeX2=true):
+ *
+ *     [quants  : fractal order [kf][ng][16n][32B] — kf=k/32, ng=n/16 global
+ *                fractals (N1: kernel LoadX2Tile loads per-group contiguous
+ *                256B-burst blocks from this order; logical shape stays (n,k))]
+ *     [scales  : (k/gs) x n fp32, row-major]   (x2Scale[j*n + col])
+ */
+static void ggml_backend_cann_transform_kq_w8(ggml_tensor * tensor, const void * src, void * dst) {
+    const int64_t k = tensor->ne[0];
+    const int64_t n = tensor->ne[1];
+    const int gs = ggml_cann_w8_group_size();
+    const bool is_q5 = (tensor->type == GGML_TYPE_Q5_K);
+    const size_t blk_size = is_q5 ? sizeof(block_q5_K) : sizeof(block_q6_K);
+    const int64_t blocks_per_row = k / QK_K;
+    const int64_t ng_num = n / 16;  // n%16 checked by kq_matmul_path
+
+    int8_t * quants = (int8_t *) dst;
+    float * scales = (float *) ((char *) dst + (size_t) (n * k));
+
+    /* Q8_0 -> W8A8 is LOSSLESS: each 32-element block's int8 quants are copied
+     * verbatim (they already are the kernel's int8 weight), and the fp16 block
+     * scale is widened exactly to fp32. No dequant/requant round trip.
+     * N1: block b == k-fractal kf (gs==32 enforced for Q8_0 by kq_matmul_path),
+     * written to its fractal slot [(b*ng_num + ng)*512 + r*32]. */
+    if (tensor->type == GGML_TYPE_Q8_0) {
+        const int64_t q8_blocks_per_row = k / QK8_0;
+        for (int64_t row = 0; row < n; row++) {
+            const block_q8_0 * g = (const block_q8_0 *) ((const char *) src +
+                (size_t) (row * q8_blocks_per_row) * sizeof(block_q8_0));
+            const int64_t ng = row >> 4;
+            const int64_t r = row & 15;
+            for (int64_t b = 0; b < q8_blocks_per_row; b++) {
+                memcpy(quants + ((b * ng_num + ng) * 16 + r) * 32, g[b].qs, QK8_0);
+                scales[b * n + row] = GGML_FP16_TO_FP32(g[b].d);
+            }
+        }
+        return;
+    }
+
+    GGML_LOG_DEBUG("cann kq: W8A8 transform '%s' type=%s k=%lld n=%lld gs=%d layout=%zuB (ggml %zuB)\n",
+                   ggml_get_name(tensor), ggml_type_name(tensor->type), (long long) k, (long long) n, gs,
+                   ggml_cann_kq_layout_size(tensor, GGML_CANN_KQ_W8A8), ggml_nbytes(tensor));
+
+    std::vector<float> wbuf(QK_K);
+    for (int64_t row = 0; row < n; row++) {
+        const int64_t ng = row >> 4;
+        const int64_t r = row & 15;
+        for (int64_t b = 0; b < blocks_per_row; b++) {
+            const char * sblk = (const char *) src + (size_t) (row * blocks_per_row + b) * blk_size;
+            if (is_q5) {
+                kq_dequant_q5_k_block((const block_q5_K *) sblk, wbuf.data());
+            } else {
+                kq_dequant_q6_k_block((const block_q6_K *) sblk, wbuf.data());
+            }
+            for (int g = 0; g < QK_K; g += gs) {
+                float amax = 0.0f;
+                for (int i = 0; i < gs; i++) {
+                    const float a = fabsf(wbuf[g + i]);
+                    if (a > amax) amax = a;
+                }
+                const float s = (amax > 0.0f) ? (amax / 127.0f) : 1.0f;
+                const int64_t kbase = b * QK_K + g;
+                for (int i = 0; i < gs; i++) {
+                    int v = (int) lrintf(wbuf[g + i] / s);
+                    if (v > 127) v = 127;
+                    if (v < -127) v = -127;
+                    /* N1: element (kbase+i) of row -> fractal slot
+                     * [kf=(kbase+i)/32][ng][r][col=(kbase+i)%32] */
+                    quants[(((kbase + i) / 32) * ng_num + ng) * 512 + r * 32 + ((kbase + i) & 31)] = (int8_t) v;
+                }
+                scales[(kbase / gs) * n + row] = s;
+            }
+        }
+    }
+}
+
+/**
+ * @brief Q4_K -> W4A8 device layout (lossy re-quantization, group = 256).
+ *
+ * Dequantize to float, re-quantize symmetric int4 [-7,7] per 256-element group
+ * and pack transposed into the operator contract:
+ *
+ *     [quants  : k x (n/8) int32, row-major; int32(k, j) holds int4
+ *                W[k, 8j+0..7], nibble i = bits [4i, 4i+4)]
+ *     [scales  : (k/256) x n uint64; fp32 scale bits in low 32-bit word
+ *                (kernel ScaleDecodePre reads the low word; high word 0x4000
+ *                matches the TransQuantParamV2/VDEQ16 encoding)]
+ *     [yOffset : n fp32; yOffset[col] = 8 * sum_j s_j * sum_{k in Gj} q[k,col]
+ *                (offline compensation of the int8->2x int4 split, see
+ *                aclnnQuantMatmulV5 A8W4Int K_G semantics)]
+ */
+static void ggml_backend_cann_transform_kq_w4(ggml_tensor * tensor, const void * src, void * dst) {
+    const int64_t k = tensor->ne[0];
+    const int64_t n = tensor->ne[1];
+    const int64_t blocks_per_row = k / QK_K;
+    const int64_t n8 = n / 8;
+
+    uint32_t * quants = (uint32_t *) dst;
+    uint64_t * scales = (uint64_t *) ((char *) dst + (size_t) (k * n8) * sizeof(int32_t));
+    float * yoffset =
+        (float *) ((char *) dst + (size_t) (k * n8) * sizeof(int32_t) + (size_t) ((k / 256) * n) * sizeof(uint64_t));
+
+    memset(quants, 0, (size_t) (k * n8) * sizeof(int32_t));
+    memset(yoffset, 0, (size_t) n * sizeof(float));
+
+    GGML_LOG_DEBUG("cann kq: W4A8 transform '%s' k=%lld n=%lld layout=%zuB (ggml %zuB)\n", ggml_get_name(tensor),
+                   (long long) k, (long long) n, ggml_cann_kq_layout_size(tensor, GGML_CANN_KQ_W4A8),
+                   ggml_nbytes(tensor));
+
+    std::vector<float> wbuf(QK_K);
+    for (int64_t row = 0; row < n; row++) {
+        const int64_t word_col = row >> 3;
+        const uint32_t nib_shift = (uint32_t) (row & 7) * 4;
+        for (int64_t b = 0; b < blocks_per_row; b++) {
+            const block_q4_K * sblk =
+                (const block_q4_K *) ((const char *) src + (size_t) (row * blocks_per_row + b) * sizeof(block_q4_K));
+            kq_dequant_q4_k_block(sblk, wbuf.data());
+            float amax = 0.0f;
+            for (int i = 0; i < QK_K; i++) {
+                const float a = fabsf(wbuf[i]);
+                if (a > amax) amax = a;
+            }
+            const float s = (amax > 0.0f) ? (amax / 7.0f) : 1.0f;
+            int qsum = 0;
+            const int64_t kbase = b * QK_K;
+            for (int i = 0; i < QK_K; i++) {
+                int v = (int) lrintf(wbuf[i] / s);
+                if (v > 7) v = 7;
+                if (v < -7) v = -7;
+                qsum += v;
+                quants[(kbase + i) * n8 + word_col] |= ((uint32_t) (v & 0xF)) << nib_shift;
+            }
+            uint32_t bits;
+            memcpy(&bits, &s, sizeof(bits));
+            scales[b * n + row] = ((uint64_t) 0x4000 << 32) | (uint64_t) bits;
+            yoffset[row] += 8.0f * s * (float) qsum;
+        }
+    }
+}
+
+static void ggml_backend_cann_transform_kq(ggml_tensor * tensor, const void * src, void * dst) {
+    const int path = ggml_cann_kq_matmul_path(tensor);
+    if (path == GGML_CANN_KQ_W8A8) {
+        ggml_backend_cann_transform_kq_w8(tensor, src, dst);
+    } else if (path == GGML_CANN_KQ_W4A8) {
+        ggml_backend_cann_transform_kq_w4(tensor, src, dst);
+    } else {
+        GGML_ABORT("kq transform called for a tensor without an NPU path");
+    }
+}
+#endif  // ASCEND_310P
+
 /**
  * @brief Transform CANN processed data back into tensor data based on its type.
  *
@@ -1286,8 +1534,55 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
     static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
 
     bool is_quantized = need_transform(tensor->type);
-    bool is_nz        = !is_quantized && tensor->type != GGML_TYPE_BF16 && weight_to_nz &&
+#ifdef ASCEND_310P
+    // K-quant (Q4_K/Q5_K/Q6_K) matmul weight: re-quantize to W8A8/W4A8 device
+    // layout at load time. Must be excluded from the NZ path below.
+    int kq_path = ggml_cann_kq_matmul_path(tensor);
+#else
+    int kq_path = GGML_CANN_KQ_NONE;
+#endif
+    bool is_kq = kq_path != GGML_CANN_KQ_NONE;
+    bool is_nz = !is_quantized && !is_kq && tensor->type != GGML_TYPE_BF16 && weight_to_nz &&
                  is_matmul_weight((const ggml_tensor *) tensor);
+
+    if (is_kq) {
+        // Re-quantized layout size differs from ggml_nbytes(); upload the full
+        // layout size. Gate on the buffer actually having reserved that much.
+        const size_t layout = ggml_cann_kq_layout_size(tensor, kq_path);
+        const size_t cap = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
+        if (layout > cap) {
+            GGML_LOG_ERROR("%s: kq layout %zuB exceeds reserved buffer size %zuB for '%s'\n", __func__, layout, cap,
+                           ggml_get_name(tensor));
+            GGML_ABORT("kq transform buffer too small");
+        }
+
+        // Single-shot write: transform directly from the caller's buffer.
+        if (offset == 0 && size == ggml_nbytes(tensor)) {
+            void * transform_buffer = malloc(layout);
+            ggml_backend_cann_transform_kq(tensor, data, transform_buffer);
+            ACL_CHECK(aclrtMemcpy(tensor->data, layout, transform_buffer, layout, ACL_MEMCPY_HOST_TO_DEVICE));
+            free(transform_buffer);
+            return;
+        }
+
+        // Chunked write: stage raw GGUF bytes, transform once complete.
+        TensorSetTracker * tracker = ctx->get_or_create_tracker(tensor);
+        std::unique_lock<std::mutex> lock(tracker->mtx);
+        if (tracker->host_buffer.empty()) {
+            tracker->host_buffer.resize(tracker->total_bytes);
+        }
+        memcpy(tracker->host_buffer.data() + offset, data, size);
+        tracker->bytes_written += size;
+        if (tracker->bytes_written >= tracker->total_bytes) {
+            void * transform_buffer = malloc(layout);
+            ggml_backend_cann_transform_kq(tensor, tracker->host_buffer.data(), transform_buffer);
+            ACL_CHECK(aclrtMemcpy(tensor->data, layout, transform_buffer, layout, ACL_MEMCPY_HOST_TO_DEVICE));
+            free(transform_buffer);
+            lock.unlock();
+            ctx->remove_tracker(tensor);
+        }
+        return;
+    }
 
     // Plain tensor (not quantized, not NZ): direct copy, no tracking needed
     if (!is_quantized && !is_nz) {
@@ -1371,6 +1666,17 @@ static void ggml_backend_cann_buffer_get_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
     ggml_cann_set_device(ctx->device);
+
+#ifdef ASCEND_310P
+    if (ggml_cann_kq_matmul_path(tensor) != GGML_CANN_KQ_NONE) {
+        // Re-quantization is lossy: the original GGUF bytes cannot be recovered.
+        GGML_LOG_ERROR("cann get_tensor: '%s' (type %s) was re-quantized for NPU W8A8/W4A8 matmul; "
+                       "original data is not recoverable, zero-filling\n",
+                       ggml_get_name(tensor), ggml_type_name(tensor->type));
+        memset(data, 0, size);
+        return;
+    }
+#endif
 
     if (!need_transform(tensor->type)) {
         ACL_CHECK(aclrtMemcpy(data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST));
@@ -1526,7 +1832,7 @@ static ggml_backend_buffer_t ggml_backend_cann_buffer_type_alloc_buffer(ggml_bac
  * buffers).
  */
 static size_t ggml_backend_cann_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return 128;
+    return 512;  // 512B GM alignment for MTE2 burst efficiency (W8A8 fractal weights)
 
     GGML_UNUSED(buft);
 }
@@ -1546,12 +1852,23 @@ static size_t ggml_backend_cann_buffer_type_get_alignment(ggml_backend_buffer_ty
  * CANN buffer.
  */
 static size_t ggml_backend_cann_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft,
-                                                           const ggml_tensor *        tensor) {
+                                                            const ggml_tensor *        tensor) {
     size_t  size = ggml_nbytes(tensor);
     int64_t ne0  = tensor->ne[0];
 
     // Only check env once.
     static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
+
+#ifdef ASCEND_310P
+    // K-quant matmul weight: reserve the re-quantized device layout size
+    // (must agree with ggml_backend_cann_buffer_set_tensor).
+    {
+        const int kq_path = ggml_cann_kq_matmul_path(tensor);
+        if (kq_path != GGML_CANN_KQ_NONE) {
+            return ggml_cann_kq_layout_size(tensor, kq_path);
+        }
+    }
+#endif
 
     // last line must bigger than 32, because every single op deal at
     // least 32 bytes.
@@ -2447,13 +2764,47 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     case GGML_TYPE_F32:
                         return true;
                     case GGML_TYPE_Q8_0:
-                    case GGML_TYPE_Q4_0:
+                        // Q8_0 MUL_MAT on 310P: routed to the W8A8 K-quant path
+                        // (lossless transform, see ggml_cann_kq_matmul_path).
+                        // Same contract as Q4_K/Q5_K/Q6_K below — weight must
+                        // already live in a CANN buffer holding the device layout.
 #ifdef ASCEND_310P
-                        // Q4 && Q8 per group is not support on 310p device
+                        if (ggml_cann_kq_matmul_path(op->src[0]) != GGML_CANN_KQ_NONE) {
+                            if (op->src[0]->buffer == nullptr ||
+                                !ggml_backend_buft_is_cann(op->src[0]->buffer->buft)) {
+                                return false;
+                            }
+                            return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+                        }
                         return false;
 #endif
                         // only support contiguous for quantized types.
                         return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+                    case GGML_TYPE_Q4_0:
+#ifdef ASCEND_310P
+                    // K-quants: NPU path via W8A8/W4A8 (transform at load, see
+                    // ggml_backend_cann_buffer_set_tensor; the decision here must
+                    // stay consistent with ggml_cann_kq_matmul_path).
+                    case GGML_TYPE_Q4_K:
+                    case GGML_TYPE_Q5_K:
+                    case GGML_TYPE_Q6_K:
+                        if (ggml_cann_kq_matmul_path(op->src[0]) != GGML_CANN_KQ_NONE) {
+                            // The weight must ALREADY reside in a CANN buffer: the
+                            // W8A8/W4A8 device layout is produced at load time in
+                            // set_tensor. A weight living in a host/CPU buffer holds
+                            // raw GGUF bytes — a plain copy would be interpreted as
+                            // the device layout and silently corrupt the result
+                            // (upstream cpy_tensor_async also refuses to copy
+                            // matmul weights). So with e.g. -ngl 0 we must report
+                            // "not supported" and let the op stay on its backend.
+                            if (op->src[0]->buffer == nullptr ||
+                                !ggml_backend_buft_is_cann(op->src[0]->buffer->buft)) {
+                                return false;
+                            }
+                            return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+                        }
+                        return false;
+#endif
                     default:
                         return false;
                 }
