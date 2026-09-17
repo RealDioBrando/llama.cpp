@@ -3,6 +3,9 @@
 #include "llama-impl.h"
 #include "llama-paged-scheduler-impl.h"
 
+#include <algorithm>
+#include <vector>
+
 struct llama_paged_scheduler {
     llama_paged_scheduler_impl impl;
 
@@ -52,6 +55,70 @@ LLAMA_API void llama_paged_scheduler_free(struct llama_paged_scheduler * sched) 
     if (sched) {
         delete sched;
     }
+}
+
+LLAMA_API bool llama_paged_scheduler_warmup(struct llama_paged_scheduler * sched,
+                                            struct llama_context *         ctx) {
+    if (!sched || !ctx) {
+        return false;
+    }
+
+    const uint32_t n_ctx = llama_n_ctx(ctx);
+    const uint32_t n_tokens = std::min<uint32_t>(llama_n_batch(ctx), n_ctx > 0 ? n_ctx - 1 : 0);
+    if (n_tokens == 0) {
+        return false;
+    }
+
+    const bool prefix_cache_was_enabled = sched->impl.set_prefix_cache_enabled(false);
+    auto run_pass = [&](uint32_t pass_tokens) {
+        std::vector<llama_token> tokens(pass_tokens, 0);
+        const llama_token bos = llama_vocab_bos(llama_model_get_vocab(llama_get_model(ctx)));
+        if (bos != LLAMA_TOKEN_NULL) {
+            tokens[0] = bos;
+        }
+
+        if (!llama_paged_scheduler_add_request(sched, tokens.data(), (int32_t) tokens.size(), 0)) {
+            return false;
+        }
+
+        llama_batch batch = {};
+        bool decoded = false;
+        while (true) {
+            if (!llama_paged_scheduler_prepare_batch(sched, &batch)) {
+                return false;
+            }
+            if (batch.n_tokens == 0) {
+                break;
+            }
+            if (llama_decode(ctx, batch) != 0) {
+                return false;
+            }
+            llama_synchronize(ctx);
+
+            const auto * info = llama_paged_scheduler_get_batch_info(sched);
+            std::vector<llama_token> next_tokens(info->n_seq, 0);
+            std::vector<int8_t> stop(info->n_seq, decoded ? 1 : 0);
+            llama_paged_scheduler_update(sched, &batch, next_tokens.data(), stop.data());
+            decoded = true;
+        }
+        return true;
+    };
+
+    // The tiny pass loads common CANN kernels before the paged graph. Keep
+    // the large pass to one ubatch so warmup does not exercise the known
+    // multi-ubatch async race on 310P.
+    const uint32_t tiny_tokens = std::min<uint32_t>(n_tokens, 2);
+    const uint32_t graph_tokens = std::min<uint32_t>(n_tokens, llama_n_ubatch(ctx));
+    bool ok = run_pass(tiny_tokens);
+    if (ok && graph_tokens > tiny_tokens) {
+        ok = run_pass(graph_tokens);
+    }
+
+    sched->impl.set_prefix_cache_enabled(prefix_cache_was_enabled);
+    if (ok) {
+        LLAMA_LOG_INFO("%s: warmed paged prefill and decode with %d token(s)\n", __func__, (int) n_tokens);
+    }
+    return ok;
 }
 
 LLAMA_API bool llama_paged_scheduler_prepare_batch(struct llama_paged_scheduler * sched, struct llama_batch * batch) {

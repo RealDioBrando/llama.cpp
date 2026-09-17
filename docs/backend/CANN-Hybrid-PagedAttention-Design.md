@@ -839,3 +839,161 @@ dense 全注意力模型 (如 Qwen3-8B PA 路径) 无 GDN 状态问题, 只需 1
 - 共享块换出: 两个 group 可分别持有 GPU/CPU 副本, 块不可变所以一致。
 - 验证: 同 system prompt 双请求 argmax 对齐非缓存路径; 共享块同时
   decode 正确性; 缓存命中下 TTFT 对比; 池压力下的驱逐行为。
+
+## 19. Paged Path 调通记录 (2026-09-17)
+
+### 19.1 当前状态
+
+qwen3.5-2B hybrid-paged 端到端已可跑通 full-attention 层的
+`ReshapeAndCache -> SelfAttention/SplitFuse/PagedAttention` 路径。
+为规避当前 310P 上多算子异步执行时偶发的 `RmsNorm` invalid GM
+address 问题，曾在 paged graph 默认启用 op-level sync；因性能影响，
+该默认行为已移除。现在 ATB paged 边界不加 sync，只有显式设置
+`GGML_CANN_SYNC_EVERY_OP=on` 时才做 op-level sync。
+
+q4 模型 1024-token prompt / 64-token decode 的验证结果:
+
+```text
+TTFT   6550.9 ms
+TPOT    636.2 ms/token
+decode  1.62 tokens/s
+```
+
+该结果是在临时 op-level sync 下测得的正确性上限，不是当前默认路径性能。
+
+### 19.2 已知限制
+
+fp16 qwen3.5-2B 在 paged 路径仍受 tied embedding 影响。
+`token_embd.weight` 约为 970 MB，当前 loader 将其留在 CPU mapped buffer，
+首次 LM-head matmul 需要 CANN 侧一次约 985 MB 的权重拷贝；
+在 paged KV 已占用设备显存后，该单次大分配会失败。
+q4_k_m 模型没有这一 1 GB 级 tied-weight 拷贝，因此可先用于验证。
+
+## 20. fp16 Hybrid-Paged + Fused GDN (2026-09-17)
+
+### 20.1 当前路径
+
+fp16 qwen3.5-2B 已在空闲约 43 GB 的 NPU 上跑通 hybrid-paged。之前记录的
+tied embedding 大拷贝失败依赖当时的空闲显存，不是 fp16 路径的固定限制。
+
+GDN chunk 路径使用:
+
+```text
+ComputeWy -> FwdH -> FwdO
+```
+
+其中 FwdH final state 是 kernel 的 `[B, H, K, V]` contiguous 布局；
+llama.cpp recurrent state 是 `[B, K, V, H]` 的 GGML raw 布局。回写前
+必须做最后一次两维转置。当前代码已修正该状态布局。
+
+310P 上纯 chunk state 在部分非零 initial state 下与 recurrent 参考有
+精度漂移。为保端到端精度，当前默认启用混合模式:
+
+```text
+GGML_CANN_GDN_CHUNK_STATE_RECURRENT=on
+```
+
+模式含义:
+
+1. attention output 仍主要来自 chunk `FwdO`；
+2. recurrent state 用 `RecurrentGatedDeltaRuleV310` 逐 token 更新；
+3. 每个 GDN call 的第 0 个 token output 也用 recurrent 结果覆盖，
+   以规避 chunk FwdO 在该位置的首 token 偏差。
+
+设为 `off` 时可回到纯 chunk kernel 路径，只用于算子调试；它 prefill
+更快，但长 prompt 端到端输出会漂移。
+
+### 20.2 单请求 1024-token / 128-token decode
+
+条件:
+
+```text
+model   qwen3.5-2b-f16.gguf
+prompt  1024 tokens
+b/ub    1024/128
+decode  128 tokens, greedy
+```
+
+结果:
+
+| path                     | TTFT     | TPOT     | decode agg tps |
+|--------------------------|---------:|---------:|---------------:|
+| recurrent GDN (baseline) | 2126.5 ms | 36.1 ms | 28.37 tokens/s |
+| hybrid fused GDN         | 1877-2049 ms | 36.4 ms | 28.10-28.23 tokens/s |
+| pure chunk fused GDN     | 1519.8 ms | 37.1 ms | 27.61 tokens/s |
+
+hybrid fused GDN prefill 提速约 4-12%（多次运行的中位值约 10%）;
+decode 与 baseline 持平。
+pure chunk 路径只作为精度调试上限，不代表可交付精度。
+
+### 20.3 精度结果
+
+在相同 greedy 请求下，hybrid fused GDN 与 recurrent baseline 的 128 个
+输出 token 完全一致。纯 chunk fused GDN 输出会漂移，因此当前默认不使用。
+
+调试 dump 的逐算子数值仍能观察到 chunk `FwdO` 与 recurrent 输出非逐位
+一致；混合模式用 recurrent state 和首 token 覆盖把它约束到端到端一致。
+后续若要进一步关闭 state fallback，需要继续定位 `FwdH/FwdO` 对非零
+initial state 的精度问题。
+
+### 20.4 Paged 和 Non-Paged TTFT 差距拆解
+
+之前的 733 ms 来自 `llama-cli` 非 paged 路径；该路径默认会先做一次
+BOS/EOS 两 token warmup，并在性能统计前 reset perf。paged example 当前
+显式关闭 warmup，因此单次 TTFT 包含 CANN/ATB 首次 kernel 和 tiling 初始化。
+
+同一 NPU、同一 fp16 模型、1024-token prompt 的 graph timing 对照：
+
+| path | ubatch | compute per ubatch |
+|---|---:|---:|
+| non-paged CLI, fused GDN | 512 | 455.4 ms, 466.0 ms |
+| paged fused GDN + state fallback | 512 | 1326.2 ms, 480.7 ms |
+| non-paged CLI, fused GDN | 128 | 136.4 ms, 139.0 ms, 139.2 ms, ... |
+| paged fused GDN + state fallback | 128 | 1044.0 ms, 178.2 ms, 178.1 ms, ... |
+
+两个关键点:
+
+1. paged 第一个 ubatch 明显更慢，主要是 cold start。paged 的首个
+   `ReshapeAndCache` 约 175 ms；后续同 shape 调用降到约 0.1 ms。
+   CANN/ATB 其他首次 kernel/tiling 初始化也落在第一个图里。
+2. 稳态差距不大。`ub=512` 时，paged 第二个 512-token 图 480.7 ms，
+   非 paged 第二个 512-token 图 466.0 ms，差距约 3%。
+   `ub=128` 的稳态差距约 27%，主要来自每个 ubatch 固定的 paged
+   cache/attention 路径开销和更小的 matmul 效率。
+
+Paged attention 本身不是 1k prefill 的主要瓶颈。`ub=128` 时每个
+full-attention 层的 SA 约 1.1-1.2 ms，RAC 约 0.1 ms；`ub=512` 时
+每个 SA 约 4 ms，RAC 约 0.1 ms。6 个 full-attention 层合计只有几十毫秒。
+
+因此，比较 fair 的口径是:
+
+- 单次冷启动 TTFT: paged 比 non-paged 慢，包含一次性初始化。
+- 稳态 TTFT: 应先做 paged warmup，或看第二次相同 shape 请求。
+- 当前 733 ms 是 non-paged + pure chunk 的上界；paged 交付路径为了
+  精度开启 state fallback，不能直接和该数值比较。
+
+### 20.5 Paged Warmup
+
+已新增 `llama_paged_scheduler_warmup()`。它通过真实 paged scheduler 执行:
+
+```text
+2-token prefill + decode
+one n_ubatch-token prefill + decode
+```
+
+小图用于加载通用 CANN kernel；大图用于加载当前 `n_ubatch` 的
+paged RAC/attention 形状。warmup 结束后释放请求块，并恢复 prefix cache
+开关，因此不会把 synthetic token 泄漏进后续请求。
+
+`llama-paged` 默认启用该 warmup，可用 `--no-warmup` 关闭。关闭后可复现
+冷启动开销。
+
+qwen3.5-2B fp16、1024-token prompt、`ub=512`、单请求:
+
+| mode          | TTFT     | TPOT     |
+|---------------|---------:|---------:|
+| no paged warmup | 1808.6 ms | - |
+| paged warmup    | 936.7 ms | 36.1 ms |
+
+128-token greedy 输出与原路径一致。`ub=128` 的冷启动 TTFT 也从约
+2.27 s 降到约 1.20 s。

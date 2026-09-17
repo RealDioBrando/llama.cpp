@@ -28,6 +28,7 @@ class llama_paged_scheduler_impl {
     void set_on_finish(llama_paged_on_finish_cb cb, void * user_data);
     llama_sequence_group *         get_group_from_id(int32_t request_id) const;
     const llama_paged_batch_info * get_curr_batch_info() const;
+    bool set_prefix_cache_enabled(bool enabled);
 
   private:
     void insert_sorted_by_arrival_time(llama_sequence_group_ptr new_group, llama_sequence_group_list & list);

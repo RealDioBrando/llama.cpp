@@ -703,6 +703,13 @@ void llama_paged_scheduler_impl::set_on_finish(llama_paged_on_finish_cb cb, void
     on_finish_user_data = user_data;
 }
 
+bool llama_paged_scheduler_impl::set_prefix_cache_enabled(bool enabled) {
+    const bool old = prefix_cache_enabled;
+    prefix_cache_enabled = enabled;
+    prefix_cache.set_enabled(enabled);
+    return old;
+}
+
 llama_sequence_group * llama_paged_scheduler_impl::get_group_from_id(int32_t request_id) const {
     return id_to_group.count(request_id) ? id_to_group.at(request_id) : nullptr;
 }

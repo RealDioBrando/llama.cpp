@@ -17,6 +17,7 @@ llama-paged -m model.gguf -kvp -ngl 100 -sm none -mg 0 \
 - `-ncpub N`: number of CPU KV blocks for swap-out (optional)
 - `-ns N`: number of sequences to queue
 - `-np N`: maximum sequences decoded in parallel (must equal `-ns` in this example)
+- `--no-warmup`: skip the paged prefill/decode warmup; warmup is enabled by default
 
 ## Phase 1 restrictions
 The paged path currently requires:

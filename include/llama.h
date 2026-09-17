@@ -1676,6 +1676,12 @@ extern "C" {
     LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama_context * ctx);
     LLAMA_API void llama_paged_scheduler_free(struct llama_paged_scheduler * sched);
 
+    // Run one prefill and one decode with synthetic tokens, then release all
+    // warmup blocks. This warms backend and ATB kernels for the configured
+    // batch/ubatch shapes without affecting request timing.
+    LLAMA_API bool llama_paged_scheduler_warmup(struct llama_paged_scheduler * sched,
+                                                struct llama_context *         ctx);
+
     // Queueing and stepping.
     LLAMA_API bool llama_paged_scheduler_add_request(struct llama_paged_scheduler * sched,
                                                      const llama_token *            tokens,

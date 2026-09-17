@@ -105,7 +105,7 @@ int main(int argc, char ** argv) {
     srand(1234);
 
     common_params params;
-    params.warmup = false;  // we do not support warmup for paged KV cache yet
+    params.warmup = true;
 
     // Example parameters that work
     // params.n_sequences = 100;
@@ -122,6 +122,13 @@ int main(int argc, char ** argv) {
         LOG_INF("%s: n_sequences (%d) cannot exceed n_parallel (%d)\n", __func__, params.n_sequences,
                 params.n_parallel);
         return 1;
+    }
+
+    // The common warmup runs before paged scheduler metadata exists. Keep the
+    // flag for the paged scheduler's own prefill + decode warmup.
+    const bool paged_warmup = params.warmup;
+    if (params.kv_paged) {
+        params.warmup = false;
     }
 
     common_init();
@@ -144,6 +151,12 @@ int main(int argc, char ** argv) {
     struct llama_paged_scheduler * scheduler = llama_paged_scheduler_init(ctx);
     if (!scheduler) {
         LOG_ERR("%s: Failed to initialize scheduler.\n", __func__);
+        return 1;
+    }
+
+    if (paged_warmup && !llama_paged_scheduler_warmup(scheduler, ctx)) {
+        LOG_ERR("%s: Failed to warm up paged scheduler.\n", __func__);
+        llama_paged_scheduler_free(scheduler);
         return 1;
     }
 
