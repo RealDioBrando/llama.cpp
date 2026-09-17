@@ -1079,8 +1079,42 @@ static bool ggml_cann_qmat_debug() {
     return on;
 }
 
+/**
+ * @brief   GDN-layer projection weights (Qwen3.5 linear-attention blocks), Plan B.
+ *
+ * @details Routes attn_qkv/attn_gate/ssm_out (large q8_0 matmuls, k=2048) to the
+ *          NPU W8A8 path by name suffix. ssm_alpha/ssm_beta ([2048,16]) are
+ *          excluded by default pending the [2048,16] feedback clarification
+ *          (19号 §4.10); opt in with GGML_CANN_GDN_SMALL=1 (independent of
+ *          GGML_CANN_GDN_PROJ). GGML_CANN_GDN_PROJ=0 restores the CPU fallback
+ *          for the large projections (default ON).
+ */
+static bool is_gdn_proj_weight(const ggml_tensor * tensor) {
+    static const bool                            enabled  = !ggml_cann_env_off("GGML_CANN_GDN_PROJ");
+    static const bool                            small_on = ggml_cann_env_on("GGML_CANN_GDN_SMALL");
+    static const std::unordered_set<std::string> gdn_suffixes{ "attn_qkv.weight", "attn_gate.weight",
+                                                               "ssm_out.weight" };
+    static const std::unordered_set<std::string> gdn_small_suffixes{ "ssm_alpha.weight", "ssm_beta.weight" };
+    const std::string                            name = ggml_get_name(tensor);
+    if (enabled) {
+        for (const auto & suffix : gdn_suffixes) {
+            if (name.find(suffix) != std::string::npos) {
+                return true;
+            }
+        }
+    }
+    if (small_on) {
+        for (const auto & suffix : gdn_small_suffixes) {
+            if (name.find(suffix) != std::string::npos) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static int ggml_cann_kq_matmul_path(const ggml_tensor * tensor) {
-    if (!is_matmul_weight(tensor)) {
+    if (!is_matmul_weight(tensor) && !is_gdn_proj_weight(tensor)) {
         return GGML_CANN_KQ_NONE;
     }
     if (tensor->ne[2] != 1 || tensor->ne[3] != 1) {

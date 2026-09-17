@@ -4466,6 +4466,38 @@ void ggml_cann_out_prod(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     }
 }
 
+/* ── SsmConv1d 自定义算子(ops-nn vendor 包, e2e optim P0)──
+ * 背景: 310P aclnnConvolution 的 depthwise(groups=d_inner)路径每次调用都对权重做
+ * FRACTAL_Z:1→FZ:6144 运行期重组(TransDataFzToDst ~1.3ms × 18 层/步 ≈ 24ms/步,
+ * NPU busy 最大单项, 详见 18 号文档 §9)。vendor 包的 aclnnSsmConv1d 以内部
+ * Transpose + 纯向量 kernel 替代。弱符号 + 失败回退: 无 vendor 包或运行报错时
+ * 自动走原 Convolution 路径。GGML_CANN_SSM_CONV1D=0 可强制关闭。 */
+#ifdef __cplusplus
+extern "C" {
+#endif
+__attribute__((weak)) aclnnStatus aclnnSsmConv1dGetWorkspaceSize(const aclTensor * x, const aclTensor * weight,
+                                                                 aclTensor * y, uint64_t * workspaceSize,
+                                                                 aclOpExecutor ** executor);
+__attribute__((weak)) aclnnStatus aclnnSsmConv1d(void * workspace, uint64_t workspaceSize, aclOpExecutor * executor,
+                                                 aclrtStream stream);
+#ifdef __cplusplus
+}
+#endif
+
+static bool ggml_cann_ssm_conv1d_enabled() {
+    static int enabled = []() {
+        const char * env = getenv("GGML_CANN_SSM_CONV1D");
+        if (env != nullptr && env[0] == '0') {
+            return 0;
+        }
+        return (aclnnSsmConv1dGetWorkspaceSize != nullptr) ? 1 : 0;
+    }();
+    return enabled == 1;
+}
+
+/* aclnnStatus 成功值(ACLNN_SUCCESS 在部分 aclnnop 头文件组合下不可见, 本地定义) */
+constexpr aclnnStatus ACLNN_STATUS_OK = static_cast<aclnnStatus>(0);
+
 void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * src0 = dst->src[0];  // conv_x
     ggml_tensor * src1 = dst->src[1];  // conv1d.weight
@@ -4488,6 +4520,57 @@ void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(ncs == nc - 1 + n_t);  // conv_x: {d_conv - 1 + n_t, d_inner, n_s}
     GGML_ASSERT(src0->nb[0] == sizeof(float));
     GGML_ASSERT(src1->nb[0] == sizeof(float));
+
+    /* P0(e2e optim): 自定义 SsmConv1d 路径(vendor 包加载时优先)。
+     * 契约: x (n_s, d_inner, ncs) / weight (d_inner, nc) / y (n_s, n_t, d_inner),
+     * 与 ggml 原始布局经 ACL 维度反转后天然一致, 零拷贝直传。
+     * 注意: 必须直接 aclCreateTensor 且 storage shape = view shape ——
+     * ggml_cann_create_tensor 的 storage 为 1 维 [总元素数], l0op::Transpose 的
+     * inferShape/tiling 要求 storage 与 view 维数一致, 否则 561103 静默回退。 */
+    if (ggml_cann_ssm_conv1d_enabled() && nr % 64 == 0 && nc >= 1 && nc <= 16 && n_t >= 1 &&
+        src0->nb[1] == ncs * sizeof(float) && src1->nb[1] == nc * sizeof(float) &&
+        dst->nb[1] == nr * sizeof(float) &&
+        (n_s == 1 || (src0->nb[2] == nr * ncs * sizeof(float) && dst->nb[2] == n_t * nr * sizeof(float)))) {
+        int64_t x_ne[3] = {n_s, nr, ncs};
+        int64_t x_st[3] = {nr * ncs, ncs, 1};
+        int64_t w_ne[2] = {nr, nc};
+        int64_t w_st[2] = {nc, 1};
+        int64_t y_ne[3] = {n_s, n_t, nr};
+        int64_t y_st[3] = {n_t * nr, nr, 1};
+        aclTensor * x_raw = aclCreateTensor(x_ne, 3, ACL_FLOAT, x_st, 0, ACL_FORMAT_ND, x_ne, 3, src0->data);
+        aclTensor * w_raw = aclCreateTensor(w_ne, 2, ACL_FLOAT, w_st, 0, ACL_FORMAT_ND, w_ne, 2, src1->data);
+        aclTensor * y_raw = aclCreateTensor(y_ne, 3, ACL_FLOAT, y_st, 0, ACL_FORMAT_ND, y_ne, 3, dst->data);
+        if (x_raw != nullptr && w_raw != nullptr && y_raw != nullptr) {
+            uint64_t        workspaceSize = 0;
+            aclOpExecutor * executor      = nullptr;
+            aclnnStatus     st = aclnnSsmConv1dGetWorkspaceSize(x_raw, w_raw, y_raw, &workspaceSize, &executor);
+            if (st == ACLNN_STATUS_OK) {
+                void *              workspaceAddr = nullptr;
+                ggml_cann_pool_alloc workspace_allocator(ctx.pool());
+                if (workspaceSize > 0) {
+                    workspaceAddr = workspace_allocator.alloc(workspaceSize);
+                }
+                st = aclnnSsmConv1d(workspaceAddr, workspaceSize, executor, ctx.stream());
+                if (st == ACLNN_STATUS_OK) {
+                    aclDestroyTensor(x_raw);
+                    aclDestroyTensor(w_raw);
+                    aclDestroyTensor(y_raw);
+                    return;
+                }
+            }
+            GGML_LOG_DEBUG("cann ssm_conv: custom SsmConv1d unavailable (st=%d), fallback to Convolution\n",
+                           (int) st);
+        }
+        if (x_raw != nullptr) {
+            aclDestroyTensor(x_raw);
+        }
+        if (w_raw != nullptr) {
+            aclDestroyTensor(w_raw);
+        }
+        if (y_raw != nullptr) {
+            aclDestroyTensor(y_raw);
+        }
+    }
 
     // --- Build CANN tensors ---
 
