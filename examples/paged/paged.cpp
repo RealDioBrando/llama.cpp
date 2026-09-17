@@ -238,19 +238,25 @@ int main(int argc, char ** argv) {
             common_sampler * sampler = it->second;
 
             int32_t     last_token_in_batch = info->batch_offsets[i] + info->batch_lens[i] - 1;
-            llama_token next_token          = common_sampler_sample(sampler, ctx, last_token_in_batch);
-            common_sampler_accept(sampler, next_token, /*accept_grammar=*/true);
-            sampled_tokens.push_back(next_token);
-            accumulated_responses[request_id] += common_token_to_piece(ctx, next_token);
-
             llama_paged_seq_state state = {};
             llama_paged_scheduler_get_seq_state(scheduler, request_id, &state);
+            const bool final_prefill = info->batch_lens[i] > 1 &&
+                                       state.n_past + info->batch_lens[i] == state.n_prompt_total;
+
+            llama_token next_token = LLAMA_TOKEN_NULL;
+            if (info->batch_lens[i] == 1 || final_prefill) {
+                next_token = common_sampler_sample(sampler, ctx, last_token_in_batch);
+                common_sampler_accept(sampler, next_token, /*accept_grammar=*/true);
+                accumulated_responses[request_id] += common_token_to_piece(ctx, next_token);
+            }
+            sampled_tokens.push_back(next_token);
 
             LOG_DBG("[Request %d] token=%s, decoded=%d, ttft=%.1fms\n", request_id,
                     common_token_to_piece(ctx, next_token).c_str(), state.n_decoded,
                     state.n_decoded == 1 ? (state.t_first_token_us - state.t_arrival_us) / 1000.0f : 0.0f);
 
-            bool stop = llama_vocab_is_eog(vocab, next_token) || state.n_decoded >= params.n_predict;
+            bool stop = (info->batch_lens[i] == 1 || final_prefill) &&
+                        (llama_vocab_is_eog(vocab, next_token) || state.n_decoded >= params.n_predict);
             stop_flags.push_back(stop ? 1 : 0);
 
             if (stop) {

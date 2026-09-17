@@ -1663,6 +1663,7 @@ extern "C" {
     struct llama_paged_seq_state {
         int32_t request_id;
         int32_t n_prompt;
+        int32_t n_prompt_total;
         int32_t n_decoded;
         int32_t n_past;
         int64_t t_arrival_us;

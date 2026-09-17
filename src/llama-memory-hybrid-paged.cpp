@@ -45,12 +45,14 @@ llama_memory_hybrid_paged::llama_memory_hybrid_paged(
     GGML_ASSERT(type_k == type_v && "paged cache requires matching K and V types");
     GGML_ASSERT(n_gpu_blocks > 0 && n_cpu_blocks > 0);
 
-    auto * gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    // use the device of the model layers so -mg pins the paged KV pools too
+    auto * gpu_dev = model.dev_layer(0);
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     GGML_ASSERT(cpu_dev && "no CPU device found for paged KV cache");
 
-    auto * backend_gpu = gpu_dev ? ggml_backend_dev_init(gpu_dev, nullptr)
-                                 : ggml_backend_dev_init(cpu_dev, nullptr);
+    auto * backend_gpu = gpu_dev && ggml_backend_dev_type(gpu_dev) == GGML_BACKEND_DEVICE_TYPE_GPU
+                             ? ggml_backend_dev_init(gpu_dev, nullptr)
+                             : ggml_backend_dev_init(cpu_dev, nullptr);
     auto * backend_cpu = ggml_backend_dev_init(cpu_dev, nullptr);
 
     mem_attn->init(backend_gpu, backend_cpu, type_k, n_gpu_blocks, n_cpu_blocks, watermark);

@@ -2727,11 +2727,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         auto * paged_cache = new llama_kv_cache_paged(head_dim, n_head, block_size, n_layers, n_ubatch, n_seq_max);
                         GGML_ASSERT(paged_cache && "unable to create paged KV cache.");
 
-                        ggml_backend_dev_t gpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+                        // use the device of the model layers so -mg pins the paged KV pools too
+                        ggml_backend_dev_t gpu_dev = dev_layer(0);
                         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
                         GGML_ASSERT(cpu_dev && "no CPU device found for paged KV cache.");
 
-                        ggml_backend_t backend_gpu = gpu_dev ? ggml_backend_dev_init(gpu_dev, nullptr) : ggml_backend_dev_init(cpu_dev, nullptr);
+                        ggml_backend_t backend_gpu = gpu_dev && ggml_backend_dev_type(gpu_dev) == GGML_BACKEND_DEVICE_TYPE_GPU
+                                                         ? ggml_backend_dev_init(gpu_dev, nullptr)
+                                                         : ggml_backend_dev_init(cpu_dev, nullptr);
                         ggml_backend_t backend_cpu = ggml_backend_dev_init(cpu_dev, nullptr);
 
                         paged_cache->init(

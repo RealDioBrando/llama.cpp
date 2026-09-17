@@ -198,6 +198,7 @@ LLAMA_API bool llama_paged_scheduler_get_seq_state(struct llama_paged_scheduler 
 
     out_state->request_id       = group->request_id;
     out_state->n_prompt         = group->n_prompt;
+    out_state->n_prompt_total   = group->n_prompt_total;
     out_state->n_decoded        = group->n_decoded;
     out_state->n_past           = group->n_past;
     out_state->t_arrival_us     = group->t_arrival_time;
