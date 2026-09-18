@@ -24,7 +24,7 @@
 
 #include "ggml-impl.h"
 #include "ggml.h"
-
+#include "ggml-backend.h"
 
 #include <aclnnop/aclnn_add.h>
 #include <aclnnop/aclnn_add_rms_norm.h>
@@ -1312,6 +1312,18 @@ static acl_tensor_ptr get_cache_acl_tensor(ggml_backend_cann_context & ctx,
     }
 
     return ggml_cann_create_tensor(*buffer, ggml_cann_type_mapping(dtype), ggml_type_size(dtype), ne, nb, dims);
+}
+
+// Non-static wrapper for the capture-time cache preload in ggml-cann.cpp. (rms_norm ones/zeros constants must exist BEFORE capture).
+acl_tensor_ptr ggml_cann_warm_cache_acl_tensor(ggml_backend_cann_context & ctx,
+                                               void **                     buffer,
+                                               int64_t &                   cache_element,
+                                               int64_t *                   ne,
+                                               size_t *                    nb,
+                                               ggml_type                   dtype,
+                                               int64_t                     dims,
+                                               float                       value) {
+    return get_cache_acl_tensor(ctx, buffer, cache_element, ne, nb, dtype, dims, value);
 }
 
 void ggml_cann_rms_norm(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
@@ -3287,6 +3299,10 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     acl_tensor_ptr acl_src = ggml_cann_create_tensor(src0);
     acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
 #ifdef ASCEND_310P
+    // The composite path below only supports full-width rotation
+    // (n_dims == ne[0]); partial rope falls through to the generic
+    // RotaryPositionEmbedding path (head/tail split).
+    if (!has_tail) {
     // Special ROPE operation for 310P
 
     // roll input
@@ -3424,6 +3440,7 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         aclnn_cast(ctx, output_fp32_tensor.get(), acl_dst.get(), ACL_FLOAT16);
     }
     return;
+    }  // end of the full-width composite path
 #endif
     int64_t acl_mode = is_neox ? 0 : 1;
 
@@ -4210,6 +4227,10 @@ void ggml_cann_mul_mat_id(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
 //  - PFA has no pseShift support and sparseMode 3/4 are rejected, so causal masking must go through
 //    the bool mask converted from the additive f16 mask (0 -> false/keep, -inf -> true/masked)
 //  - IFA rejects GQA with head_dim > 128, so KV heads are expanded to MHA before the call
+//
+// The mask is carried in device memory (pseShift), so a captured graph
+// replays with the current mask content and no host-side KV-length
+// update is needed.
 static void ggml_cann_flash_attn_ext_310p(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * src0 = dst->src[0];  // q     permuted view [D, S, N, B], BSND memory
     ggml_tensor * src1 = dst->src[1];  // k     permuted view [D, K, Nk, B], BSND memory
@@ -4760,7 +4781,6 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst
         GGML_ABORT("Function is not implemented.");
     }
 }
-
 static void ggml_cann_out_prod_fp(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * src0 = dst->src[0];  // weight  [ne00=m, ne01=K, ne02, ne03]
     ggml_tensor * src1 = dst->src[1];  // input   [ne10=n, ne11=K, ne12, ne13]
