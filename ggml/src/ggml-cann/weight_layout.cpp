@@ -159,3 +159,59 @@ void ggml_cann_weight_format_to_nz(ggml_tensor * tensor, int device) {
     transform_2d_weight(tensor->data, ggml_cann_type_mapping(tensor->type),
                         ggml_type_size(tensor->type), tensor->ne, tensor->nb, device);
 }
+
+#ifdef ASCEND_310P
+bool ggml_cann_tied_output_weight_candidate(const ggml_tensor * tensor) {
+    static const bool tied_output_enabled = parse_bool(
+        get_env_as_lowercase("GGML_CANN_TIED_OUTPUT_NZ").value_or("on"));
+    return tied_output_enabled && ggml_cann_weight_layout_enabled() && tensor->type == GGML_TYPE_F16 &&
+           ggml_is_contiguous(tensor) && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+           strcmp(ggml_get_name(tensor), "token_embd.weight") == 0 &&
+           can_transform_slice(tensor);
+}
+
+size_t ggml_cann_tied_output_weight_alloc_size(const ggml_tensor * tensor) {
+    if (!ggml_cann_tied_output_weight_candidate(tensor)) {
+        return 0;
+    }
+    return std::max(ggml_nbytes(tensor), calculate_2d_nz_size(tensor));
+}
+
+void ggml_cann_tied_output_weight_to_nz(const ggml_tensor * tensor, void * dst, int device) {
+    if (!ggml_cann_tied_output_weight_candidate(tensor)) {
+        return;
+    }
+
+    int64_t ne[2] = { tensor->ne[0], tensor->ne[1] };
+    size_t  nb[2] = { tensor->nb[0], tensor->nb[1] };
+    transform_2d_weight(dst, ggml_cann_type_mapping(tensor->type),
+                        ggml_type_size(tensor->type), ne, nb, device);
+}
+
+bool ggml_cann_prepare_tied_output_weight(const ggml_tensor * tensor,
+                                          ggml_cann_tied_output_weight_cache * cache,
+                                          int device) {
+    if (!ggml_cann_tied_output_weight_candidate(tensor) || cache == nullptr) {
+        return false;
+    }
+
+    auto it = cache->entries.find(tensor);
+    if (it != cache->entries.end()) {
+        return true;
+    }
+
+    const size_t tied_bytes = ggml_cann_tied_output_weight_alloc_size(tensor);
+    if (tied_bytes == 0) {
+        return false;
+    }
+
+    auto entry = std::make_unique<ggml_cann_tied_output_weight_cache::entry>();
+    ACL_CHECK(aclrtMalloc(&entry->buffer, tied_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+    entry->size = tied_bytes;
+    ACL_CHECK(aclrtMemcpy(entry->buffer, ggml_nbytes(tensor), tensor->data,
+                          ggml_nbytes(tensor), ACL_MEMCPY_DEVICE_TO_DEVICE));
+    ggml_cann_tied_output_weight_to_nz(tensor, entry->buffer, device);
+    cache->entries.emplace(tensor, std::move(entry));
+    return true;
+}
+#endif

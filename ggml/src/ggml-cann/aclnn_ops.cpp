@@ -2265,78 +2265,27 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
 
     // Only check env once.
     static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
-    // First-use NZ conversion cache for the tied lm head (token_embd.weight is also
-    // read by GET_ROWS, so it cannot be NZ-converted at load time; instead convert
-    // on the first MUL_MAT and cache the converted buffer for the rest of the run).
-    struct NzWeightCache {
-        struct Entry {
-            void * dev = nullptr;
-        };
-        std::unordered_map<const void *, Entry> map;
-    };
-    static NzWeightCache g_nz_w_cache;
-    static std::mutex    g_nz_w_mtx;
-    void *               nz_cached = nullptr;
-
-    const bool is_tied_head = weight_to_nz && weight->type != GGML_TYPE_BF16 &&
-                              ggml_is_contiguous(weight) && weight->ne[2] == 1 && weight->ne[3] == 1 &&
-                              strstr(ggml_get_name(weight), "token_embd.weight") != nullptr;
-
-    if (is_tied_head) {
-        std::lock_guard<std::mutex> lk(g_nz_w_mtx);
-        auto                        it = g_nz_w_cache.map.find(weight->data);
-        if (it != g_nz_w_cache.map.end()) {
-            nz_cached = it->second.dev;
+    bool used_tied_copy = false;
+#ifdef ASCEND_310P
+    // The tied lm head (token_embd.weight) keeps its ND data for GET_ROWS;
+    // mul_mat reads a separate FRACTAL_NZ copy prepared once at weight-load
+    // time. Lookup only, so graph capture never sees a first-use prepare.
+    auto * tied_cache = ggml_cann_tied_output_weight_cache_from_tensor(weight);
+    if (tied_cache != nullptr && n_dims == 2) {
+        auto it = tied_cache->entries.find(weight);
+        if (it != tied_cache->entries.end()) {
+            acl_weight_tensor = ggml_cann_create_tensor(it->second->buffer, ACL_FLOAT16, sizeof(uint16_t),
+                                                        transpose_ne, transpose_nb, n_dims,
+                                                        ACL_FORMAT_FRACTAL_NZ);
+            used_tied_copy = true;
         }
     }
+#endif
 
-    if (weight_to_nz && weight->type != GGML_TYPE_BF16 && (ggml_cann_is_weight_layout_candidate(weight) || nz_cached)) {
-        if (is_tied_head && nz_cached == nullptr) {
-            // one-time in-buffer conversion: alloc >= NZ size, copy ND, convert in place
-            int64_t shape[2] = { weight->ne[1], weight->ne[0] };
-            
-            const aclIntArray * acl_shape = aclCreateIntArray(shape, 2);
-            size_t              nz_size   = 0;
-            ACL_CHECK(aclnnCalculateMatmulWeightSizeV2(acl_shape, ggml_cann_type_mapping(weight->type), &nz_size));
-            aclDestroyIntArray(acl_shape);
-
-            void * dev = nullptr;
-            ACL_CHECK(aclrtMalloc(&dev, std::max(nz_size, ggml_nbytes(weight)), ACL_MEM_MALLOC_HUGE_FIRST));
-            ACL_CHECK(aclrtMemcpy(dev, ggml_nbytes(weight), weight->data, ggml_nbytes(weight),
-                                  ACL_MEMCPY_DEVICE_TO_DEVICE));
-
-            int64_t          w_ne[2] = { weight->ne[0], weight->ne[1] };
-            size_t           w_nb[2] = { ggml_type_size(weight->type),
-                                         (size_t) ggml_type_size(weight->type) * weight->ne[0] };
-            int64_t          w_st[2] = { 1, weight->ne[0] };
-            aclTensor *      w_desc  = aclCreateTensor(w_ne, 2, ggml_cann_type_mapping(weight->type), w_st, 0,
-                                                       ACL_FORMAT_ND, nullptr, 0, dev);
-            uint64_t         ws_size = 0;
-            aclOpExecutor *  exec    = nullptr;
-            ACL_CHECK(aclnnTransMatmulWeightGetWorkspaceSize(w_desc, &ws_size, &exec));
-            if (ws_size > 0) {
-                void * ws = nullptr;
-                ACL_CHECK(aclrtMalloc(&ws, ws_size, ACL_MEM_MALLOC_HUGE_FIRST));
-                ACL_CHECK(aclnnTransMatmulWeight(ws, ws_size, exec, ctx.stream()));
-                aclrtFree(ws);
-            } else {
-                ACL_CHECK(aclnnTransMatmulWeight(nullptr, 0, exec, ctx.stream()));
-            }
-            aclDestroyTensor(w_desc);
-
-            std::lock_guard<std::mutex> lk(g_nz_w_mtx);
-            g_nz_w_cache.map[weight->data] = NzWeightCache::Entry{ dev };
-            nz_cached = dev;
-        }
-        if (is_tied_head) {
-            acl_weight_tensor = ggml_cann_create_tensor(nz_cached, ggml_cann_type_mapping(weight->type),
-                                                        ggml_type_size(weight->type), transpose_ne, transpose_nb,
-                                                        n_dims, ACL_FORMAT_FRACTAL_NZ);
-        } else {
-            acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims,
-                                                        ACL_FORMAT_FRACTAL_NZ);
-        }
-    } else {
+    if (!used_tied_copy && weight_to_nz && weight->type != GGML_TYPE_BF16 &&
+        ggml_cann_is_weight_layout_candidate(weight)) {
+        acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_FRACTAL_NZ);
+    } else if (!used_tied_copy) {
         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_ND);
     }
     acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst, bcast_dst_ne, bcast_dst_nb, n_dims);
