@@ -24,6 +24,8 @@
 
 #include "ggml-impl.h"
 #include "ggml.h"
+#include "weight_layout.h"
+
 #include "ggml-backend.h"
 
 #include <aclnnop/aclnn_add.h>
@@ -2288,7 +2290,7 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
         }
     }
 
-    if (weight_to_nz && weight->type != GGML_TYPE_BF16 && (is_matmul_weight(weight) || nz_cached)) {
+    if (weight_to_nz && weight->type != GGML_TYPE_BF16 && (ggml_cann_is_weight_layout_candidate(weight) || nz_cached)) {
         if (is_tied_head && nz_cached == nullptr) {
             // one-time in-buffer conversion: alloc >= NZ size, copy ND, convert in place
             int64_t shape[2] = { weight->ne[1], weight->ne[0] };
