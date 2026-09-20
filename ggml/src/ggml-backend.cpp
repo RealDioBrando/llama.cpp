@@ -1654,6 +1654,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    // 310P aclgraph diagnosis: which backend runs each split. With strict
+    // graph matching no split ever REPLAYs, and per-split addresses
+    // change every step (galloc reuses buffers across layers). This log
+    // shows the split topology (backend, node range, inputs) to locate
+    // where the CPU/CANN alternation and staging copies come from.
+    if (getenv("GGML_SCHED_DEBUG_SPLIT")) {
+        fprintf(stderr, "[SPLITS] n_splits=%d\n", sched->n_splits);
+        for (int i = 0; i < sched->n_splits; i++) {
+            struct ggml_backend_sched_split * sp = &splits[i];
+            fprintf(stderr, "[SPLITS] %d/%d backend=%s nodes=%d [%d..%d) inputs=%d ops=",
+                i, sched->n_splits,
+                ggml_backend_name(sched->backends[sp->backend_id]),
+                (int) sp->graph.n_nodes, sp->i_start, sp->i_end, sp->n_inputs);
+        // Print all op names for small splits, first few for large ones.
+        int n_print = sp->graph.n_nodes < 6 ? (int) sp->graph.n_nodes : 3;
+            for (int j = 0; j < n_print && j < sp->graph.n_nodes; j++) {
+                fprintf(stderr, "%s%s", j ? "," : "", ggml_op_name(sp->graph.nodes[j]->op));
+            }
+            if (n_print < sp->graph.n_nodes) fprintf(stderr, ",...");
+            fprintf(stderr, "\n");
+        }
+        fflush(stderr);
+    }
+
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
@@ -1880,6 +1904,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    // CANN graph capture: dual-buffer (n_copies=2) alternates input copy
+    // buffer addresses each step, which invalidates the LRU graph fingerprint
+    // (MATCH-FAIL shows alternating addresses). Force single buffer when the
+    // caller requests graph-stable scheduling (env GGML_SCHED_GRAPH_STABLE).
+    if (parallel && getenv("GGML_SCHED_GRAPH_STABLE")) {
+        sched->n_copies = 1;
+    }
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)

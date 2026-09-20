@@ -23,6 +23,7 @@
 #include "ggml-cann.h"
 
 #include "ggml-backend-impl.h"
+#include "ggml-backend.h"
 #include "ggml-cann/aclnn_ops.h"
 #include "ggml-cann/paged_attn.h"
 #include "ggml-cann/common.h"
@@ -31,12 +32,17 @@
 
 #include <acl/acl.h>
 #include <aclnnop/aclnn_trans_matmul_weight.h>
+#ifdef USE_ACL_GRAPH
+#include <aclnnop/aclnn_prompt_flash_attention_v3.h>
+#include <aclnnop/aclnn_incre_flash_attention_v4.h>
+#endif
 #include <stdarg.h>
 
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -712,12 +718,6 @@ struct ggml_cann_pool_vmm : public ggml_cann_pool {
 
             // add to the pool
             pool_size += reserve_size;
-
-#ifdef DEBUG_CANN_MALLOC
-            GGML_LOG_INFO("cann pool[%d]: size increased to %llu MB (reserved %llu MB)\n", device,
-                          (unsigned long long) (pool_size / 1024 / 1024),
-                          (unsigned long long) (reserve_size / 1024 / 1024));
-#endif
         }
 
         GGML_ASSERT(pool_addr != 0);
@@ -792,6 +792,211 @@ struct TensorSetTracker {
     size_t total_bytes = 0;           ///< Target size (full tensor)
     std::vector<uint8_t> host_buffer; ///< Host staging buffer for quantized tensors
 };
+
+#ifdef USE_ACL_GRAPH
+//
+// Capture-time arena allocator.
+//
+// A captured graph references the workspace addresses that its ops used
+// during capture. The regular memory pool recycles those addresses as soon
+// as the ops' RAII scopes end, so a cached graph would read recycled memory
+// on replay. While capture is active, ggml_cann_pool_alloc::alloc() routes
+// to this arena instead: a bump allocator with its own device blocks that
+// are never recycled. The transient pool is left untouched, which also
+// preserves the vmm pool's LIFO discipline. At CaptureEnd the blocks are
+// transferred to the captured graph and released when the graph dies.
+//
+
+static thread_local void * g_cann_capture_pin_graph_key = nullptr;
+
+// Chain of device blocks, bump-allocated. Blocks are never moved: captured
+// graphs hold pointers into them until the graph dies.
+struct cann_capture_arena {
+    struct Block { void * ptr; size_t size; size_t used; };
+    std::vector<Block> blocks;
+    size_t total_used = 0;
+
+    void * alloc(size_t size, size_t * actual_size, size_t * block_idx);
+    void free(size_t block_idx, size_t size);
+    void release_all();
+};
+
+static thread_local cann_capture_arena * g_cann_capture_arena = nullptr;
+
+// Recycle pool for arena blocks. Graphs return their blocks here on
+// destruction instead of freeing them, so the next capture can reuse them
+// and the steady state performs no device allocations.
+// The storage is intentionally never destroyed: backends are dlopen'd and
+// the teardown order of the backend registry vs this TU's statics is not
+// guaranteed. A plain static could be destroyed while cached graphs still
+// exist, corrupting the heap at process exit.
+static std::mutex * g_arena_recycle_mtx_ptr() {
+    static std::mutex * m = new std::mutex();
+    return m;
+}
+
+static std::vector<std::pair<void*,size_t>> * g_arena_recycle_ptr() {
+    static auto * v = new std::vector<std::pair<void*,size_t>>();
+    return v;
+}
+
+void ggml_cann_arena_recycle_put(void * ptr, size_t size) {
+    std::lock_guard<std::mutex> lock(*g_arena_recycle_mtx_ptr());
+    g_arena_recycle_ptr()->push_back({ptr, size});
+}
+
+void * ggml_cann_arena_recycle_take(size_t min_size) {
+    std::lock_guard<std::mutex> lock(*g_arena_recycle_mtx_ptr());
+    auto & pool = *g_arena_recycle_ptr();
+    for (auto it = pool.begin(); it != pool.end(); ++it) {
+        if (it->second >= min_size) {
+            void * p = it->first;
+            pool.erase(it);
+            return p;
+        }
+    }
+    return nullptr;
+}
+
+// Free every recycled block (device memory relief on OOM).
+void ggml_cann_arena_recycle_release_all() {
+    std::lock_guard<std::mutex> lock(*g_arena_recycle_mtx_ptr());
+    for (auto & b : *g_arena_recycle_ptr()) {
+        aclrtFree(b.first);
+    }
+    g_arena_recycle_ptr()->clear();
+}
+
+// Emergency OOM relief, registered by the capture path before
+// CaptureBegin. When an aclrtMalloc fails during capture, the hook evicts
+// every cached graph except the one being captured (the LRU front owns no
+// arena blocks yet), their blocks go to the recycle pool, and the pool is
+// freed. Losing the replay cache for one step is preferable to aborting.
+static thread_local std::function<void()> g_arena_emergency_release = nullptr;
+
+bool ggml_cann_capture_pinning_active() {
+    return g_cann_capture_pin_graph_key != nullptr;
+}
+
+void ggml_cann_capture_pin_begin() {
+    // fresh arena per capture pass
+    if (g_cann_capture_arena != nullptr) {
+        g_cann_capture_arena->release_all();
+        delete g_cann_capture_arena;
+        g_cann_capture_arena = nullptr;
+    }
+    g_cann_capture_pin_graph_key = (void *) 1;
+}
+
+void ggml_cann_capture_pin_end(void * graph_key) {
+    // Transfer ownership of the arena's blocks to the graph; the graph
+    // returns them to the recycle pool on destruction.
+    auto * graph = (ggml_cann_graph *) graph_key;
+    if (g_cann_capture_arena != nullptr && graph != nullptr && graph != (ggml_cann_graph *) 1) {
+        for (auto & b : g_cann_capture_arena->blocks) {
+            graph->arena_blocks.push_back({b.ptr, b.size});
+        }
+        if (getenv("GGML_CANN_DEBUG_DECISION")) {
+            fprintf(stderr, "[GDEC] capture-end: %zu arena blocks -> graph %p\n",
+                g_cann_capture_arena->blocks.size(), (void *) graph);
+            fflush(stderr);
+        }
+    }
+    g_cann_capture_pin_graph_key = nullptr;
+    // keep g_cann_capture_arena alive-but-empty: its Block entries have
+    // been moved to the graph; clear our copy of the pointers WITHOUT freeing
+    if (g_cann_capture_arena != nullptr) {
+        g_cann_capture_arena->blocks.clear();
+        g_cann_capture_arena->total_used = 0;
+    }
+}
+
+void * ggml_cann_capture_arena_alloc(size_t size, size_t * actual_size, size_t * block_idx) {
+    if (g_cann_capture_arena == nullptr) {
+        g_cann_capture_arena = new cann_capture_arena();
+    }
+    return g_cann_capture_arena->alloc(size, actual_size, block_idx);
+}
+
+void ggml_cann_capture_arena_free(size_t block_idx, size_t size) {
+    if (g_cann_capture_arena != nullptr) {
+        g_cann_capture_arena->free(block_idx, size);
+    }
+}
+
+void * cann_capture_arena::alloc(size_t size, size_t * actual_size, size_t * block_idx) {
+    size = GGML_PAD(size, 128);
+    if (size == 0) {
+        size = 128;
+    }
+    *actual_size = size;
+    // find a block with space
+    for (size_t i = 0; i < blocks.size(); ++i) {
+        auto & b = blocks[i];
+        if (b.used + size <= b.size) {
+            void * ptr = (void *) ((char *) b.ptr + b.used);
+            b.used += size;
+            total_used += size;
+            *block_idx = i;
+            return ptr;
+        }
+    }
+    // Allocate a new block, preferring the recycle pool to a fresh
+    // device allocation.
+    size_t block_size = (size > (size_t) (4 << 20)) ? size : (size_t) (4 << 20);
+    Block b;
+    b.size = block_size;
+    b.used = 0;
+    b.ptr = ggml_cann_arena_recycle_take(block_size);
+    if (b.ptr == nullptr) {
+        aclError e = aclrtMalloc(&b.ptr, block_size, ACL_MEM_MALLOC_HUGE_FIRST);
+        if (e != ACL_SUCCESS) {
+            // Relief pass 1: free the recycle pool.
+            GGML_LOG_ERROR("capture arena: aclrtMalloc(%zu) failed, freeing recycle pool\n", block_size);
+            ggml_cann_arena_recycle_release_all();
+            e = aclrtMalloc(&b.ptr, block_size, ACL_MEM_MALLOC_HUGE_FIRST);
+        }
+        if (e != ACL_SUCCESS && g_arena_emergency_release != nullptr) {
+            // Relief pass 2: evict every cached graph, then retry.
+            GGML_LOG_ERROR("capture arena: aclrtMalloc(%zu) failed, evicting cached graphs\n", block_size);
+            auto release = g_arena_emergency_release;
+            g_arena_emergency_release = nullptr;
+            release();
+            ggml_cann_arena_recycle_release_all();
+            e = aclrtMalloc(&b.ptr, block_size, ACL_MEM_MALLOC_HUGE_FIRST);
+        }
+        if (e != ACL_SUCCESS) {
+            GGML_ABORT("capture arena: aclrtMalloc(%zu) failed after emergency relief (device OOM?)", block_size);
+        }
+    }
+    b.used = size;
+    void * ptr = b.ptr;
+    *block_idx = blocks.size();
+    blocks.push_back(b);
+    total_used += size;
+    return ptr;
+}
+
+void cann_capture_arena::free(size_t block_idx, size_t size) {
+    // Release a workspace back to its block so the next capture-time
+    // allocation can reuse the space. Workspaces are allocated and released
+    // in scoped (RAII) order, so the peak concurrent footprint is what stays
+    // in the arena instead of the sum of every op's workspace.
+    GGML_ASSERT(block_idx < blocks.size());
+    Block & b = blocks[block_idx];
+    GGML_ASSERT(b.used >= size);
+    b.used -= size;
+    total_used -= size;
+}
+
+void cann_capture_arena::release_all() {
+    for (auto & b : blocks) {
+        aclrtFree(b.ptr);
+    }
+    blocks.clear();
+    total_used = 0;
+}
+#endif  // USE_ACL_GRAPH
 
 /**
  * @brief Context for managing a CANN buffer associated with a specific device.
@@ -2577,6 +2782,146 @@ static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
     return false;
 }
 
+#ifdef USE_ACL_GRAPH
+static void evaluate_and_capture_cann_graph_piecewise(ggml_backend_cann_context * cann_ctx,
+                                                       ggml_cgraph *               cgraph) {
+    aclrtStream stream = cann_ctx->stream();
+    bool capturing = false;
+    aclmdlRI seg_graph = nullptr;
+    int seg_count = 0;
+    int attn_count = 0;
+    bool capture_failed = true;
+
+    static bool piecewise_debug = parse_bool(get_env_as_lowercase("GGML_CANN_PIECEWISE_DEBUG").value_or(""));
+    static bool piecewise_enable_capture = parse_bool(get_env_as_lowercase("GGML_CANN_PIECEWISE_CAPTURE").value_or(""));
+
+    if (piecewise_enable_capture) {
+        capture_failed = false;
+    }
+
+    if (piecewise_debug) {
+        fprintf(stderr, "PIECEWISE: start, n_nodes=%d\n", cgraph->n_nodes);
+    }
+
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+
+        if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE ||
+            node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW ||
+            node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+            continue;
+        }
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        // Attention nodes: split point (run eager)
+        bool is_attn = (node->op == GGML_OP_FLASH_ATTN_EXT ||
+                        node->op == GGML_OP_GATED_DELTA_NET ||
+                        node->op == GGML_OP_GATED_LINEAR_ATTN);
+        if (is_attn) {
+            attn_count++;
+            // End current segment if capturing
+            if (capturing) {
+                if (piecewise_debug) {
+                    fprintf(stderr, "PIECEWISE: seg %d capture end (node %d)\n", seg_count, i);
+                }
+                aclError e = aclmdlRICaptureEnd(stream, &seg_graph);
+                if (e != ACL_SUCCESS) {
+                    fprintf(stderr, "PIECEWISE: capture end failed, falling back to eager\n");
+                    capture_failed = true;
+                    capturing = false;
+                } else {
+                    if (piecewise_debug) {
+                        fprintf(stderr, "PIECEWISE: seg %d replay\n", seg_count);
+                    }
+                    aclmdlRIExecuteAsync(seg_graph, stream);
+                    aclmdlRIDestroy(seg_graph);
+                    seg_graph = nullptr;
+                    capturing = false;
+                    seg_count++;
+                }
+            }
+            // Run attention eagerly (with sync before/after)
+            if (piecewise_debug) {
+                fprintf(stderr, "PIECEWISE: attn eager node %d op=%s\n", i, ggml_op_name(node->op));
+            }
+            aclrtSynchronizeStream(stream);
+            bool ok = ggml_cann_compute_forward(*cann_ctx, node);
+            GGML_ASSERT(ok);
+            aclrtSynchronizeStream(stream);
+            continue;
+        }
+
+        // Non-attention node
+        if (!capturing && !capture_failed) {
+            // Start new segment capture
+            seg_count++;
+            if (piecewise_debug) {
+                fprintf(stderr, "PIECEWISE: seg %d capture begin (node %d op=%s)\n", seg_count, i, ggml_op_name(node->op));
+            }
+            // Preload rope cache if this is a ROPE node
+            if (node->op == GGML_OP_ROPE) {
+                ggml_cann_rope_cache_preload(*cann_ctx, node);
+            }
+            aclError e = aclmdlRICaptureBegin(stream, ACL_MODEL_RI_CAPTURE_MODE_GLOBAL);
+            if (e != ACL_SUCCESS) {
+                fprintf(stderr, "PIECEWISE: capture begin failed (err=%d), falling back to eager\n", (int)e);
+                capture_failed = true;
+            } else {
+                capturing = true;
+            }
+        }
+
+        if (capturing) {
+            // Execute during capture (recorded into graph)
+            bool ok = ggml_cann_compute_forward(*cann_ctx, node);
+            if (!ok) {
+                fprintf(stderr, "PIECEWISE: op failed during capture, falling back to eager\n");
+                // End capture, discard the broken graph
+                aclmdlRICaptureEnd(stream, &seg_graph);
+                if (seg_graph) {
+                    aclmdlRIDestroy(seg_graph);
+                    seg_graph = nullptr;
+                }
+                capturing = false;
+                capture_failed = true;
+            }
+        }
+
+        if (!capturing) {
+            // Eager execution (either capture failed or fallback)
+            aclrtSynchronizeStream(stream);
+            bool ok = ggml_cann_compute_forward(*cann_ctx, node);
+            GGML_ASSERT(ok);
+            aclrtSynchronizeStream(stream);
+        }
+    }
+
+    // End last segment
+    if (capturing) {
+        if (piecewise_debug) {
+            fprintf(stderr, "PIECEWISE: seg %d capture end (final)\n", seg_count);
+        }
+        aclError e = aclmdlRICaptureEnd(stream, &seg_graph);
+        if (e == ACL_SUCCESS) {
+            if (piecewise_debug) {
+                fprintf(stderr, "PIECEWISE: seg %d replay (final)\n", seg_count);
+            }
+            aclmdlRIExecuteAsync(seg_graph, stream);
+            aclmdlRIDestroy(seg_graph);
+        } else {
+            fprintf(stderr, "PIECEWISE: final capture end failed\n");
+        }
+    }
+
+    if (piecewise_debug) {
+        fprintf(stderr, "PIECEWISE: done, segments=%d attn_eager=%d capture_failed=%d\n",
+                seg_count, attn_count, (int)capture_failed);
+    }
+}
+#endif // USE_ACL_GRAPH
+
 /**
  * @brief Evaluate the computation graph and optionally capture or execute it using CANN graph API.
  *
@@ -2595,8 +2940,33 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                                             bool                        use_cann_graph,
                                             bool                        cann_graph_capture_required) {
 #ifdef USE_ACL_GRAPH
+    if (use_cann_graph && cann_ctx->piecewise_mode) {
+        evaluate_and_capture_cann_graph_piecewise(cann_ctx, cgraph);
+        return;
+    }
+#endif
+
+#ifdef USE_ACL_GRAPH
     if (use_cann_graph && cann_graph_capture_required) {  // Begin CANN graph capture
         ACL_CHECK(aclmdlRICaptureBegin(cann_ctx->stream(), ACL_MODEL_RI_CAPTURE_MODE_GLOBAL));
+        cann_ctx->capturing = true;
+        // Register the OOM relief hook: evicts every cached graph except
+        // the LRU front (the graph being captured owns no arena blocks
+        // until CaptureEnd).
+        g_arena_emergency_release = [cann_ctx]() {
+            auto & cache = cann_ctx->graph_lru_cache.cache_list;
+            ggml_cann_graph * front = nullptr;
+            if (!cache.empty()) {
+                front = cache.front();
+                cache.pop_front();
+            }
+            cann_ctx->graph_lru_cache.clear();
+            if (front != nullptr) {
+                cache.push_front(front);
+            }
+        };
+        // Route workspace allocations to the capture arena.
+        ggml_cann_capture_pin_begin();
     }
 #endif  // USE_ACL_GRAPH
     // Only perform the graph execution if CANN graphs are not enabled, or we are capturing the graph.
@@ -2638,10 +3008,15 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 
         if (cann_graph_capture_required) {  // End CANN graph capture
             ACL_CHECK(aclmdlRICaptureEnd(cann_ctx->stream(), &matched_graph->graph));
+            cann_ctx->capturing = false;
+            // Transfer the arena's device blocks to the captured graph.
+            ggml_cann_capture_pin_end(matched_graph);
+            g_arena_emergency_release = nullptr;
         }
 
         // Execute CANN graph
         ACL_CHECK(aclmdlRIExecuteAsync(matched_graph->graph, cann_ctx->stream()));
+
     }
 #endif  // USE_ACL_GRAPH
 }
@@ -2661,7 +3036,44 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
     ggml_cann_set_device(cann_ctx->device);
-    g_nz_workspaces[cann_ctx->device].clear();
+    // One-time summary of the switch state for this run.
+    {
+        static bool config_printed = false;
+        if (!config_printed) {
+            auto env_flag = [](const char * name, bool dflt) -> bool {
+                const char * e = getenv(name);
+                if (e == nullptr || e[0] == '\0') return dflt;
+                if ((e[0] | 0x20) == 'f' || e[0] == '0') return false;
+                if ((e[0] | 0x20) == 'o' && (e[1] | 0x20) == 'f') return false;
+                return true;
+            };
+            const bool graph_on = env_flag("GGML_CANN_ACL_GRAPH", true);
+            const char * conv_env    = getenv("GGML_CANN_SSM_CONV");
+            const char * conv_legacy = getenv("GGML_CANN_SSM_CONV_OFF");
+            const char * conv_str;
+            if (conv_legacy != nullptr && conv_legacy[0] == '1') {
+                conv_str = "cpu";
+            } else if (conv_env == nullptr || conv_env[0] == '\0') {
+                conv_str = "auto";
+            } else if (conv_env[0] == 'c' || conv_env[0] == 'C' || conv_env[0] == '1') {
+                conv_str = "cpu";
+            } else if (conv_env[0] == 'n' || conv_env[0] == 'N' || conv_env[0] == '0') {
+                conv_str = "npu";
+            } else {
+                conv_str = "auto";
+            }
+            GGML_LOG_INFO("CANN graph config: graph=%s conv=%s\n",
+                graph_on ? "on" : "off",
+                conv_str);
+            config_printed = true;
+        }
+    }
+    // NOTE: do NOT clear the NZ workspace here. Clearing forces re-allocation
+    // on the next weight_format_to_nz call (triggered by sched cross-backend
+    // set_tensor), producing different buffer addresses each step. The LRU
+    // graph fingerprint compares addresses, so this was causing re-capture
+    // every step (see MATCH-FAIL diagnostics 8/27). The workspace is freed
+    // on program exit instead (g_nz_workspaces is static).
 
     // calculate rope cache for fist layer in current device.
     cann_ctx->rope_cache.cached = false;
@@ -2673,13 +3085,16 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     static bool prefill_use_graph = parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
     if (!prefill_use_graph) {
         // Do not use acl_graph for prefill.
+        // Detect prefill vs decode from the token (batch) count of any matmul:
+        // every split carries a matmul whose activation src[1] has ne[1] = m.
+        // Decode has m == 1; prefill has m > 1. This must not rely on finding
+        // an attention op, because GDN-layer splits route the fused delta-net
+        // node to the CPU, so those splits contain no FA/GDN node and would
+        // otherwise be (wrongly) treated as decode and graph-captured.
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
-            // TODO: Optimize here. Currently, we can only
-            // get seq_len by FA's input.
-            if (node->op == GGML_OP_FLASH_ATTN_EXT) {
-                // Q -> src[0], shape: [B, S, N, D]
-                use_cann_graph = (node->src[0]->ne[1] == 1);
+            if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr) {
+                use_cann_graph = (node->src[1]->ne[1] == 1);
                 break;
             }
         }
@@ -2689,14 +3104,53 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
         use_cann_graph = false;
     }
 
-    if (use_cann_graph) {
+    if (use_cann_graph && !cann_ctx->piecewise_mode) {
+        // LRU cache operations (skip when piecewise mode is on)
         // If no matching graph is found, the graph needs to be recaptured.
-        graph_capture_required = !cann_ctx->graph_lru_cache.find_and_move_to_front(cgraph);
+            // Debug switch: force re-capture every step.
+            static const bool no_lru = []() {
+                const char * e = getenv("GGML_CANN_NO_LRU");
+                return e && e[0] == '1';
+            }();
+            graph_capture_required = no_lru ||
+                !cann_ctx->graph_lru_cache.find_and_move_to_front(cgraph);
+
+        // Decision log (capture vs replay per evaluate call).
+        if (getenv("GGML_CANN_DEBUG_DECISION")) {
+            static std::atomic<int> g_dec_call(0);
+            int call_no = g_dec_call.fetch_add(1);
+            fprintf(stderr, "[GDEC] call#%d nodes=%d op0=%d cache=%zu -> %s\n",
+                call_no, (int) cgraph->n_nodes,
+                (int) (cgraph->n_nodes > 0 ? cgraph->nodes[0]->op : -1),
+                cann_ctx->graph_lru_cache.cache_list.size(),
+                graph_capture_required ? "CAPTURE" : "REPLAY");
+            fflush(stderr);
+        }
+
+        // Debug: count captures vs replays (env GGML_CANN_DEBUG_SCHED=1 for verbose)
+        {
+            static std::atomic<int> n_capture(0);
+            static std::atomic<int> n_replay(0);
+            if (graph_capture_required) {
+                n_capture++;
+            } else {
+                n_replay++;
+            }
+            if (getenv("GGML_CANN_DEBUG_SCHED")) {
+                int total = n_capture.load() + n_replay.load();
+                if (total % 100 == 1 || total <= 10) {
+                    fprintf(stderr, "[ACLGRAPH] call#%d capture=%d replay=%d nodes=%d op0=%d\n",
+                        total, n_capture.load(), n_replay.load(),
+                        (int)cgraph->n_nodes, (int)(cgraph->n_nodes > 0 ? cgraph->nodes[0]->op : -1));
+                }
+            }
+        }
 
         if (graph_capture_required) {
             // If no matching graph is found, add a new ACL graph.
             ggml_cann_graph * new_graph = ggml_cann_graph::create_from_cgraph(cgraph);
             cann_ctx->graph_lru_cache.push(new_graph);
+
 
             // Pre-load rope cache before graph capture.  During capture the
             // stream cannot perform host-to-device memcpy or device memory
@@ -2708,6 +3162,38 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
                 if (node->op == GGML_OP_ROPE) {
                     ggml_cann_rope_cache_preload(*cann_ctx, node);
                     break;
+                }
+            }
+
+            // Pre-create the rms_norm constant caches (ones / zeros
+            // vectors) before capture: their first use runs aclrtMalloc +
+            // fill, and the malloc is forbidden inside the capture region.
+            // The cache must cover the full element count of the norm's
+            // src tensor, not just ne[0].
+            {
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    ggml_tensor * node = cgraph->nodes[i];
+                    if (node->op == GGML_OP_RMS_NORM && node->src[0] != nullptr) {
+                        const ggml_tensor * s = node->src[0];
+                        int64_t n_el = s->ne[0] * s->ne[1] * s->ne[2] * s->ne[3];
+                        if (cann_ctx->rms_norm_one_tensor_cache.size < n_el) {
+                            int64_t cn[1] = { n_el };
+                            size_t  cb[1] = { sizeof(float) };
+                            acl_tensor_ptr t1 = ggml_cann_warm_cache_acl_tensor(*cann_ctx,
+                                &cann_ctx->rms_norm_one_tensor_cache.cache,
+                                cann_ctx->rms_norm_one_tensor_cache.size,
+                                cn, cb, GGML_TYPE_F32, 1, 1.0f);
+                        }
+                        if (cann_ctx->rms_norm_zero_tensor_cache.size < n_el) {
+                            int64_t cn[1] = { n_el };
+                            size_t  cb[1] = { sizeof(float) };
+                            acl_tensor_ptr t0 = ggml_cann_warm_cache_acl_tensor(*cann_ctx,
+                                &cann_ctx->rms_norm_zero_tensor_cache.cache,
+                                cann_ctx->rms_norm_zero_tensor_cache.size,
+                                cn, cb, GGML_TYPE_F32, 1, 0.0f);
+                        }
+                        break;  // one RMS norm node is enough to size the caches
+                    }
                 }
             }
         }
@@ -2880,8 +3366,8 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     return false;
                 }
 #else
-                if ((op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16 && op->type != GGML_TYPE_BF16) ||
-                    (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16 && src->type != GGML_TYPE_BF16)) {
+                if ((op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) ||
+                    (src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16)) {
                     // only support F32, F16 and BF16.
                     return false;
                 }
@@ -2911,10 +3397,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     return false;
                 }
 #ifdef ASCEND_310P
-                // TODO: Support rope_dim < ne00(dim)
-                if (op->src[0]->ne[0] != op->op_params[1]) {
-                    return false;
-                }
+                // Partial rope (n_dims < ne[0]) takes the
+                // RotaryPositionEmbedding path in ggml_cann_rope; only
+                // contiguous inputs are supported there.
                 if (!ggml_is_contiguous(op->src[0])) {
                     return false;
                 }
@@ -3034,53 +3519,25 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     return false;
                 }
 #ifdef ASCEND_310P
-                // 310P uses aclnnPromptFlashAttentionV3 (prefill) / aclnnIncreFlashAttentionV4 (decode)
-                if (op->src[0]->type != GGML_TYPE_F32 && op->src[0]->type != GGML_TYPE_F16) {
-                    return false;
-                }
-                // the implementation relies on the additive f16 mask
-                if (op->src[3] == nullptr || op->src[3]->type != GGML_TYPE_F16) {
-                    return false;
-                }
-                // alibi bias cannot be fused on 310P (PFA rejects pseShift)
+                // alibi bias cannot be fused on 310P (the prefill path has no
+                // free pseShift channel for it) - route it to the CPU instead
+                // of silently computing a wrong result.
                 if (maxBias != 0.0f) {
                     return false;
                 }
-                {
-                    const int64_t D  = op->src[0]->ne[0];
-                    const int64_t N  = op->src[0]->ne[2];
-                    const int64_t Nk = op->src[1]->ne[2];
-                    if (D > 512 || D % 16 != 0) {
-                        return false;
-                    }
-                    if (Nk > N || N % Nk != 0 || N / Nk > 64) {
-                        return false;
-                    }
-                    const int64_t q_len = op->src[0]->ne[1];
-                    const int64_t B     = op->src[0]->ne[3];
-                    const int64_t K     = op->src[1]->ne[1];
-                    if (K > 65536) {
-                        return false;
-                    }
-                    if (q_len == 1) {
-                        // decode: IncreFlashAttentionV4 supports batch >= 1
-                        if (B > 256) {
-                            return false;
-                        }
-                    } else {
-                        // prefill: PromptFlashAttentionV3 path only handles a single stream
-                        if (B != 1) {
-                            return false;
-                        }
-                        if (K % 16 != 0) {
-                            return false;
-                        }
-                        // actQ must stay in the verified set {K/2, K}; cap the compute waste
-                        const int64_t act_q = (2 * q_len <= K) ? K / 2 : K;
-                        if (act_q > 4 * q_len) {
-                            return false;
-                        }
-                    }
+                // Mask flows through device memory (pseShift for decode,
+                // attenMask for prefill), so the captured graph is
+                // replay-safe: no host-side KV length channel.
+                if (op->src[3] == nullptr) {
+                    return false;
+                }
+                if (op->src[1]->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                // The prefill path (q_len > 1) assumes a single sequence;
+                // route multi-sequence prefill to the CPU. Decode handles any B.
+                if (op->src[0]->ne[3] > 1 && op->src[0]->ne[1] > 1) {
+                    return false;
                 }
                 return true;
 #endif
@@ -3105,8 +3562,43 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 }
                 return true;
             }
-        case GGML_OP_SSM_CONV:
+        case GGML_OP_SSM_CONV: {
+            // The 310P Conv2D output requires a FzToDst format conversion
+            // that costs far more than the conv itself at decode shapes.
+            // Route single-token (decode) convs to the CPU to avoid the
+            // conversion, and keep multi-token (prefill) convs on the NPU
+            // where the batch throughput outweighs it.
+            //   GGML_CANN_SSM_CONV=npu|cpu|auto (auto = shape-routed)
+            //   GGML_CANN_SSM_CONV_OFF=1 is a legacy alias for cpu.
+            // Shape test: sx = concat(conv_states, qkv_mixed), so
+            // ne[0] == (d_conv - 1) + n_tokens; a single-token step has
+            // sx->ne[0] == kernel->ne[0].
+            static const int conv_mode = []() {
+                const char * legacy = getenv("GGML_CANN_SSM_CONV_OFF");
+                if (legacy != nullptr && legacy[0] == '1') {
+                    return 1;  // cpu
+                }
+                const char * mode = getenv("GGML_CANN_SSM_CONV");
+                if (mode != nullptr) {
+                    if (mode[0] == 'c' || mode[0] == 'C' || mode[0] == '1') return 1;  // cpu
+                    if (mode[0] == 'n' || mode[0] == 'N' || mode[0] == '0') return 2;  // npu
+                }
+                return 0;  // auto (shape-routed)
+            }();
+            if (conv_mode == 1) {
+                return false;
+            }
+            if (conv_mode == 2) {
+                return true;
+            }
+            // auto: single-token conv -> CPU, multi-token -> NPU
+            const ggml_tensor * sx = op->src[0];
+            const ggml_tensor * kernel = op->src[1];
+            if (sx != nullptr && kernel != nullptr && sx->ne[0] == kernel->ne[0]) {
+                return false;
+            }
             return true;
+        }
         case GGML_OP_CUMSUM:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_TRI:

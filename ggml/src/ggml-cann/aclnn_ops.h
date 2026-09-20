@@ -616,6 +616,20 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst);
 void ggml_cann_rope_cache_preload(ggml_backend_cann_context & ctx, ggml_tensor * dst);
 
 /**
+ * @brief Warms a constant-tensor cache (device malloc + fill) OUTSIDE graph
+ * capture. Used by the capture path to pre-create the rms_norm ones/zeros
+ * constants so their first use never happens under capture.
+ */
+acl_tensor_ptr ggml_cann_warm_cache_acl_tensor(ggml_backend_cann_context & ctx,
+                                               void **                     buffer,
+                                               int64_t &                   cache_element,
+                                               int64_t *                   ne,
+                                               size_t *                    nb,
+                                               ggml_type                   dtype,
+                                               int64_t                     dims,
+                                               float                       value);
+
+/**
  * @brief   Computes the index of the maximum value along the specified dimension
  *          of a ggml tensor using the CANN backend.
  *
@@ -994,10 +1008,11 @@ static bool is_matmul_weight(const ggml_tensor * tensor) {
                                                                   "attn_k.weight",      "attn_v.weight",
                                                                   "attn_output.weight", "ffn_gate.weight",
                                                                   "ffn_up.weight",      "ffn_down.weight",
-                                                                  // linear attention (GatedDeltaNet) projections
+                                                                  // linear attention (GatedDeltaNet) projections.
+                                                                  // ssm_beta/ssm_alpha stay out: the W8A8 path
+                                                                  // diverges on these narrow [k, 16] weights.
                                                                   "attn_qkv.weight",    "attn_gate.weight",
-                                                                  "ssm_out.weight",     "ssm_beta.weight",
-                                                                  "ssm_alpha.weight" };
+                                                                  "ssm_out.weight" };
 
     for (const auto & suffix : weight_suffixes) {
         if (name.find(suffix) != std::string::npos) {
