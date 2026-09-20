@@ -25,6 +25,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cann/aclnn_ops.h"
 #include "ggml-cann/common.h"
+#include "ggml-cann/weight_layout.h"
 #include "ggml-impl.h"
 #include "ggml.h"
 
@@ -1486,20 +1487,7 @@ static ggml_cann_nz_workspace g_nz_workspaces[GGML_CANN_MAX_DEVICES];
  *       across calls. This reduces overhead from repeated memory allocation and deallocation.
  */
 static void weight_format_to_nz(ggml_tensor * tensor, int device) {
-    acl_tensor_ptr weightTransposed = ggml_cann_create_tensor(tensor, tensor->ne, tensor->nb, 2, ACL_FORMAT_ND, 0);
-    uint64_t       workspaceSize    = 0;
-    aclOpExecutor * executor;
-
-    // TransMatmulWeight
-    ACL_CHECK(aclnnTransMatmulWeightGetWorkspaceSize(weightTransposed.get(), &workspaceSize, &executor));
-
-    std::lock_guard<std::mutex> lock(g_nz_workspaces[device].mtx);
-    // Avoid frequent malloc/free of the workspace.
-    g_nz_workspaces[device].realloc(workspaceSize);
-
-    void * g_nz_workspace = g_nz_workspaces[device].get();
-
-    ACL_CHECK(aclnnTransMatmulWeight(g_nz_workspace, workspaceSize, executor, nullptr));
+    ggml_cann_weight_format_to_nz(tensor, device);
 }
 
 // TODO: need handle tensor which has paddings.
@@ -1543,7 +1531,7 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
 #endif
     bool is_kq = kq_path != GGML_CANN_KQ_NONE;
     bool is_nz = !is_quantized && !is_kq && tensor->type != GGML_TYPE_BF16 && weight_to_nz &&
-                 is_matmul_weight((const ggml_tensor *) tensor);
+                 ggml_cann_is_weight_layout_candidate((const ggml_tensor *) tensor);
 
     if (is_kq) {
         // Re-quantized layout size differs from ggml_nbytes(); upload the full
@@ -1856,9 +1844,6 @@ static size_t ggml_backend_cann_buffer_type_get_alloc_size(ggml_backend_buffer_t
     size_t  size = ggml_nbytes(tensor);
     int64_t ne0  = tensor->ne[0];
 
-    // Only check env once.
-    static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
-
 #ifdef ASCEND_310P
     // K-quant matmul weight: reserve the re-quantized device layout size
     // (must agree with ggml_backend_cann_buffer_set_tensor).
@@ -1880,18 +1865,8 @@ static size_t ggml_backend_cann_buffer_type_get_alloc_size(ggml_backend_buffer_t
         if (ne0 % MATRIX_ROW_PADDING != 0) {
             size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
         }
-    } else if (weight_to_nz && tensor->type != GGML_TYPE_BF16
-               && is_matmul_weight((const ggml_tensor *) tensor)) {
-        // NZ format weight are not support quantized yet.
-        // If ND tensor transform to NZ, size may changed.
-        int64_t shape[] = { tensor->ne[1], tensor->ne[0] };
-        GGML_ASSERT(tensor->ne[2] == 1);
-        GGML_ASSERT(tensor->ne[3] == 1);
-        const aclIntArray * acl_shape = aclCreateIntArray(shape, 2);
-        size_t              new_size;
-        ACL_CHECK(aclnnCalculateMatmulWeightSizeV2(acl_shape, ggml_cann_type_mapping(tensor->type), &new_size));
-        ACL_CHECK(aclDestroyIntArray(acl_shape));
-        size = std::max(size, new_size);
+    } else if (ggml_cann_is_weight_layout_candidate((const ggml_tensor *) tensor)) {
+        size = ggml_cann_weight_layout_alloc_size(tensor);
     }
 
     return size;
