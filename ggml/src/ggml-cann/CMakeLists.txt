@@ -33,10 +33,13 @@ string(TOUPPER ${SOC_TYPE_COMPILE_OPTION} SOC_TYPE_COMPILE_OPTION)
 message(STATUS "CANN: SOC_VERSION =  ${SOC_VERSION}")
 option(USE_ACL_GRAPH "Enable CANN graph execution (ACL graph mode)" OFF)
 
+# 310P aclgraph is experimental: validated on Ascend310P3 with CANN 9.1.0.
+# The other Ascend310P1-310P7 variants (same soc_version family) are
+# expected to work the same way but have not been tested.
 if(USE_ACL_GRAPH AND (SOC_TYPE_MAJOR_SN STREQUAL "310P" OR SOC_TYPE_COMPILE_OPTION STREQUAL "ASCEND_310P"))
-    message(FATAL_ERROR
-        "CANN Graph (ACL graph mode) is not supported on 310P devices. "
-        "Please build with -DUSE_ACL_GRAPH=OFF or use a supported SOC.")
+    message(WARNING
+        "CANN Graph (ACL graph mode) on 310P is experimental and not well tested. "
+        "If capture fails at runtime, rebuild with -DUSE_ACL_GRAPH=OFF.")
 endif()
 
 if (CANN_INSTALL_DIR)
