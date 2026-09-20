@@ -122,6 +122,7 @@ def unified_command(args: argparse.Namespace, requests: int) -> list[str]:
     return [
         str(args.unified_bin),
         "-m", args.model,
+        "-kvu",
         "-f", str(args.prompt_file),
         "-np", str(requests),
         "-ns", str(requests),
