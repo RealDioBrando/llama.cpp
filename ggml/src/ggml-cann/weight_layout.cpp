@@ -109,12 +109,11 @@ bool ggml_cann_is_weight_layout_candidate(const ggml_tensor * tensor) {
         return false;
     }
 
-    // Expert NZ needs the grouped-matmul paths to build FRACTAL_NZ tensors
-    // (moe_ops / moe_fused_ops in the upstream module). This branch does not
-    // carry them yet, and buffer set_tensor asserts ne[2] == 1, so keep
-    // expert weights in ND format here.
+    // Expert NZ is consumed by the grouped-matmul paths in moe_ops and
+    // moe_fused_ops.
     if (tensor->ne[2] > 1 || tensor->ne[3] > 1) {
-        return false;
+        return tensor->ne[3] == 1 && tensor->type == GGML_TYPE_F16 && is_expert_weight_name(tensor) &&
+               can_transform_slice(tensor);
     }
 
     return is_dense_weight_name(tensor) && can_transform_slice(tensor);
