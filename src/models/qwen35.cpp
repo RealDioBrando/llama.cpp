@@ -1,5 +1,7 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-memory-hybrid-paged.h"
+#include "llama-hybrid-paged-graph.h"
 
 void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -146,7 +148,22 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     cb(inpL, "model.input_embed", -1);
 
-    auto * inp = build_inp_mem_hybrid();
+    auto * paged_hybrid =
+            dynamic_cast<const llama_memory_hybrid_paged_context *>(mctx);
+
+    llm_graph_input_i * inp_attn = nullptr;
+    llm_graph_input_rs  * inp_rs  = nullptr;
+
+    if (paged_hybrid) {
+        inp_attn = llama_hybrid_paged_build_attn_inp(
+                *this, paged_hybrid->get_paged_attn());
+        inp_rs = llama_hybrid_paged_build_rs_inp(
+                *this, paged_hybrid->get_recr());
+    } else {
+        auto * inp = build_inp_mem_hybrid();
+        inp_attn = inp->get_attn();
+        inp_rs   = inp->get_recr();
+    }
 
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
@@ -165,10 +182,10 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         // Determine layer type and build appropriate attention mechanism
         if (hparams.is_recr(il)) {
             // Linear attention layer (gated delta net)
-            cur = build_layer_attn_linear(inp->get_recr(), cur, il);
+            cur = build_layer_attn_linear(inp_rs, cur, il);
         } else {
             // Full attention layer
-            cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
+            cur = build_layer_attn(inp_attn, cur, inp_pos, sections, il);
         }
 
         if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
@@ -252,7 +269,7 @@ ggml_tensor * llama_model_qwen35::graph::build_norm_gated(
 }
 
 ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
-        llm_graph_input_attn_kv * inp,
+          llm_graph_input_i *       inp,
         ggml_tensor *             cur,
         ggml_tensor *             inp_pos,
         int *                     sections,

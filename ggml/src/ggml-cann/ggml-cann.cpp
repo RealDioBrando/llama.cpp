@@ -25,6 +25,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "ggml-cann/aclnn_ops.h"
+#include "ggml-cann/paged_attn.h"
 #include "ggml-cann/common.h"
 #include "ggml-impl.h"
 #include "ggml.h"
@@ -2293,6 +2294,12 @@ ggml_backend_buffer_type_t ggml_backend_cann_host_buffer_type() {
  * @return true if the computation was successful; false otherwise.
  */
 static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct ggml_tensor * dst) {
+    static const bool op_debug = getenv("GGML_CANN_OP_DEBUG") != nullptr;
+    static const bool op_timing = getenv("GGML_CANN_OP_TIMING") != nullptr;
+    const int64_t op_t0 = op_timing ? ggml_time_us() : 0;
+    if (op_debug) {
+        GGML_LOG_INFO("[CANN op] %s\n", ggml_op_desc(dst));
+    }
     switch (dst->op) {
         case GGML_OP_REPEAT:
             ggml_cann_repeat(ctx, dst);
@@ -2541,6 +2548,9 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
         case GGML_OP_FILL:
             ggml_cann_fill(ctx, dst);
             break;
+        case GGML_OP_PAGED_ATTN:
+            ggml_cann_paged_attn(ctx, dst);
+            break;
         case GGML_OP_DIAG:
             ggml_cann_diag(ctx, dst);
             break;
@@ -2551,6 +2561,10 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
             return false;
     }
 
+    if (op_timing) {
+        GGML_LOG_ERROR("[cann op time] %s us=%lld\n", ggml_op_desc(dst),
+                       (long long) (ggml_time_us() - op_t0));
+    }
     return true;
 }
 
@@ -2580,6 +2594,7 @@ static const char * ggml_backend_cann_name(ggml_backend_t backend) {
  */
 static void ggml_backend_cann_free(ggml_backend_t backend) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
+    ggml_cann_paged_attn_cleanup(*cann_ctx);
     ACL_CHECK(aclrtSynchronizeDevice());
     ACL_CHECK(aclrtResetDevice(cann_ctx->device));
 
@@ -3590,6 +3605,17 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_FILL:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_PAGED_ATTN:
+            {
+#ifdef GGML_CANN_HAS_ATB
+                if (op->src[3]->type != GGML_TYPE_F16 || op->src[4]->type != GGML_TYPE_F16) {
+                    return false;
+                }
+                return true;
+#else
+                return false;
+#endif
+            }
         case GGML_OP_DIAG:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SOLVE_TRI:

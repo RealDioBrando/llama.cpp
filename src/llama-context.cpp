@@ -15,6 +15,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -79,6 +80,36 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.name             =*/ "fused DeepSeek V4 HC post",
     /*.n_tokens_per_seq =*/ 1,
 };
+
+namespace {
+// Returns empty string on success, or an error message describing why
+// paged KV cache cannot be used with the current model placement.
+std::string validate_paged_kv_placement(const llama_model & model) {
+    std::set<ggml_backend_dev_t> devs_used;
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        ggml_backend_dev_t dev = model.dev_layer(il);
+        if (dev != nullptr) {
+            devs_used.insert(dev);
+        }
+    }
+
+    if (devs_used.size() > 1) {
+        std::string dev_list;
+        for (auto * d : devs_used) {
+            if (!dev_list.empty()) dev_list += ", ";
+            dev_list += ggml_backend_dev_name(d);
+        }
+        return format(
+            "paged KV cache (--kv-paged) currently requires all model layers "
+            "to live on a single device, but the model is split across %zu "
+            "devices (%s). Re-run with `-sm none -mg <gpu_id>` to pin the "
+            "model to one device, or omit --kv-paged.",
+            devs_used.size(), dev_list.c_str());
+    }
+
+    return {};
+}
+} // namespace
 
 llama_context::llama_context(
         const llama_model & model,
@@ -271,6 +302,11 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.kv_paged   = params.kv_paged;
+    cparams.block_size = params.block_size;
+    cparams.n_gpu_blocks = params.n_gpu_blocks;
+    cparams.n_cpu_blocks = params.n_cpu_blocks;
+    cparams.kv_paged_watermark = params.kv_paged_watermark;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -391,6 +427,27 @@ llama_context::llama_context(
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
+
+        ggml_backend_t gpu_handle = nullptr;
+        if (cparams.kv_paged) {
+            std::string err = validate_paged_kv_placement(model);
+            if (!err.empty()) {
+                LLAMA_LOG_ERROR("%s: %s\n", __func__, err.c_str());
+                throw std::runtime_error(err);
+            }
+            // Find the first non-CPU backend to use as the primary GPU/Compute backend
+            for (auto & b : backends) {
+                if (ggml_backend_get_device(b.get()) &&
+                    ggml_backend_dev_type(ggml_backend_get_device(b.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    gpu_handle = b.get();
+                    break;
+                }
+            }
+            // Fallback: If no GPU, use CPU for both
+            if (!gpu_handle) {
+                gpu_handle = backend_cpu;
+            }
+        }
 
         memory.reset(model.create_memory(params_mem, cparams));
     }
@@ -777,6 +834,10 @@ uint32_t llama_context::n_ubatch() const {
 
 uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
+}
+
+uint32_t llama_context::block_size() const {
+    return cparams.block_size;
 }
 
 uint32_t llama_context::n_threads() const {
@@ -1347,7 +1408,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    static const bool graph_timing = std::getenv("LLAMA_GRAPH_TIMING") != nullptr;
+    static const bool graph_reuse_debug = std::getenv("LLAMA_GRAPH_REUSE_DEBUG") != nullptr;
+    bool graph_reused = false;
+    int64_t graph_build_us = 0;
+    int64_t graph_alloc_us = 0;
+
+    bool can_reuse_graph = !graph_reuse_disable && res->can_reuse(gparams);
+    if (graph_reuse_debug && !can_reuse_graph) {
+        LLAMA_LOG_ERROR("[graph reuse] n_tokens=%d n_seq_tokens=%d n_seqs=%d n_seqs_unq=%d equal=%d outputs=%d\n",
+                        ubatch.n_tokens, ubatch.n_seq_tokens, ubatch.n_seqs, ubatch.n_seqs_unq,
+                        ubatch.equal_seqs(), n_outputs);
+    }
+
+    if (can_reuse_graph) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1358,17 +1432,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        graph_reused = true;
     } else {
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
+        const auto t_start_us = graph_timing ? ggml_time_us() : 0;
 
         gf = model.build_graph(gparams);
 
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        graph_build_us = graph_timing ? ggml_time_us() - t_start_us : 0;
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -1376,28 +1451,41 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        const auto t_alloc_us = graph_timing ? ggml_time_us() : 0;
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        graph_alloc_us = graph_timing ? ggml_time_us() - t_alloc_us : 0;
     }
 
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
+        const auto t_start_us = graph_timing ? ggml_time_us() : 0;
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
 
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        if (graph_timing) {
+            LLAMA_LOG_ERROR("[graph timing] reuse=%d n_tokens=%d build=%.3fms alloc=%.3fms set_inputs=%.3fms\n",
+                           graph_reused ? 1 : 0, ubatch.n_tokens, graph_build_us / 1000.0,
+                           graph_alloc_us / 1000.0, (ggml_time_us() - t_start_us) / 1000.0);
+        }
     }
+
+    const auto compute_t0 = graph_timing ? ggml_time_us() : 0;
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+    if (graph_timing) {
+        LLAMA_LOG_ERROR("[graph timing] compute n_tokens=%d total=%.3fms\n",
+                       ubatch.n_tokens, (ggml_time_us() - compute_t0) / 1000.0);
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -3651,6 +3739,11 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.kv_paged                    =*/ false,
+        /*.block_size                  =*/ 16,
+        /*.n_gpu_blocks                =*/ 0,
+        /*.n_cpu_blocks                =*/ 0,
+        /*.kv_paged_watermark          =*/ 0.05,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

@@ -78,6 +78,24 @@ if (CANN_INSTALL_DIR)
 
     target_compile_definitions(ggml-cann PRIVATE "-D${SOC_TYPE_COMPILE_OPTION}")
 
+    # ATB (Ascend Transformer Boost) ops for paged KV cache attention
+    set(ATB_HOME "/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1" CACHE PATH "Path to the ATB package")
+    if(EXISTS "${ATB_HOME}/lib/libatb.so")
+        target_include_directories(ggml-cann PRIVATE ${ATB_HOME}/include)
+        target_link_directories(ggml-cann PRIVATE ${ATB_HOME}/lib)
+        target_link_libraries(ggml-cann PRIVATE atb)
+        # propagate the path to consumers so they can resolve libatb's deps at link time,
+        # and keep an rpath so libggml-cann.so finds libatb.so at runtime
+        set_target_properties(ggml-cann PROPERTIES
+            INTERFACE_LINK_DIRECTORIES "${ATB_HOME}/lib"
+            BUILD_RPATH   "${ATB_HOME}/lib"
+            INSTALL_RPATH "${ATB_HOME}/lib")
+        target_compile_definitions(ggml-cann PRIVATE GGML_CANN_HAS_ATB)
+        message(STATUS "CANN: ATB enabled from ${ATB_HOME}")
+    else()
+        message(STATUS "CANN: ATB not found at ${ATB_HOME}, paged KV attention disabled")
+    endif()
+
     if (USE_ACL_GRAPH)
         target_compile_definitions(ggml-cann PRIVATE USE_ACL_GRAPH)
         message(STATUS "CANN: USE_ACL_GRAPH is enabled.")
