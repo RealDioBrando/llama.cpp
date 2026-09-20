@@ -169,8 +169,10 @@ struct ggml_cann_pool_alloc {
     ggml_cann_pool * pool        = nullptr; /**< Pointer to the memory pool. */
     void *           ptr         = nullptr; /**< Pointer to the allocated memory block. */
     size_t           actual_size = 0;       /**< Actual size of the allocated memory block. */
+#ifdef USE_ACL_GRAPH
     bool             from_arena  = false;   /**< Allocated from the capture arena (graph lifetime). */
     size_t           arena_block_idx = 0;   /**< Arena block index (for LIFO free on capture workspace). */
+#endif
 
     /**
      * @brief Default constructor.
@@ -195,6 +197,7 @@ struct ggml_cann_pool_alloc {
      */
     ~ggml_cann_pool_alloc() {
         if (ptr != nullptr) {
+#ifdef USE_ACL_GRAPH
             if (from_arena) {
                 // Release the capture-time workspace back to its block so the
                 // next alloc reuses it (LIFO). The underlying blocks are still
@@ -202,6 +205,7 @@ struct ggml_cann_pool_alloc {
                 ggml_cann_capture_arena_free(arena_block_idx, actual_size);
                 return;
             }
+#endif
             pool->free(ptr, actual_size);
         }
     }
