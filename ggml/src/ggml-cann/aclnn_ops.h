@@ -1084,10 +1084,10 @@ static bool ggml_cann_qmat_debug() {
  *
  * @details Routes attn_qkv/attn_gate/ssm_out (large q8_0 matmuls, k=2048) to the
  *          NPU W8A8 path by name suffix. ssm_alpha/ssm_beta ([2048,16]) are
- *          excluded by default pending the [2048,16] feedback clarification
- *          (19号 §4.10); opt in with GGML_CANN_GDN_SMALL=1 (independent of
- *          GGML_CANN_GDN_PROJ). GGML_CANN_GDN_PROJ=0 restores the CPU fallback
- *          for the large projections (default ON).
+ *          excluded by default pending clarification of the [2048,16]
+ *          feedback support; opt in with GGML_CANN_GDN_SMALL=1 (independent
+ *          of GGML_CANN_GDN_PROJ). GGML_CANN_GDN_PROJ=0 restores the CPU
+ *          fallback for the large projections (default ON).
  */
 static bool is_gdn_proj_weight(const ggml_tensor * tensor) {
     static const bool                            enabled  = !ggml_cann_env_off("GGML_CANN_GDN_PROJ");

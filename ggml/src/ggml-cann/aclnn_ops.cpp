@@ -4466,12 +4466,19 @@ void ggml_cann_out_prod(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     }
 }
 
-/* ── SsmConv1d 自定义算子(ops-nn vendor 包, e2e optim P0)──
- * 背景: 310P aclnnConvolution 的 depthwise(groups=d_inner)路径每次调用都对权重做
- * FRACTAL_Z:1→FZ:6144 运行期重组(TransDataFzToDst ~1.3ms × 18 层/步 ≈ 24ms/步,
- * NPU busy 最大单项, 详见 18 号文档 §9)。vendor 包的 aclnnSsmConv1d 以内部
- * Transpose + 纯向量 kernel 替代。弱符号 + 失败回退: 无 vendor 包或运行报错时
- * 自动走原 Convolution 路径。GGML_CANN_SSM_CONV1D=0 可强制关闭。 */
+/*
+ * SsmConv1d custom operator (ops-nn vendor package).
+ *
+ * Background: on 310P, the depthwise path of aclnnConvolution (groups=d_inner)
+ * reorganizes the weight at runtime on every call (TransDataFzToDst
+ * FRACTAL_Z:1 -> FZ:6144, ~1.3 ms per call x 18 layers/step ~ 24 ms/step, the
+ * largest single NPU-busy item in per-op profiling). The vendor aclnnSsmConv1d
+ * replaces it with an internal transpose plus a pure vector kernel.
+ *
+ * Weak symbols with fallback: when the vendor package is absent or the call
+ * fails at runtime, the original Convolution path is used automatically.
+ * GGML_CANN_SSM_CONV1D=0 force-disables the custom path.
+ */
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -4495,7 +4502,8 @@ static bool ggml_cann_ssm_conv1d_enabled() {
     return enabled == 1;
 }
 
-/* aclnnStatus 成功值(ACLNN_SUCCESS 在部分 aclnnop 头文件组合下不可见, 本地定义) */
+/* ACLNN_SUCCESS is not visible under some aclnnop header combinations,
+ * so define the success value locally. */
 constexpr aclnnStatus ACLNN_STATUS_OK = static_cast<aclnnStatus>(0);
 
 void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
@@ -4521,12 +4529,14 @@ void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src0->nb[0] == sizeof(float));
     GGML_ASSERT(src1->nb[0] == sizeof(float));
 
-    /* P0(e2e optim): 自定义 SsmConv1d 路径(vendor 包加载时优先)。
-     * 契约: x (n_s, d_inner, ncs) / weight (d_inner, nc) / y (n_s, n_t, d_inner),
-     * 与 ggml 原始布局经 ACL 维度反转后天然一致, 零拷贝直传。
-     * 注意: 必须直接 aclCreateTensor 且 storage shape = view shape ——
-     * ggml_cann_create_tensor 的 storage 为 1 维 [总元素数], l0op::Transpose 的
-     * inferShape/tiling 要求 storage 与 view 维数一致, 否则 561103 静默回退。 */
+    /* Custom SsmConv1d path (preferred when the vendor package is loaded).
+     * Contract: x (n_s, d_inner, ncs) / weight (d_inner, nc) / y
+     * (n_s, n_t, d_inner) — matches the ggml layouts after ACL dim reversal,
+     * passed zero-copy. Note: tensors must be created directly with
+     * aclCreateTensor and storage shape == view shape — the storage of
+     * ggml_cann_create_tensor is 1-D [total elements], while the
+     * l0op::Transpose inferShape/tiling requires storage and view to have the
+     * same rank, otherwise it silently falls back (error 561103). */
     if (ggml_cann_ssm_conv1d_enabled() && nr % 64 == 0 && nc >= 1 && nc <= 16 && n_t >= 1 &&
         src0->nb[1] == ncs * sizeof(float) && src1->nb[1] == nc * sizeof(float) &&
         dst->nb[1] == nr * sizeof(float) &&
