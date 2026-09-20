@@ -76,7 +76,7 @@ class llama_paged_scheduler_impl {
     const int32_t          n_batch;
     llama_kv_cache_paged * kv_cache_manager = nullptr;
     llama_memory_hybrid_paged * hybrid_memory_manager = nullptr;
-    llama_paged_batch_info curr_info;
+    llama_paged_batch_info curr_info = {};
 
     llama_paged_prefix_cache prefix_cache;
     bool                     prefix_cache_enabled = true;

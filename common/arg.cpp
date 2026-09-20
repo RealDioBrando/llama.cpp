@@ -1738,6 +1738,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "number of physical CPU blocks for paged KV cache (default: 1)",
         [](common_params & params, int value) {
             params.n_cpu_blocks = value;
+            params.n_cpu_blocks_set = true;
         }
     ).set_examples({LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
@@ -1745,6 +1746,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "number of physical GPU blocks for paged KV cache (default: 1)",
         [](common_params & params, int value) {
             params.n_gpu_blocks = value;
+            params.n_gpu_blocks_set = true;
         }
     ).set_examples({LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(

@@ -30,3 +30,18 @@ Note: SWA architectures (gemma3, llama4, etc.) are not yet supported.
 ## Output
 - Prints all the generated outputs at the end.
 - Prints performance timings (general and per-request).
+
+## Performance benchmark
+
+Use the fixed Paged vs Unified performance case when comparing KV cache modes:
+
+```bash
+python3 scripts/perf-paged-vs-unified.py \
+  --model /app/gguf-models/qwen3.5-2b-f16.gguf \
+  --bin-dir build-cann/bin \
+  --device 5
+```
+
+The case runs single-request and 10-request workloads, captures per-run logs, and writes `results.json` and `results.md`. Use `--scenarios paged-single unified-single` for a short smoke run and `--dry-run` to inspect the exact commands.
+
+The case discards warmups per scenario, alternates Paged and Unified ordering, waits for host and NPU idle state, adds a quiet gap between runs, and reports median values. It records a relative-range stability score; pass `--require-stable` to turn an unstable result into a failure.

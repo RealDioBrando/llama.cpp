@@ -1327,14 +1327,26 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
         return;
     }
 
-    const uint32_t n_gpu_blocks = (uint32_t)(available / bytes_per_block);
-    const uint32_t n_cpu_blocks = (uint32_t)(n_gpu_blocks * params.cpu_to_gpu_blocks_ratio);
+    // Paged scheduler treats n_ctx as per-sequence capacity.
+    const uint32_t n_seq_max = std::max(1u, (uint32_t) std::max(0, params.n_parallel));
+    const double   watermark = std::clamp((double) params.kv_paged_watermark, 0.0, 0.99);
+    const uint64_t context_gpu_tokens = (uint64_t) params.n_ctx * n_seq_max;
+    const uint64_t context_gpu_blocks =
+        (uint64_t) std::ceil((double) context_gpu_tokens / block_size / (1.0 - watermark));
+    const uint32_t n_gpu_blocks =
+        (uint32_t) std::min<uint64_t>(available / bytes_per_block, context_gpu_blocks);
+    const uint32_t n_cpu_blocks = (uint32_t) std::max<uint64_t>(1,
+        (uint64_t) std::ceil(n_gpu_blocks * params.cpu_to_gpu_blocks_ratio / (1.0 - watermark)));
 
     LOG_INF("%s: free_vram=%0.1f MiB, bytes_per_block=%ld, n_gpu_blocks=%d, n_cpu_blocks=%d\n",
             __func__, free_vram / 1024.0f / 1024.0f, bytes_per_block, n_gpu_blocks, n_cpu_blocks);
 
-    params.n_gpu_blocks = n_gpu_blocks;
-    params.n_cpu_blocks = n_cpu_blocks;
+    if (!params.n_gpu_blocks_set) {
+        params.n_gpu_blocks = n_gpu_blocks;
+    }
+    if (!params.n_cpu_blocks_set) {
+        params.n_cpu_blocks = n_cpu_blocks;
+    }
 }
 
 common_init_result::common_init_result(common_params & params, bool model_only) :

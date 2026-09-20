@@ -455,9 +455,10 @@ int main(int argc, char ** argv) {
                 //        client.id, client.seq_id, id, client.n_decoded, client.i_batch, token_str.c_str());
 
                 if (client.n_decoded > 2 &&
-                    (!params.sampling.ignore_eos && llama_vocab_is_eog(vocab, id) ||
+                    ((!params.sampling.ignore_eos && llama_vocab_is_eog(vocab, id)) ||
                      (params.n_predict > 0 && client.n_decoded >= params.n_predict) ||
-                     client.response.find("User:") != std::string::npos)) {
+                     (!params.sampling.ignore_eos &&
+                      client.response.find("User:") != std::string::npos))) {
                     // basic reverse prompt
                     const size_t pos = client.response.find("User:");
                     if (pos != std::string::npos) {

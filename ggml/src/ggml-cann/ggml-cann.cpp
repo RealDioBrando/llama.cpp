@@ -2389,6 +2389,7 @@ static const char * ggml_backend_cann_name(ggml_backend_t backend) {
  */
 static void ggml_backend_cann_free(ggml_backend_t backend) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
+    ggml_cann_paged_attn_cleanup(*cann_ctx);
     ACL_CHECK(aclrtSynchronizeDevice());
     ACL_CHECK(aclrtResetDevice(cann_ctx->device));
 

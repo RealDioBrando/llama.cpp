@@ -8,3 +8,4 @@ struct ggml_tensor;
 // KV pools are wrapped as FRACTAL_NZ and interpreted by ATB ops; the rest of
 // llama.cpp never sees the layout.
 void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst);
+void ggml_cann_paged_attn_cleanup(ggml_backend_cann_context & ctx);

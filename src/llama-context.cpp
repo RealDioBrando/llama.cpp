@@ -1409,11 +1409,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     static const bool graph_timing = std::getenv("LLAMA_GRAPH_TIMING") != nullptr;
+    static const bool graph_reuse_debug = std::getenv("LLAMA_GRAPH_REUSE_DEBUG") != nullptr;
     bool graph_reused = false;
     int64_t graph_build_us = 0;
     int64_t graph_alloc_us = 0;
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    bool can_reuse_graph = !graph_reuse_disable && res->can_reuse(gparams);
+    if (graph_reuse_debug && !can_reuse_graph) {
+        LLAMA_LOG_ERROR("[graph reuse] n_tokens=%d n_seq_tokens=%d n_seqs=%d n_seqs_unq=%d equal=%d outputs=%d\n",
+                        ubatch.n_tokens, ubatch.n_seq_tokens, ubatch.n_seqs, ubatch.n_seqs_unq,
+                        ubatch.equal_seqs(), n_outputs);
+    }
+
+    if (can_reuse_graph) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running

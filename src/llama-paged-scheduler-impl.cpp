@@ -89,11 +89,10 @@ llama_scheduler_status llama_paged_scheduler_impl::step(llama_batch & batch) {
 
     // A paged ubatch assumes every sequence contributes the same number of
     // tokens. Keep prefill and decode in separate scheduling steps.
-    const bool has_prefill = std::any_of(candidates.begin(), candidates.end(),
-                                         [](const llama_sequence_group * group) {
-                                             return group && group->n_decoded == 0;
-                                         });
-    if (!has_prefill && !waiting.empty()) {
+    // Drain queued prefills before decoding. Otherwise the first ready
+    // sequence starts decoding while later sequences wait and a queued batch
+    // runs with a tiny active batch.
+    if (!waiting.empty()) {
         process_waiting_list(candidates, n_batch);
     }
 
@@ -503,9 +502,9 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
         }
         ++count;
         // Reserve the full prompt plus one decode slot; only chunk_tokens run now.
-        bool success = kv_cache_manager->allocate(group->n_prompt + 1, *group);
+        bool success = kv_cache_manager->allocate(1, *group);
         while (!success && evict_cached_blocks()) {
-            success = kv_cache_manager->allocate(group->n_prompt + 1, *group);
+            success = kv_cache_manager->allocate(1, *group);
         }
         if (!success) {
             // We respect FCFS, so we stop here to prevent a younger waiting request from jumping ahead.

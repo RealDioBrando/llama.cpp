@@ -14,11 +14,13 @@
 #include "llama-kv-cache-dsv4.h"
 #include "llama-kv-cache-paged.h"
 #include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-paged.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
@@ -344,7 +346,12 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
-    const auto * mctx = static_cast<const llama_memory_recurrent_context *>(params.mctx);
+    const auto * hybrid_mctx = dynamic_cast<const llama_memory_hybrid_paged_context *>(params.mctx);
+    const auto * mctx = hybrid_mctx ? hybrid_mctx->get_recr()
+                                    : dynamic_cast<const llama_memory_recurrent_context *>(params.mctx);
+    if (!mctx) {
+        return false;
+    }
 
     this->mctx = mctx;
 
@@ -1076,11 +1083,34 @@ void llm_graph_input_attn_kv_paged::set_input(const llama_ubatch* ubatch) {
     }
 }
 
-bool llm_graph_input_attn_kv_paged::can_reuse(const llm_graph_params & /*params*/) {
-    // In paged KV cache, we can 'never' re-use the graph. Because we have write_slots
-    // which encode the complete physical memory mapping for a specific batch at a specific
-    // step.
-    return false;
+bool llm_graph_input_attn_kv_paged::can_reuse(const llm_graph_params & params) {
+    // The graph topology only depends on metadata shapes. The physical mapping
+    // in write slots and block tables is an input and is refreshed by set_input.
+    const auto * hybrid_mctx = dynamic_cast<const llama_memory_hybrid_paged_context *>(params.mctx);
+    const auto * next_mctx = hybrid_mctx ? hybrid_mctx->get_paged_attn()
+                                         : dynamic_cast<const llama_kv_cache_paged_context *>(params.mctx);
+    if (!next_mctx || mctx != next_mctx) {
+        mctx = next_mctx;
+    }
+    if (!next_mctx) {
+        static const bool reuse_debug = std::getenv("LLAMA_GRAPH_REUSE_DEBUG") != nullptr;
+        if (reuse_debug) {
+            LLAMA_LOG_ERROR("[paged reuse] no paged mctx\n");
+        }
+        return false;
+    }
+
+    const bool can = paged_write_slots->ne[0] == next_mctx->get_n_tokens() &&
+                     paged_block_table->ne[1] == next_mctx->get_batch_size() &&
+                     paged_block_table->ne[0] == next_mctx->get_max_blocks();
+    static const bool reuse_debug = std::getenv("LLAMA_GRAPH_REUSE_DEBUG") != nullptr;
+    if (reuse_debug && !can) {
+        LLAMA_LOG_ERROR("[paged reuse] shape mismatch graph=[%ld,%ld,%ld] ctx=[%d,%d,%d]\n",
+                        (long) paged_write_slots->ne[0], (long) paged_block_table->ne[1],
+                        (long) paged_block_table->ne[0], next_mctx->get_n_tokens(),
+                        next_mctx->get_batch_size(), next_mctx->get_max_blocks());
+    }
+    return can;
 }
 
 void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
@@ -1438,6 +1468,24 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     if (!this->params.allow_reuse(params)) {
+        static const bool reuse_debug = std::getenv("LLAMA_GRAPH_REUSE_DEBUG") != nullptr;
+        if (reuse_debug) {
+            bool ubatch_match = true;
+            bool sampler_match = true;
+            for (uint32_t i = 0; i < this->params.ubatch.n_tokens; ++i) {
+                ubatch_match &= this->params.ubatch.output[i] == params.ubatch.output[i] &&
+                                this->params.ubatch.seq_id[i][0] == params.ubatch.seq_id[i][0];
+            }
+            sampler_match = this->params.samplers.size() == params.samplers.size();
+            LLAMA_LOG_ERROR(
+                "[graph reuse] params mismatch ubatch=%d outputs=%d/%d samplers=%zu/%zu "
+                "sampler_match=%d ubatch_match=%d data=%d/%d seqs=%u/%u unq=%u/%u\n",
+                ubatch_match, this->params.n_outputs, params.n_outputs,
+                this->params.samplers.size(), params.samplers.size(), sampler_match, ubatch_match,
+                (int) (bool) this->params.ubatch.data, (int) (bool) params.ubatch.data,
+                this->params.ubatch.n_seqs, params.ubatch.n_seqs,
+                this->params.ubatch.n_seqs_unq, params.ubatch.n_seqs_unq);
+        }
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
         }

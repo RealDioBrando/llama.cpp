@@ -77,6 +77,10 @@ struct atb_paged_state {
     std::mutex       mtx;
 
     ~atb_paged_state() {
+        if (ctx) {
+            ACL_CHECK(aclrtSetCurrentContext(saved_ctx));
+            ACL_CHECK(aclrtSynchronizeDevice());
+        }
         if (rac)  atb::DestroyOperation((atb::Operation *) rac);
         if (sa)   atb::DestroyOperation((atb::Operation *) sa);
         if (pa)   atb::DestroyOperation((atb::Operation *) pa);
@@ -369,6 +373,9 @@ void self_attention_prefill(ggml_backend_cann_context & ctx, void * q_f16, void 
 void ggml_cann_paged_attn(ggml_backend_cann_context &, ggml_tensor *) {
     GGML_ABORT("ggml-cann was built without ATB support; paged KV cache requires the nnal/atb package");
 }
+
+void ggml_cann_paged_attn_cleanup(ggml_backend_cann_context &) {
+}
 #else
 
 void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
@@ -571,9 +578,11 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         vp.inTensors  = { qa, kc, vc, btt, clt };
         vp.outTensors = { out };
         const int64_t pa_setup_t0 = paged_timing ? ggml_time_us() : 0;
-        GGML_LOG_INFO("[CANN paged] PA call: cl_host min/max = %d/%d\n",
-                      *std::min_element(cl_host.begin(), cl_host.end()),
-                      *std::max_element(cl_host.begin(), cl_host.end()));
+        if (paged_debug) {
+            GGML_LOG_INFO("[CANN paged] PA call: cl_host min/max = %d/%d\n",
+                          *std::min_element(cl_host.begin(), cl_host.end()),
+                          *std::max_element(cl_host.begin(), cl_host.end()));
+        }
         setup_op(g_atb.pa, vp, &g_atb.ws_pa, &g_atb.ws_pa_sz, (atb::Context *) g_atb.ctx, stream);
         const int64_t pa_setup_us = paged_timing ? ggml_time_us() - pa_setup_t0 : 0;
         const int64_t pa_exec_t0 = paged_timing ? ggml_time_us() : 0;
@@ -641,8 +650,10 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
             const int64_t mask_ms    = ((ctx_len + 15) / 16) * 16;
             const int64_t tokens_pad = ((len + 15) / 16) * 16;
             const int64_t mask_elems = (mask_ms / 16) * tokens_pad * 16;
-            GGML_LOG_INFO("[CANN paged] SF call: seq=%d len=%d ctx=%d mask_ms=%d tokens_pad=%d\n",
-                          (int) seq, (int) len, (int) ctx_len, (int) mask_ms, (int) tokens_pad);
+            if (paged_debug) {
+                GGML_LOG_INFO("[CANN paged] SF call: seq=%d len=%d ctx=%d mask_ms=%d tokens_pad=%d\n",
+                              (int) seq, (int) len, (int) ctx_len, (int) mask_ms, (int) tokens_pad);
+            }
             ggml_cann_pool_alloc mask_alloc(ctx.pool(), mask_elems * sizeof(uint16_t));
             std::vector<uint16_t> mask_host;
             const float neg_big = -10000.0f;
@@ -696,6 +707,50 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
                        (int) n_tokens, (int) n_seq, (long long) (ggml_time_us() - total_t0),
                        (long long) (ggml_time_us() - cast_back_t0));
     }
+}
+
+void ggml_cann_paged_attn_cleanup(ggml_backend_cann_context & cann_ctx) {
+    if (!g_atb.ctx) {
+        return;
+    }
+
+    ACL_CHECK(aclrtSetCurrentContext(g_atb.saved_ctx));
+    ((atb::Context *) g_atb.ctx)->SetExecuteStream(cann_ctx.stream());
+    ACL_CHECK(aclrtSynchronizeDevice());
+
+    if (g_atb.rac)  atb::DestroyOperation((atb::Operation *) g_atb.rac);
+    if (g_atb.sa)   atb::DestroyOperation((atb::Operation *) g_atb.sa);
+    if (g_atb.pa)   atb::DestroyOperation((atb::Operation *) g_atb.pa);
+    if (g_atb.sf)   atb::DestroyOperation((atb::Operation *) g_atb.sf);
+    atb::DestroyContext((atb::Context *) g_atb.ctx);
+
+    if (g_atb.ws_rac) ACL_CHECK(aclrtFree(g_atb.ws_rac));
+    if (g_atb.ws_sa)  ACL_CHECK(aclrtFree(g_atb.ws_sa));
+    if (g_atb.ws_pa)  ACL_CHECK(aclrtFree(g_atb.ws_pa));
+    if (g_atb.ws_sf)  ACL_CHECK(aclrtFree(g_atb.ws_sf));
+    if (g_atb.prefill_mask) ACL_CHECK(aclrtFree(g_atb.prefill_mask));
+
+    g_atb.ctx       = nullptr;
+    g_atb.rac       = nullptr;
+    g_atb.sa        = nullptr;
+    g_atb.pa        = nullptr;
+    g_atb.sf        = nullptr;
+    g_atb.ws_rac    = nullptr;
+    g_atb.ws_rac_sz = 0;
+    g_atb.ws_sa     = nullptr;
+    g_atb.ws_sa_sz  = 0;
+    g_atb.ws_pa     = nullptr;
+    g_atb.ws_pa_sz  = 0;
+    g_atb.ws_sf     = nullptr;
+    g_atb.ws_sf_sz  = 0;
+    g_atb.rac_tokens = -1;
+    g_atb.sa_heads   = -1;
+    g_atb.sa_kv_heads = -1;
+    g_atb.sa_head_dim = -1;
+    g_atb.sa_scale    = 0.0f;
+    g_atb.prefill_mask = nullptr;
+    g_atb.prefill_mask_len = -1;
+    g_atb.saved_ctx = nullptr;
 }
 
 #endif  // GGML_CANN_HAS_ATB
