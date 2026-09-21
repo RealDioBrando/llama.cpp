@@ -991,9 +991,14 @@ void ggml_cann_op_add_rms_norm_fused(ggml_backend_cann_context & ctx,
 static bool is_matmul_weight(const ggml_tensor * tensor) {
     std::string                                  name = ggml_get_name(tensor);
     static const std::unordered_set<std::string> weight_suffixes{ "output.weight",      "attn_q.weight",
-                                                                  "attn_k.weight",      "attn_v.weight",
-                                                                  "attn_output.weight", "ffn_gate.weight",
-                                                                  "ffn_up.weight",      "ffn_down.weight" };
+                                                                   "attn_k.weight",      "attn_v.weight",
+                                                                   "attn_output.weight", "ffn_gate.weight",
+                                                                   "ffn_up.weight",      "ffn_down.weight",
+                                                                   "token_embd.weight" };
+    /* token_embd.weight: tied-embedding lm_head (Qwen3.5 etc., no standalone
+     * output.weight). Routing it to W8A8 requires the lazy transform: skip the
+     * load-time transform (GET_ROWS needs the original Q8_0) and do the one-time
+     * fractal repack into a cached copy at compute time (in the mul_mat handler). */
 
     for (const auto & suffix : weight_suffixes) {
         if (name.find(suffix) != std::string::npos) {

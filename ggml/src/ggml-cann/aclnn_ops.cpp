@@ -2497,6 +2497,37 @@ static void ggml_cann_mul_mat_kquant(ggml_backend_cann_context & ctx, ggml_tenso
 
     // ---- 3. weight tensors from the device layout ----
     char * weight_base = (char *) src0->data;
+
+    /* R2 lm_head NPU: tied embedding(token_embd.weight)在加载期跳过了 transform
+     * (保 GET_ROWS 原始 Q8_0), 此处做 lazy 一次性分形重排并缓存设备副本 */
+    {
+        static std::unordered_map<const void *, void *> s_fractal_cache;
+        static std::mutex                               s_cache_mutex;
+        const std::string                               wname = ggml_get_name(src0);
+        if (wname.find("token_embd.weight") != std::string::npos) {
+            std::lock_guard<std::mutex> lock(s_cache_mutex);
+            auto it = s_fractal_cache.find(src0->data);
+            if (it == s_fractal_cache.end()) {
+                const size_t nbytes  = ggml_nbytes(src0);
+                const size_t layout  = ggml_cann_kq_layout_size(src0, path);
+                void *       h_raw   = malloc(nbytes);
+                void *       h_frac  = malloc(layout);
+                ACL_CHECK(aclrtMemcpy(h_raw, nbytes, src0->data, nbytes, ACL_MEMCPY_DEVICE_TO_HOST));
+                ggml_backend_cann_transform_kq_pub(src0, h_raw, h_frac);
+                void * d_frac = nullptr;
+                ACL_CHECK(aclrtMalloc(&d_frac, layout, ACL_MEM_MALLOC_HUGE_FIRST));
+                ACL_CHECK(aclrtMemcpy(d_frac, layout, h_frac, layout, ACL_MEMCPY_HOST_TO_DEVICE));
+                free(h_raw);
+                free(h_frac);
+                s_fractal_cache[src0->data] = d_frac;
+                GGML_LOG_DEBUG("lm_head lazy transform: '%s' %zuB -> fractal %zuB (cached)\n", wname.c_str(), nbytes,
+                               layout);
+                weight_base = (char *) d_frac;
+            } else {
+                weight_base = (char *) it->second;
+            }
+        }
+    }
     acl_tensor_ptr acl_x2;
     acl_tensor_ptr acl_x2_scale;
     acl_tensor_ptr acl_yoffset;
