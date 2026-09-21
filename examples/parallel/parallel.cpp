@@ -454,9 +454,9 @@ int main(int argc, char ** argv) {
                 //printf("client %d, seq %d, token %d, pos %d, batch %d: %s\n",
                 //        client.id, client.seq_id, id, client.n_decoded, client.i_batch, token_str.c_str());
 
-               if (client.n_decoded > 2 &&
+                if (client.n_decoded > 2 &&
                     ((!params.sampling.ignore_eos && llama_vocab_is_eog(vocab, id)) ||
-                    (params.n_predict > 0 && client.n_decoded >= params.n_predict) ||
+                     (params.n_predict > 0 && client.n_decoded >= params.n_predict) ||
                      (!params.sampling.ignore_eos &&
                       client.response.find("User:") != std::string::npos))) {
                     // basic reverse prompt
@@ -471,9 +471,10 @@ int main(int argc, char ** argv) {
 
                     const auto t_main_end = ggml_time_us();
 
-                    LOG_INF("\033[31mClient %3d, seq %3d/%3d, prompt %4d t, response %4d t, time %5.2f s, speed %5.2f t/s, cache miss %d \033[0m \n\nInput:    %s\n\033[35mResponse: %s\033[0m\n\n",
+                    LOG_INF("\033[31mClient %3d, seq %3d/%3d, prompt %4d t, response %4d t, time %5.2f s, gen time %5.2f s, speed %5.2f t/s, cache miss %d \033[0m \n\nInput:    %s\n\033[35mResponse: %s\033[0m\n\n",
                             client.id, client.seq_id, n_seq, client.n_prompt, client.n_decoded,
                             (t_main_end - client.t_start_prompt) / 1e6,
+                            (t_main_end - client.t_start_gen) / 1e6,
                             (double) (client.n_prompt + client.n_decoded) / (t_main_end - client.t_start_prompt) * 1e6,
                             n_cache_miss,
                             ::trim(client.input).c_str(),

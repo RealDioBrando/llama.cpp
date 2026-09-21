@@ -1287,6 +1287,68 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+static void common_fit_paged_kv_blocks(common_params& params, const llama_model * model) {
+    GGML_ASSERT(model && "model must be loaded before fitting paged KV blocks.");
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!dev) {
+        LOG_WRN("%s: no GPU device found, cannot fit paged KV blocks.\n", __func__);
+        return;
+    }
+
+    size_t free_vram = 0;
+    size_t total_vram = 0;
+    ggml_backend_dev_memory(dev, &free_vram, &total_vram);
+
+    const uint32_t n_heads_kv = llama_model_n_head_kv(model);
+    const uint32_t n_layers   = llama_model_n_layer(model);
+    const uint32_t head_dim   = llama_model_n_embd(model) / llama_model_n_head(model);
+    const uint32_t block_size = params.block_size;
+
+    const size_t bytes_per_block = (size_t)2 * head_dim * n_heads_kv * block_size * n_layers * ggml_type_size(GGML_TYPE_F16);
+
+    const size_t margin = params.fit_params_target.empty()
+        ? (size_t)(total_vram * 0.05f)
+        : (size_t)params.fit_params_target[0];
+
+    if (free_vram <= margin) {
+        LOG_ERR("%s: not enough free VRAM for paged KV blocks. "
+                "free_vram=%.1f MiB <= margin=%.1f MiB. "
+                "Try reducing --margin or offloading fewer layers to GPU.\n",
+                __func__, free_vram / 1024.0f / 1024.0f, margin    / 1024.0f / 1024.0f);
+        return; // leave params.n_gpu_blocks at its existing value
+    }
+
+    const size_t available = (free_vram > margin) ? free_vram - margin : 0;
+
+    if (bytes_per_block == 0 || available < bytes_per_block) {
+        LOG_ERR("%s: available VRAM (%.1f MiB) is less than one block (%.1f MiB). "
+                "Try increasing n_gpu_blocks manually or reducing block_size.\n",
+                __func__, available      / 1024.0f / 1024.0f, bytes_per_block / 1024.0f / 1024.0f);
+        return;
+    }
+
+    // Paged scheduler treats n_ctx as per-sequence capacity.
+    const uint32_t n_seq_max = std::max(1u, (uint32_t) std::max(0, params.n_parallel));
+    const double   watermark = std::clamp((double) params.kv_paged_watermark, 0.0, 0.99);
+    const uint64_t context_gpu_tokens = (uint64_t) params.n_ctx * n_seq_max;
+    const uint64_t context_gpu_blocks =
+        (uint64_t) std::ceil((double) context_gpu_tokens / block_size / (1.0 - watermark));
+    const uint32_t n_gpu_blocks =
+        (uint32_t) std::min<uint64_t>(available / bytes_per_block, context_gpu_blocks);
+    const uint32_t n_cpu_blocks = (uint32_t) std::max<uint64_t>(1,
+        (uint64_t) std::ceil(n_gpu_blocks * params.cpu_to_gpu_blocks_ratio / (1.0 - watermark)));
+
+    LOG_INF("%s: free_vram=%0.1f MiB, bytes_per_block=%ld, n_gpu_blocks=%d, n_cpu_blocks=%d\n",
+            __func__, free_vram / 1024.0f / 1024.0f, bytes_per_block, n_gpu_blocks, n_cpu_blocks);
+
+    if (!params.n_gpu_blocks_set) {
+        params.n_gpu_blocks = n_gpu_blocks;
+    }
+    if (!params.n_cpu_blocks_set) {
+        params.n_cpu_blocks = n_cpu_blocks;
+    }
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
@@ -1335,6 +1397,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     if (model_only) {
         return;
+    }
+
+    if (params.fit_params && params.kv_paged) {
+        LOG_INF("%s: fitting KV paged params to device memory\n", __func__);
+        common_fit_paged_kv_blocks(params, pimpl->model.get());
+        cparams = common_context_params_to_llama(params);
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -1748,6 +1816,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.kv_paged          = params.kv_paged;
+    cparams.block_size        = params.block_size;
+    cparams.n_gpu_blocks      = params.n_gpu_blocks;
+    cparams.n_cpu_blocks      = params.n_cpu_blocks;
+    cparams.kv_paged_watermark = params.kv_paged_watermark;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

@@ -4812,6 +4812,46 @@ void ggml_cann_out_prod(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     }
 }
 
+/*
+ * SsmConv1d custom operator (ops-nn vendor package).
+ *
+ * Background: on 310P, the depthwise path of aclnnConvolution (groups=d_inner)
+ * reorganizes the weight at runtime on every call (TransDataFzToDst
+ * FRACTAL_Z:1 -> FZ:6144, ~1.3 ms per call x 18 layers/step ~ 24 ms/step, the
+ * largest single NPU-busy item in per-op profiling). The vendor aclnnSsmConv1d
+ * replaces it with an internal transpose plus a pure vector kernel.
+ *
+ * Weak symbols with fallback: when the vendor package is absent or the call
+ * fails at runtime, the original Convolution path is used automatically.
+ * GGML_CANN_SSM_CONV1D=0 force-disables the custom path.
+ */
+#ifdef __cplusplus
+extern "C" {
+#endif
+__attribute__((weak)) aclnnStatus aclnnSsmConv1dGetWorkspaceSize(const aclTensor * x, const aclTensor * weight,
+                                                                 aclTensor * y, uint64_t * workspaceSize,
+                                                                 aclOpExecutor ** executor);
+__attribute__((weak)) aclnnStatus aclnnSsmConv1d(void * workspace, uint64_t workspaceSize, aclOpExecutor * executor,
+                                                 aclrtStream stream);
+#ifdef __cplusplus
+}
+#endif
+
+static bool ggml_cann_ssm_conv1d_enabled() {
+    static int enabled = []() {
+        const char * env = getenv("GGML_CANN_SSM_CONV1D");
+        if (env != nullptr && env[0] == '0') {
+            return 0;
+        }
+        return (aclnnSsmConv1dGetWorkspaceSize != nullptr) ? 1 : 0;
+    }();
+    return enabled == 1;
+}
+
+/* ACLNN_SUCCESS is not visible under some aclnnop header combinations,
+ * so define the success value locally. */
+constexpr aclnnStatus ACLNN_STATUS_OK = static_cast<aclnnStatus>(0);
+
 void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * src0 = dst->src[0];  // conv_x
     ggml_tensor * src1 = dst->src[1];  // conv1d.weight
@@ -4834,6 +4874,59 @@ void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(ncs == nc - 1 + n_t);  // conv_x: {d_conv - 1 + n_t, d_inner, n_s}
     GGML_ASSERT(src0->nb[0] == sizeof(float));
     GGML_ASSERT(src1->nb[0] == sizeof(float));
+
+    /* Custom SsmConv1d path (preferred when the vendor package is loaded).
+     * Contract: x (n_s, d_inner, ncs) / weight (d_inner, nc) / y
+     * (n_s, n_t, d_inner) — matches the ggml layouts after ACL dim reversal,
+     * passed zero-copy. Note: tensors must be created directly with
+     * aclCreateTensor and storage shape == view shape — the storage of
+     * ggml_cann_create_tensor is 1-D [total elements], while the
+     * l0op::Transpose inferShape/tiling requires storage and view to have the
+     * same rank, otherwise it silently falls back (error 561103). */
+    if (ggml_cann_ssm_conv1d_enabled() && nr % 64 == 0 && nc >= 1 && nc <= 16 && n_t >= 1 &&
+        src0->nb[1] == ncs * sizeof(float) && src1->nb[1] == nc * sizeof(float) &&
+        dst->nb[1] == nr * sizeof(float) &&
+        (n_s == 1 || (src0->nb[2] == nr * ncs * sizeof(float) && dst->nb[2] == n_t * nr * sizeof(float)))) {
+        int64_t x_ne[3] = {n_s, nr, ncs};
+        int64_t x_st[3] = {nr * ncs, ncs, 1};
+        int64_t w_ne[2] = {nr, nc};
+        int64_t w_st[2] = {nc, 1};
+        int64_t y_ne[3] = {n_s, n_t, nr};
+        int64_t y_st[3] = {n_t * nr, nr, 1};
+        aclTensor * x_raw = aclCreateTensor(x_ne, 3, ACL_FLOAT, x_st, 0, ACL_FORMAT_ND, x_ne, 3, src0->data);
+        aclTensor * w_raw = aclCreateTensor(w_ne, 2, ACL_FLOAT, w_st, 0, ACL_FORMAT_ND, w_ne, 2, src1->data);
+        aclTensor * y_raw = aclCreateTensor(y_ne, 3, ACL_FLOAT, y_st, 0, ACL_FORMAT_ND, y_ne, 3, dst->data);
+        if (x_raw != nullptr && w_raw != nullptr && y_raw != nullptr) {
+            uint64_t        workspaceSize = 0;
+            aclOpExecutor * executor      = nullptr;
+            aclnnStatus     st = aclnnSsmConv1dGetWorkspaceSize(x_raw, w_raw, y_raw, &workspaceSize, &executor);
+            if (st == ACLNN_STATUS_OK) {
+                void *              workspaceAddr = nullptr;
+                ggml_cann_pool_alloc workspace_allocator(ctx.pool());
+                if (workspaceSize > 0) {
+                    workspaceAddr = workspace_allocator.alloc(workspaceSize);
+                }
+                st = aclnnSsmConv1d(workspaceAddr, workspaceSize, executor, ctx.stream());
+                if (st == ACLNN_STATUS_OK) {
+                    aclDestroyTensor(x_raw);
+                    aclDestroyTensor(w_raw);
+                    aclDestroyTensor(y_raw);
+                    return;
+                }
+            }
+            GGML_LOG_DEBUG("cann ssm_conv: custom SsmConv1d unavailable (st=%d), fallback to Convolution\n",
+                           (int) st);
+        }
+        if (x_raw != nullptr) {
+            aclDestroyTensor(x_raw);
+        }
+        if (w_raw != nullptr) {
+            aclDestroyTensor(w_raw);
+        }
+        if (y_raw != nullptr) {
+            aclDestroyTensor(y_raw);
+        }
+    }
 
     // --- Build CANN tensors ---
 
