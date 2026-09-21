@@ -2498,8 +2498,12 @@ static void ggml_cann_mul_mat_kquant(ggml_backend_cann_context & ctx, ggml_tenso
     // ---- 3. weight tensors from the device layout ----
     char * weight_base = (char *) src0->data;
 
-    /* R2 lm_head NPU: tied embedding(token_embd.weight)在加载期跳过了 transform
-     * (保 GET_ROWS 原始 Q8_0), 此处做 lazy 一次性分形重排并缓存设备副本 */
+    /* lm_head NPU: tied embedding (token_embd.weight) went through the standard
+     * Q8_0 upload path at load time (planar layout: quants contiguous + scales
+     * contiguous), while the fractal transform expects the original GGUF block
+     * format (scale+quant interleaved). So here: D2H, reassemble back to block
+     * format, then fractal-repack; the result is cached in a separate device
+     * buffer. */
     {
         static std::unordered_map<const void *, void *> s_fractal_cache;
         static std::mutex                               s_cache_mutex;
@@ -2508,20 +2512,40 @@ static void ggml_cann_mul_mat_kquant(ggml_backend_cann_context & ctx, ggml_tenso
             std::lock_guard<std::mutex> lock(s_cache_mutex);
             auto it = s_fractal_cache.find(src0->data);
             if (it == s_fractal_cache.end()) {
-                const size_t nbytes  = ggml_nbytes(src0);
-                const size_t layout  = ggml_cann_kq_layout_size(src0, path);
-                void *       h_raw   = malloc(nbytes);
-                void *       h_frac  = malloc(layout);
-                ACL_CHECK(aclrtMemcpy(h_raw, nbytes, src0->data, nbytes, ACL_MEMCPY_DEVICE_TO_HOST));
-                ggml_backend_cann_transform_kq_pub(src0, h_raw, h_frac);
+                const int64_t  n_elems = ggml_nelements(src0);
+                const int64_t  groups  = n_elems / 32; /* QK8_0 */
+                const size_t   nbytes  = ggml_nbytes(src0);
+                const size_t   layout  = ggml_cann_kq_layout_size(src0, path);
+
+                /* D2H: read the planar-format data */
+                void * h_planar = malloc(nbytes);
+                ACL_CHECK(aclrtMemcpy(h_planar, nbytes, src0->data, nbytes, ACL_MEMCPY_DEVICE_TO_HOST));
+
+                /* planar -> block reassembly: quants[0..n_elems) + scales[0..groups) -> block[i] = {d, qs[32]} */
+                const uint8_t *  planar_q = (const uint8_t *) h_planar;
+                const uint16_t * planar_s = (const uint16_t *) ((const char *) h_planar + n_elems);
+                void *           h_block = malloc(nbytes);
+                for (int64_t i = 0; i < groups; ++i) {
+                    char *     blk = (char *) h_block + i * 34; /* sizeof(block_q8_0) = 2+32 */
+                    uint16_t   d   = planar_s[i];
+                    memcpy(blk, &d, 2);
+                    memcpy(blk + 2, planar_q + i * 32, 32);
+                }
+                free(h_planar);
+
+                /* block format -> fractal */
+                void * h_frac = malloc(layout);
+                ggml_backend_cann_transform_kq_pub(src0, h_block, h_frac);
+                free(h_block);
+
+                /* upload the fractal data to a separate device buffer */
                 void * d_frac = nullptr;
                 ACL_CHECK(aclrtMalloc(&d_frac, layout, ACL_MEM_MALLOC_HUGE_FIRST));
                 ACL_CHECK(aclrtMemcpy(d_frac, layout, h_frac, layout, ACL_MEMCPY_HOST_TO_DEVICE));
-                free(h_raw);
                 free(h_frac);
                 s_fractal_cache[src0->data] = d_frac;
-                GGML_LOG_DEBUG("lm_head lazy transform: '%s' %zuB -> fractal %zuB (cached)\n", wname.c_str(), nbytes,
-                               layout);
+                GGML_LOG_DEBUG("lm_head lazy transform: '%s' %lld elems -> fractal %zuB (cached)\n",
+                               wname.c_str(), (long long) n_elems, layout);
                 weight_base = (char *) d_frac;
             } else {
                 weight_base = (char *) it->second;
