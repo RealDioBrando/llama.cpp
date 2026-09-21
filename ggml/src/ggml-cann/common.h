@@ -728,6 +728,28 @@ struct ggml_cann_tensor_cache {
 /**
  * @brief Context for managing CANN backend operations.
  */
+#ifdef ASCEND_310P
+struct ggml_cann_tied_output_weight_cache {
+    struct entry {
+        void * buffer = nullptr;
+        size_t size   = 0;
+
+        ~entry() {
+            if (buffer != nullptr) {
+                ACL_CHECK(aclrtFree(buffer));
+            }
+        }
+    };
+
+    std::map<const ggml_tensor *, std::unique_ptr<entry>> entries;
+};
+
+ggml_cann_tied_output_weight_cache * ggml_cann_tied_output_weight_cache_from_tensor(const ggml_tensor * tensor);
+bool ggml_cann_prepare_tied_output_weight(const ggml_tensor * tensor,
+                                          ggml_cann_tied_output_weight_cache * cache,
+                                          int device);
+#endif
+
 struct ggml_backend_cann_context {
     int32_t     device;               /**< Device ID. */
     std::string name;                 /**< Name of the device. */

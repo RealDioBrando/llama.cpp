@@ -1013,6 +1013,9 @@ struct ggml_backend_cann_buffer_context {
 
     std::mutex tracker_mutex;   ///< Protects the trackers map
     std::unordered_map<void *, std::unique_ptr<TensorSetTracker>> trackers;
+#ifdef ASCEND_310P
+    ggml_cann_tied_output_weight_cache tied_output_weight_cache;
+#endif
 
     /**
      * @brief Constructor to initialize the CANN buffer context.
@@ -1092,6 +1095,21 @@ static const char * ggml_backend_cann_buffer_type_name(ggml_backend_buffer_type_
 static bool ggml_backend_buft_is_cann(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cann_buffer_type_name;
 }
+
+#ifdef ASCEND_310P
+ggml_cann_tied_output_weight_cache * ggml_cann_tied_output_weight_cache_from_tensor(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->buffer == nullptr) {
+        return nullptr;
+    }
+
+    if (!ggml_backend_buft_is_cann(ggml_backend_buffer_get_type(tensor->buffer))) {
+        return nullptr;
+    }
+
+    auto * ctx = (ggml_backend_cann_buffer_context *) tensor->buffer->context;
+    return ctx != nullptr ? &ctx->tied_output_weight_cache : nullptr;
+}
+#endif
 
 /**
  * @brief Free resources associated with a CANN buffer.
@@ -1783,6 +1801,9 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
     // Plain tensor (not quantized, not NZ): direct copy, no tracking needed
     if (!is_quantized && !is_nz) {
         ACL_CHECK(aclrtMemcpy((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
+#ifdef ASCEND_310P
+        ggml_cann_prepare_tied_output_weight(tensor, &ctx->tied_output_weight_cache, ctx->device);
+#endif
         return;
     }
 
@@ -1830,6 +1851,10 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
         if (is_nz) {
             weight_format_to_nz(tensor, ctx->device);
         }
+
+#ifdef ASCEND_310P
+        ggml_cann_prepare_tied_output_weight(tensor, &ctx->tied_output_weight_cache, ctx->device);
+#endif
 
         // Unlock before removing tracker, as remove_tracker destroys the mutex
         lock.unlock();
