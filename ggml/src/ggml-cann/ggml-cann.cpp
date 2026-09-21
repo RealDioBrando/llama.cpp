@@ -26,6 +26,8 @@
 #include "ggml-backend.h"
 #include "ggml-cann/aclnn_ops.h"
 #include "ggml-cann/paged_attn.h"
+#include "ggml-cann/moe_ops.h"
+#include "ggml-cann/moe_fused_ops.h"
 #include "ggml-cann/common.h"
 #include "ggml-cann/weight_layout.h"
 #include "ggml-impl.h"
@@ -1793,8 +1795,6 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
             free(transform_buffer);
         } else {
             // NZ weight
-            GGML_ASSERT(tensor->ne[2] == 1);
-            GGML_ASSERT(tensor->ne[3] == 1);
             ACL_CHECK(aclrtMemcpy(tensor->data, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
             weight_format_to_nz(tensor, ctx->device);
         }
@@ -1828,8 +1828,6 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
         }
 
         if (is_nz) {
-            GGML_ASSERT(tensor->ne[2] == 1);
-            GGML_ASSERT(tensor->ne[3] == 1);
             weight_format_to_nz(tensor, ctx->device);
         }
 
@@ -2423,7 +2421,12 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
             ggml_cann_mul_mat(ctx, dst);
             break;
         case GGML_OP_MUL_MAT_ID:
-            ggml_cann_mul_mat_id(ctx, dst);
+            if (parse_bool(get_env_as_lowercase("GGML_CANN_MOE_GROUPED").value_or("off")) &&
+                ggml_cann_mul_mat_id_grouped_supported(dst)) {
+                ggml_cann_mul_mat_id_grouped(ctx, dst);
+            } else {
+                ggml_cann_mul_mat_id(ctx, dst);
+            }
             break;
         case GGML_OP_SCALE:
             ggml_cann_scale(ctx, dst);
@@ -2949,14 +2952,32 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
     static bool opt_fusion = parse_bool(get_env_as_lowercase("GGML_CANN_OPERATOR_FUSION").value_or(""));
 
     if (!use_cann_graph || cann_graph_capture_required) {
+        int fused_until = -1;
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
+            if (i <= fused_until) {
+                if (i == fused_until) {
+                    fused_until = -1;
+                }
+                continue;
+            }
+
             if (opt_fusion) {
                 if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM })) {
                     ggml_cann_op_add_rms_norm_fused(*cann_ctx, node, cgraph->nodes[i + 1]);
                     i++;
                     continue;
                 }
+            }
+
+            if (ggml_cann_moe_router_fused(*cann_ctx, cgraph, i, &fused_until)) {
+                continue;
+            }
+            if (ggml_cann_moe_gate_up_fused(*cann_ctx, cgraph, i, &fused_until)) {
+                continue;
+            }
+            if (ggml_cann_moe_down_unpermute_fused(*cann_ctx, cgraph, i, &fused_until)) {
+                continue;
             }
 
             if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
