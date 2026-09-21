@@ -26,6 +26,9 @@
 #include "acl_tensor.h"
 #include "common.h"
 
+/* R2 lm_head NPU: lazy fractal transform for tied embeddings (from ggml-cann.cpp) */
+void ggml_backend_cann_transform_kq_pub(ggml_tensor * tensor, const void * src, void * dst);
+
 #include <cstdlib>
 
 #include <aclnnop/aclnn_abs.h>
