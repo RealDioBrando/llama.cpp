@@ -6,6 +6,7 @@
 #include "llama-adapter.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 #include <memory>
 #include <set>
@@ -23,10 +24,12 @@ struct llama_memory_context_i;
 
 class llama_kv_cache_context;
 class llama_kv_cache_dsa_context;
+class llama_kv_cache_dsa_iswa_context;
 class llama_kv_cache_msa_context;
 class llama_kv_cache_dsv4_raw_context;
 class llama_kv_cache_dsv4_context;
 class llama_kv_cache_iswa_context;
+class llama_kv_cache_paged_context;
 class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
@@ -374,6 +377,9 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    // like can_reuse, but does not re-bind mctx
+    bool can_reuse_impl(const llm_graph_params & params);
+
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
@@ -405,6 +411,9 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    // like can_reuse, but does not re-bind mctx
+    bool can_reuse_impl(const llm_graph_params & params);
+
     ggml_tensor * get_k_idxs_mla() const { return self_k_idxs_mla; }
     ggml_tensor * get_k_idxs_lid() const { return self_k_idxs_lid; }
 
@@ -425,6 +434,32 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_dsa_context * mctx;
+};
+
+// DSA input (full-attention layers + indexer) with K-only input for the SWA layers
+class llm_graph_input_attn_k_dsa_iswa : public llm_graph_input_i {
+public:
+    llm_graph_input_attn_k_dsa_iswa(
+            std::unique_ptr<llm_graph_input_attn_k_dsa> inp_dsa,
+            std::unique_ptr<llm_graph_input_attn_k>     inp_swa,
+            const llama_kv_cache_dsa_iswa_context *     mctx) :
+        inp_dsa(std::move(inp_dsa)),
+        inp_swa(std::move(inp_swa)),
+        mctx(mctx) {
+    }
+    ~llm_graph_input_attn_k_dsa_iswa() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    llm_graph_input_attn_k_dsa * get_dsa() const { return inp_dsa.get(); }
+    llm_graph_input_attn_k     * get_swa() const { return inp_swa.get(); }
+
+    std::unique_ptr<llm_graph_input_attn_k_dsa> inp_dsa;
+    std::unique_ptr<llm_graph_input_attn_k>     inp_swa;
+
+    const llama_kv_cache_dsa_iswa_context * mctx;
 };
 
 // standard K/V attention input against the base cache, plus destination indices for the indexer key cache
@@ -530,6 +565,36 @@ public:
     const llama_cparams cparams;
 
     const llama_kv_cache_iswa_context * mctx;
+};
+
+class llm_graph_input_attn_kv_paged : public llm_graph_input_i {
+public:
+    llm_graph_input_attn_kv_paged(
+            const llama_hparams & hparams,
+            const llama_cparams & cparams,
+            const llama_kv_cache_paged_context * mctx) :
+        hparams(hparams),
+        cparams(cparams),
+        mctx(mctx) {
+    }
+    ~llm_graph_input_attn_kv_paged() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    // The tensors the attention kernel will actually use
+    ggml_tensor * paged_write_slots   = nullptr;
+    ggml_tensor * paged_block_table   = nullptr;
+    ggml_tensor * paged_context_lens  = nullptr;
+    ggml_tensor * paged_batch_offsets = nullptr;
+    ggml_tensor * paged_batch_lens    = nullptr;
+
+    const llama_hparams hparams;
+    const llama_cparams cparams;
+
+    int32_t last_n_tokens;
+
+    const llama_kv_cache_paged_context * mctx;
 };
 
 // DSV4 raw graph inputs are SWA-only, but their mask may be stream-shaped
@@ -1046,6 +1111,19 @@ struct llm_graph_context {
                   int64_t   n_head_kv,
                       int   il) const;
 
+    // Set reshape to false to return contiguous projections before clamp/reshape.
+    llm_graph_qkv build_qkv(
+        const llama_layer & layer,
+              ggml_tensor * cur,
+                  int64_t   n_embd_head_q,
+                  int64_t   n_head_q,
+                  int64_t   n_embd_head_k,
+                  int64_t   n_head_k,
+                  int64_t   n_embd_head_v,
+                  int64_t   n_head_v,
+                      int   il,
+                     bool   reshape = true) const;
+
     ggml_tensor * build_ffn(
              ggml_tensor * cur,
              ggml_tensor * up,
@@ -1130,6 +1208,21 @@ struct llm_graph_context {
     // attention
     //
 
+    ggml_tensor * build_attn_mha_paged(
+             ggml_tensor * q,               // [n_embd_head, n_head, n_tokens]
+             ggml_tensor * k_cur,           // [n_embd_head, n_head_kv, n_tokens]
+             ggml_tensor * v_cur,           // [n_embd_head, n_head_kv, n_tokens]
+             ggml_tensor * k_cache,         // master K buffer
+             ggml_tensor * v_cache,         // master V buffer
+             ggml_tensor * block_table,     // [max_blocks, batch_size]
+             ggml_tensor * write_slots,     // [n_tokens]
+             ggml_tensor * context_lens,    // [batch_size]
+             ggml_tensor * batch_offsets,   // [batch_size]
+             ggml_tensor * batch_lens,      // [batch_size]
+                   float   kq_scale,
+                     int   block_size,
+                     int   max_blocks) const;
+
     ggml_tensor * build_attn_mha(
             ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]
@@ -1138,6 +1231,7 @@ struct llm_graph_context {
             ggml_tensor * kq_mask,
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+                int64_t   n_kv_max,
                   float   kq_scale,
                     int   il) const;
 
@@ -1158,6 +1252,22 @@ struct llm_graph_context {
                     int   il) const;
 
     llm_graph_input_attn_kv * build_attn_inp_kv() const;
+
+    llm_graph_input_i * build_attn_inp_kv_auto() const;
+
+    ggml_tensor * build_attn(
+            llm_graph_input_i    * inp,
+            ggml_tensor          * wo,
+            ggml_tensor          * wo_b,
+            ggml_tensor          * wo_s,
+            ggml_tensor          * q_cur,
+            ggml_tensor          * k_cur,
+            ggml_tensor          * v_cur,
+            ggml_tensor          * kq_b,
+            ggml_tensor          * sinks,
+            ggml_tensor          * v_mla,
+            float                  kq_scale,
+            int                    il) const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,
@@ -1191,6 +1301,8 @@ struct llm_graph_context {
 
     llm_graph_input_attn_k_dsa * build_attn_inp_k_dsa() const;
 
+    llm_graph_input_attn_k_dsa_iswa * build_attn_inp_k_dsa_iswa() const;
+
     llm_graph_input_attn_kv_msa * build_attn_inp_kv_msa(bool msa_enabled) const;
 
     ggml_tensor * build_attn(
@@ -1209,6 +1321,8 @@ struct llm_graph_context {
                     int   il) const;
 
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
+
+    llm_graph_input_attn_kv_paged * build_attn_inp_kv_paged() const;
 
     llm_graph_input_dsv4 * build_inp_dsv4() const;
 
@@ -1233,6 +1347,21 @@ struct llm_graph_context {
     // note: the K cache is used as V (MLA-style attention)
     ggml_tensor * build_attn(
             llm_graph_input_attn_k_iswa * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens] optional
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens] optional
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks, // [n_head_q]
+            ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+                  float   kq_scale,
+                    int   il) const;
+
+
+    ggml_tensor * build_attn(
+            llm_graph_input_attn_kv_paged * inp,
             ggml_tensor * wo,
             ggml_tensor * wo_b,
             ggml_tensor * wo_s,
@@ -1338,3 +1467,4 @@ struct llm_graph_context {
 
 // TODO: better name
 int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t n_buckets, bool bidirectional);
+

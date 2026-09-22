@@ -136,6 +136,32 @@ struct ggml_cann_pool {
     virtual void free(void * ptr, size_t size) = 0;
 };
 
+#ifdef USE_ACL_GRAPH
+/**
+ * @brief Capture-time arena allocator support.
+ *
+ * While an ACL graph is being captured, ops allocate workspaces through
+ * ggml_cann_pool_alloc. The RAII scope frees them immediately, but the
+ * recorded graph references those addresses for its whole LRU lifetime.
+ * The arena routes capture-time allocations to graph-owned device blocks
+ * so the addresses stay valid across replays; the transient pool (a LIFO
+ * allocator) is left untouched during capture.
+ *
+ * Defined in ggml-cann.cpp. The active flag is thread-local.
+ */
+bool        ggml_cann_capture_pinning_active();
+void        ggml_cann_capture_pin_begin();
+void        ggml_cann_capture_pin_end(void * graph_key);
+void *      ggml_cann_capture_arena_alloc(size_t size, size_t * actual_size, size_t * block_idx);
+void        ggml_cann_capture_arena_free(size_t block_idx, size_t size);
+// Recycle pool for arena blocks: destroyed graphs return their blocks
+// here instead of freeing them, and new captures reuse them first. This
+// keeps the steady state free of device allocations.
+void        ggml_cann_arena_recycle_put(void * ptr, size_t size);
+void *      ggml_cann_arena_recycle_take(size_t min_size);
+void        ggml_cann_arena_recycle_release_all();
+#endif  // USE_ACL_GRAPH
+
 /**
  * @brief RAII wrapper for managing memory allocations from a CANN memory pool.
  */
@@ -143,6 +169,10 @@ struct ggml_cann_pool_alloc {
     ggml_cann_pool * pool        = nullptr; /**< Pointer to the memory pool. */
     void *           ptr         = nullptr; /**< Pointer to the allocated memory block. */
     size_t           actual_size = 0;       /**< Actual size of the allocated memory block. */
+#ifdef USE_ACL_GRAPH
+    bool             from_arena  = false;   /**< Allocated from the capture arena (graph lifetime). */
+    size_t           arena_block_idx = 0;   /**< Arena block index (for LIFO free on capture workspace). */
+#endif
 
     /**
      * @brief Default constructor.
@@ -167,6 +197,15 @@ struct ggml_cann_pool_alloc {
      */
     ~ggml_cann_pool_alloc() {
         if (ptr != nullptr) {
+#ifdef USE_ACL_GRAPH
+            if (from_arena) {
+                // Release the capture-time workspace back to its block so the
+                // next alloc reuses it (LIFO). The underlying blocks are still
+                // owned by the graph (returned to the recycle pool on death).
+                ggml_cann_capture_arena_free(arena_block_idx, actual_size);
+                return;
+            }
+#endif
             pool->free(ptr, actual_size);
         }
     }
@@ -179,6 +218,18 @@ struct ggml_cann_pool_alloc {
     void * alloc(size_t size) {
         GGML_ASSERT(pool != nullptr);
         GGML_ASSERT(ptr == nullptr);
+#ifdef USE_ACL_GRAPH
+        // Route to the capture arena while a graph is being captured, so
+        // the recorded workspace addresses stay valid for the graph's
+        // entire lifetime in the cache.
+        if (ggml_cann_capture_pinning_active()) {
+            size_t asize = 0;
+            ptr = ggml_cann_capture_arena_alloc(size, &asize, &arena_block_idx);
+            actual_size = asize;
+            from_arena = true;
+            return ptr;
+        }
+#endif
         ptr = pool->alloc(size, &this->actual_size);
         return ptr;
     }
@@ -241,23 +292,52 @@ struct ggml_graph_node_properties {
      * @return true if all fields match (excluding GGML_OP_VIEW); false otherwise.
      */
     bool has_matching_properties(ggml_tensor * node) {
+        // Strict address matching: every non-VIEW node's address (including
+        // all src addresses) must equal the value recorded at capture time.
+        // Per-layer splits can share the same node addresses (the allocator
+        // reuses buffers), so the src weight address is often the only
+        // signal that distinguishes layers. Tolerating address changes
+        // would let one layer's graph be replayed with another layer's
+        // weights.
         if (node->data != this->node_address && node->op != GGML_OP_VIEW) {
+            if (getenv("GGML_CANN_DEBUG_MATCH")) {
+                fprintf(stderr, "[MATCH-FAIL] op=%d name=%s: addr %p != %p\n",
+                    (int)node->op, ggml_get_name(node), node->data, this->node_address);
+            }
             return false;
         }
 
+        // src address check: strict for all non-VIEW nodes (upstream).
+
         if (node->op != this->node_op) {
+            if (getenv("GGML_CANN_DEBUG_MATCH")) {
+                fprintf(stderr, "[MATCH-FAIL] name=%s: op %d != %d\n",
+                    ggml_get_name(node), (int)node->op, (int)this->node_op);
+            }
             return false;
         }
 
         if (node->type != this->node_type) {
+            if (getenv("GGML_CANN_DEBUG_MATCH")) {
+                fprintf(stderr, "[MATCH-FAIL] name=%s: type %d != %d\n",
+                    ggml_get_name(node), (int)node->type, (int)this->node_type);
+            }
             return false;
         }
 
         for (int i = 0; i < GGML_MAX_DIMS; i++) {
             if (node->ne[i] != this->ne[i]) {
+                if (getenv("GGML_CANN_DEBUG_MATCH")) {
+                    fprintf(stderr, "[MATCH-FAIL] name=%s: ne[%d] %ld != %ld\n",
+                        ggml_get_name(node), i, (long)node->ne[i], (long)this->ne[i]);
+                }
                 return false;
             }
             if (node->nb[i] != this->nb[i]) {
+                if (getenv("GGML_CANN_DEBUG_MATCH")) {
+                    fprintf(stderr, "[MATCH-FAIL] name=%s: nb[%d] %ld != %ld\n",
+                        ggml_get_name(node), i, (long)node->nb[i], (long)this->nb[i]);
+                }
                 return false;
             }
         }
@@ -265,29 +345,60 @@ struct ggml_graph_node_properties {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             if (node->src[i]) {
                 if (node->src[i]->data != this->src_address[i] && node->op != GGML_OP_VIEW) {
+                    if (getenv("GGML_CANN_DEBUG_MATCH")) {
+                        fprintf(stderr, "[MATCH-FAIL] name=%s: src[%d] '%s' addr %p != %p\n",
+                            ggml_get_name(node), i, ggml_get_name(node->src[i]),
+                            node->src[i]->data, this->src_address[i]);
+                    }
                     return false;
                 }
 
                 if (node->src[i]->type != this->src_type[i]) {
+                    if (getenv("GGML_CANN_DEBUG_MATCH")) {
+                        fprintf(stderr, "[MATCH-FAIL] name=%s: src[%d] '%s' type %d != %d\n",
+                            ggml_get_name(node), i, ggml_get_name(node->src[i]),
+                            (int)node->src[i]->type, (int)this->src_type[i]);
+                    }
                     return false;
                 }
 
                 for (int d = 0; d < GGML_MAX_DIMS; d++) {
                     if (node->src[i]->ne[d] != this->src_ne[i][d]) {
+                        if (getenv("GGML_CANN_DEBUG_MATCH")) {
+                            fprintf(stderr, "[MATCH-FAIL] name=%s: src[%d] '%s' ne[%d] %ld != %ld\n",
+                                ggml_get_name(node), i, ggml_get_name(node->src[i]),
+                                d, (long)node->src[i]->ne[d], (long)this->src_ne[i][d]);
+                        }
                         return false;
                     }
                     if (node->src[i]->nb[d] != this->src_nb[i][d]) {
+                        if (getenv("GGML_CANN_DEBUG_MATCH")) {
+                            fprintf(stderr, "[MATCH-FAIL] name=%s: src[%d] '%s' nb[%d] %ld != %ld\n",
+                                ggml_get_name(node), i, ggml_get_name(node->src[i]),
+                                d, (long)node->src[i]->nb[d], (long)this->src_nb[i][d]);
+                        }
                         return false;
                     }
                 }
             } else {
                 if (this->src_address[i] != nullptr) {
+                    if (getenv("GGML_CANN_DEBUG_MATCH")) {
+                        fprintf(stderr, "[MATCH-FAIL] name=%s: src[%d] now null, was %p\n",
+                            ggml_get_name(node), i, this->src_address[i]);
+                    }
                     return false;
                 }
             }
         }
 
-        return memcmp(this->op_params, node->op_params, GGML_MAX_OP_PARAMS) == 0;
+        if (memcmp(this->op_params, node->op_params, GGML_MAX_OP_PARAMS) != 0) {
+            if (getenv("GGML_CANN_DEBUG_MATCH")) {
+                fprintf(stderr, "[MATCH-FAIL] name=%s: op_params differ (op=%d)\n",
+                    ggml_get_name(node), (int)node->op);
+            }
+            return false;
+        }
+        return true;
     }
 };
 
@@ -296,9 +407,23 @@ struct ggml_cann_graph {
         if (graph != nullptr) {
             ACL_CHECK(aclmdlRIDestroy(graph));
         }
+    // Return the arena blocks owned by this graph to the recycle pool.
+#ifdef USE_ACL_GRAPH
+        for (auto & [ptr, size] : arena_blocks) {
+            ggml_cann_arena_recycle_put(ptr, size);
+        }
+        arena_blocks.clear();
+#endif
     }
 
     aclmdlRI graph = nullptr;
+
+    // Arena blocks owned by this graph. During capture, pool_alloc routes
+    // to a per-capture arena whose blocks are transferred here at
+    // CaptureEnd. On graph destruction the blocks go to the recycle pool.
+#ifdef USE_ACL_GRAPH
+    std::vector<std::pair<void *, size_t>> arena_blocks;
+#endif
 
     std::vector<ggml_graph_node_properties> ggml_graph_properties;
 
@@ -389,9 +514,33 @@ struct ggml_cann_graph {
 struct ggml_cann_graph_lru_cache {
     size_t capacity;                         /**< Maximum number of graphs in the cache. */
 
+    size_t budget_bytes = 0;                 /**< Max arena bytes held by cached graphs (0 = unlimited). */
+    size_t arena_bytes  = 0;                 /**< Current arena bytes held by cached graphs. */
+
     std::list<ggml_cann_graph *> cache_list; /**< List storing cached graphs as raw pointers. */
 
-    ggml_cann_graph_lru_cache() { capacity = parse_integer(get_env_as_lowercase("GGML_CANN_GRAPH_CACHE_CAPACITY").value_or("12")); }
+    ggml_cann_graph_lru_cache() {
+        // The default must comfortably exceed the number of distinct graph
+        // splits the scheduler produces per decode step (one cached graph
+        // per split). Too small a cache constantly evicts in-use graphs
+        // and degenerates into recapture every step.
+        capacity = parse_integer(get_env_as_lowercase("GGML_CANN_GRAPH_CACHE_CAPACITY").value_or("64"));
+
+        // Optional device-memory budget (MB) for the arena blocks pinned by
+        // cached graphs. 0 keeps the previous unbounded behavior. When set,
+        // LRU graphs are evicted (and their recycled blocks freed) until the
+        // total fits the budget, capping the graph-capture memory footprint.
+        size_t budget_mb = parse_integer(get_env_as_lowercase("GGML_CANN_GRAPH_CACHE_BUDGET").value_or("0"));
+        budget_bytes     = budget_mb * 1024 * 1024;
+    }
+
+    static size_t arena_bytes_of(ggml_cann_graph * g) {
+        size_t total = 0;
+        for (auto & [ptr, size] : g->arena_blocks) {
+            total += size;
+        }
+        return total;
+    }
 
     /**
      * @brief Push a new graph to the front of the cache.
@@ -403,9 +552,26 @@ struct ggml_cann_graph_lru_cache {
         if (cache_list.size() >= capacity) {
             ggml_cann_graph * old = cache_list.back();
             cache_list.pop_back();
+            arena_bytes -= arena_bytes_of(old);
+            if (getenv("GGML_CANN_DEBUG_DECISION")) {
+                fprintf(stderr, "[GDEC] EVICT arena_blocks=%zu\n", old->arena_blocks.size());
+            }
             delete old;  // free the old graph
         }
         cache_list.push_front(new_node);
+        arena_bytes += arena_bytes_of(new_node);
+
+        // Memory budget: evict LRU graphs and release their recycled blocks
+        // until the pinned arena fits. Keep at least one graph cached.
+        if (budget_bytes > 0) {
+            while (arena_bytes > budget_bytes && cache_list.size() > 1) {
+                ggml_cann_graph * old = cache_list.back();
+                cache_list.pop_back();
+                arena_bytes -= arena_bytes_of(old);
+                delete old;
+            }
+            ggml_cann_arena_recycle_release_all();
+        }
     }
 
     /**
@@ -416,6 +582,7 @@ struct ggml_cann_graph_lru_cache {
             delete ptr;
         }
         cache_list.clear();
+        arena_bytes = 0;
     }
 
     /**
@@ -435,12 +602,18 @@ struct ggml_cann_graph_lru_cache {
      * @return true if found; false otherwise.
      */
     bool find_and_move_to_front(ggml_cgraph * cgraph) {
+        size_t idx = 0;
         for (auto & graph_ptr : this->cache_list) {
             if (graph_ptr->matches_cgraph(cgraph)) {
+                if (getenv("GGML_CANN_DEBUG_DECISION")) {
+                    fprintf(stderr, "[GDEC] MATCH idx=%zu cache=%zu nodes=%d\n",
+                        idx, this->cache_list.size(), (int) cgraph->n_nodes);
+                }
                 cache_list.remove(graph_ptr);
                 cache_list.push_front(graph_ptr);
                 return true;
             }
+            idx++;
         }
         return false;
     }
@@ -555,6 +728,28 @@ struct ggml_cann_tensor_cache {
 /**
  * @brief Context for managing CANN backend operations.
  */
+#ifdef ASCEND_310P
+struct ggml_cann_tied_output_weight_cache {
+    struct entry {
+        void * buffer = nullptr;
+        size_t size   = 0;
+
+        ~entry() {
+            if (buffer != nullptr) {
+                ACL_CHECK(aclrtFree(buffer));
+            }
+        }
+    };
+
+    std::map<const ggml_tensor *, std::unique_ptr<entry>> entries;
+};
+
+ggml_cann_tied_output_weight_cache * ggml_cann_tied_output_weight_cache_from_tensor(const ggml_tensor * tensor);
+bool ggml_cann_prepare_tied_output_weight(const ggml_tensor * tensor,
+                                          ggml_cann_tied_output_weight_cache * cache,
+                                          int device);
+#endif
+
 struct ggml_backend_cann_context {
     int32_t     device;               /**< Device ID. */
     std::string name;                 /**< Name of the device. */
@@ -564,6 +759,8 @@ struct ggml_backend_cann_context {
     /// Cached CANN ACL graph used for executing the current ggml computation graph.
     ggml_cann_graph_lru_cache graph_lru_cache;
     bool                      acl_graph_mode = true;
+    bool                      piecewise_mode = false;
+    bool                      capturing       = false;   /**< true between CaptureBegin/End. */
 #endif
     bool                   async_mode;
     // Rope Cache
@@ -584,8 +781,12 @@ struct ggml_backend_cann_context {
 
 #ifdef USE_ACL_GRAPH
         acl_graph_mode = parse_bool(get_env_as_lowercase("GGML_CANN_ACL_GRAPH").value_or("on"));
+        piecewise_mode = parse_bool(get_env_as_lowercase("GGML_CANN_PIECEWISE").value_or(""));
         GGML_LOG_INFO("%s: device %d execution mode is %s (%s)\n", __func__, device, acl_graph_mode ? "GRAPH" : "EAGER",
                       acl_graph_mode ? "acl graph enabled" : "acl graph disabled");
+        if (piecewise_mode) {
+            GGML_LOG_INFO("%s: piecewise mode enabled (attention eager, rest graph)\n", __func__);
+        }
 #endif
     }
 

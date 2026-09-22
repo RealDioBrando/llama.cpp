@@ -21,6 +21,11 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    uint32_t block_size;
+    uint32_t n_gpu_blocks;
+    uint32_t n_cpu_blocks;
+    float    kv_paged_watermark;
+
     float rope_freq_base;
     float rope_freq_scale;
 
@@ -52,11 +57,13 @@ struct llama_cparams {
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
     bool kv_unified;
+    bool kv_paged;
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;
+    enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;
 
     ggml_backend_sched_eval_callback cb_eval;

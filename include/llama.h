@@ -43,10 +43,10 @@
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
 
 #define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
-#define LLAMA_SESSION_VERSION 9
+#define LLAMA_SESSION_VERSION 10
 
 #define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
-#define LLAMA_STATE_SEQ_VERSION 2
+#define LLAMA_STATE_SEQ_VERSION 3
 
 #ifdef __cplusplus
 extern "C" {
@@ -62,6 +62,8 @@ extern "C" {
     struct llama_model;
     struct llama_context;
     struct llama_sampler;
+
+    struct llama_paged_scheduler;
 
     typedef struct llama_memory_i * llama_memory_t;
 
@@ -214,6 +216,12 @@ extern "C" {
     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
     LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
 
+    enum llama_lazy_mode {
+        LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
+        LLAMA_LAZY_MODE_AUTO = 1, // lazy only for marked tensors larger than 4 GiB (requires mmap)
+        LLAMA_LAZY_MODE_ON   = 2, // read the rows of tensors marked by the arch on demand (requires mmap)
+    };
+
     enum llama_context_type {
         LLAMA_CONTEXT_TYPE_DEFAULT = 0,
         LLAMA_CONTEXT_TYPE_MTP     = 1,
@@ -263,6 +271,22 @@ extern "C" {
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
     } llama_batch;
+
+    // CPU-side metadata produced by the paged scheduler and consumed by
+    // llama_kv_cache_paged_context during graph build. These arrays are owned
+    // by the scheduler and must remain valid until the next scheduler step
+    // clears them.
+    typedef struct llama_paged_batch_info {
+        int32_t   n_blocks_per_seq;
+        int32_t   n_seq;
+        int32_t   n_tokens;
+
+        int32_t * write_slots;  // [n_tokens]
+        int32_t * block_table;  // [n_seq * n_blocks_per_seq]
+        int32_t * context_lens;  // [n_seq]
+        int32_t * batch_offsets;  // [n_seq]
+        int32_t * batch_lens;  // [n_seq]
+    } llama_paged_batch_info;
 
     enum llama_model_kv_override_type {
         LLAMA_KV_OVERRIDE_TYPE_INT,
@@ -314,6 +338,8 @@ extern "C" {
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
         enum llama_load_mode  load_mode;  // how to load the model
+
+        enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
@@ -399,6 +425,14 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
 
+        // Paged KV cache (experimental)
+        // Opt-in block-indexing KV cache with continuous-batching scheduling
+        bool     kv_paged;           // enable paged KV cache
+        uint32_t block_size;         // tokens per physical KV block
+        uint32_t n_gpu_blocks;       // GPU block pool size
+        uint32_t n_cpu_blocks;       // CPU block pool size for swap-out
+        float    kv_paged_watermark; // percentage of GPU blocks reserved as safety margin [0, 0.1)
+
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
@@ -437,6 +471,7 @@ extern "C" {
         const struct llama_model_kv_override * kv_overrides;        // pointer to kv overrides
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
         const int32_t * prune_layers;                               // pointer to layer indices to prune
+        size_t max_buf_size;                                        // max bytes of tensor rows kept in memory at once, 0 = default (8 GiB)
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {
@@ -733,7 +768,7 @@ extern "C" {
 
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
-    // seq_id < 0 : match any sequence
+    // seq_id < 0 : match any sequence [TAG_LLAMA_SEQ_ID_NEG]
     // p0 < 0     : [0,  p1]
     // p1 < 0     : [p0, inf)
     LLAMA_API bool llama_memory_seq_rm(
@@ -1348,7 +1383,7 @@ extern "C" {
     LLAMA_API struct llama_sampler * llama_sampler_chain_get(      struct llama_sampler * chain, int32_t i);
 
     // the total number of samplers in the chain
-    LLAMA_API int                    llama_sampler_chain_n  (const struct llama_sampler * chain);
+    LLAMA_API int32_t                llama_sampler_chain_n  (const struct llama_sampler * chain);
 
     // after removing a sampler, the chain will no longer own it, and it will not be freed when the chain is freed
     LLAMA_API struct llama_sampler * llama_sampler_chain_remove(   struct llama_sampler * chain, int32_t i);
@@ -1622,6 +1657,60 @@ extern "C" {
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
 
+    //
+    // Paged inference
+    //
+    struct llama_paged_seq_state {
+        int32_t request_id;
+        int32_t n_prompt;
+        int32_t n_prompt_total;
+        int32_t n_decoded;
+        int32_t n_past;
+        int64_t t_arrival_us;
+        int64_t t_first_token_us;
+    };
+
+    typedef void (*llama_paged_on_finish_cb)(int32_t             request_id,
+                                             const llama_token * tokens,
+                                             int32_t             n_tokens,
+                                             void *              user_data);
+    LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama_context * ctx);
+    LLAMA_API void llama_paged_scheduler_free(struct llama_paged_scheduler * sched);
+
+    // Run one prefill and one decode with synthetic tokens, then release all
+    // warmup blocks. This warms backend and ATB kernels for the configured
+    // batch/ubatch shapes without affecting request timing.
+    LLAMA_API bool llama_paged_scheduler_warmup(struct llama_paged_scheduler * sched,
+                                                struct llama_context *         ctx);
+
+    // Queueing and stepping.
+    LLAMA_API bool llama_paged_scheduler_add_request(struct llama_paged_scheduler * sched,
+                                                     const llama_token *            tokens,
+                                                     int32_t                        n_tokens,
+                                                     int32_t                        request_id);
+
+    LLAMA_API bool llama_paged_scheduler_prepare_batch(struct llama_paged_scheduler * sched,
+                                                       struct llama_batch *           batch);
+
+    LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler * sched,
+                                                struct llama_batch *           batch,
+                                                const llama_token *            tokens,
+                                                const int8_t *                 stop_flags);
+
+    // Introspection.
+    LLAMA_API bool llama_paged_scheduler_get_seq_state(struct llama_paged_scheduler * sched,
+                                                       int32_t                        request_id,
+                                                       struct llama_paged_seq_state * out_state);
+
+    // Returns the current batch's paged routing metadata. Valid until the next
+    // call to llama_paged_scheduler_prepare_batch on this scheduler. Do not free.
+    LLAMA_API const struct llama_paged_batch_info * llama_paged_scheduler_get_batch_info(
+        const struct llama_paged_scheduler * sched);
+
+    // Optional finish callback.
+    LLAMA_API void llama_paged_scheduler_set_on_finish(struct llama_paged_scheduler * sched,
+                                                       llama_paged_on_finish_cb       cb,
+                                                       void *                         user_data);
 #ifdef __cplusplus
 }
 #endif
