@@ -33,10 +33,13 @@ string(TOUPPER ${SOC_TYPE_COMPILE_OPTION} SOC_TYPE_COMPILE_OPTION)
 message(STATUS "CANN: SOC_VERSION =  ${SOC_VERSION}")
 option(USE_ACL_GRAPH "Enable CANN graph execution (ACL graph mode)" OFF)
 
+# 310P aclgraph is experimental: validated on Ascend310P3 with CANN 9.1.0.
+# The other Ascend310P1-310P7 variants (same soc_version family) are
+# expected to work the same way but have not been tested.
 if(USE_ACL_GRAPH AND (SOC_TYPE_MAJOR_SN STREQUAL "310P" OR SOC_TYPE_COMPILE_OPTION STREQUAL "ASCEND_310P"))
-    message(FATAL_ERROR
-        "CANN Graph (ACL graph mode) is not supported on 310P devices. "
-        "Please build with -DUSE_ACL_GRAPH=OFF or use a supported SOC.")
+    message(WARNING
+        "CANN Graph (ACL graph mode) on 310P is experimental and not well tested. "
+        "If capture fails at runtime, rebuild with -DUSE_ACL_GRAPH=OFF.")
 endif()
 
 if (CANN_INSTALL_DIR)
@@ -74,6 +77,24 @@ if (CANN_INSTALL_DIR)
     target_link_directories(ggml-cann PRIVATE ${CANN_INSTALL_DIR}/lib64)
 
     target_compile_definitions(ggml-cann PRIVATE "-D${SOC_TYPE_COMPILE_OPTION}")
+
+    # ATB (Ascend Transformer Boost) ops for paged KV cache attention
+    set(ATB_HOME "/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1" CACHE PATH "Path to the ATB package")
+    if(EXISTS "${ATB_HOME}/lib/libatb.so")
+        target_include_directories(ggml-cann PRIVATE ${ATB_HOME}/include)
+        target_link_directories(ggml-cann PRIVATE ${ATB_HOME}/lib)
+        target_link_libraries(ggml-cann PRIVATE atb)
+        # propagate the path to consumers so they can resolve libatb's deps at link time,
+        # and keep an rpath so libggml-cann.so finds libatb.so at runtime
+        set_target_properties(ggml-cann PROPERTIES
+            INTERFACE_LINK_DIRECTORIES "${ATB_HOME}/lib"
+            BUILD_RPATH   "${ATB_HOME}/lib"
+            INSTALL_RPATH "${ATB_HOME}/lib")
+        target_compile_definitions(ggml-cann PRIVATE GGML_CANN_HAS_ATB)
+        message(STATUS "CANN: ATB enabled from ${ATB_HOME}")
+    else()
+        message(STATUS "CANN: ATB not found at ${ATB_HOME}, paged KV attention disabled")
+    endif()
 
     if (USE_ACL_GRAPH)
         target_compile_definitions(ggml-cann PRIVATE USE_ACL_GRAPH)

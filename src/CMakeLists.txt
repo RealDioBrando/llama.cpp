@@ -27,6 +27,13 @@ set(LLAMA_CORE_SOURCES
     llama-kv-cache-dsa-iswa.cpp
     llama-kv-cache-msa.cpp
     llama-kv-cache-dsv4.cpp
+    llama-kv-cache-paged.cpp
+    llama-block-manager.cpp
+    llama-paged-prefix-cache.cpp
+    llama-paged-scheduler.cpp
+    llama-paged-scheduler-impl.cpp
+    llama-memory-hybrid-paged.cpp
+    llama-hybrid-paged-graph.cpp
     llama-memory.cpp
     llama-memory-hybrid.cpp
     llama-memory-hybrid-iswa.cpp

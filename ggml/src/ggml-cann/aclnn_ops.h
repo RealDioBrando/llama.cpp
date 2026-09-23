@@ -26,7 +26,7 @@
 #include "acl_tensor.h"
 #include "common.h"
 
-/* R2 lm_head NPU: lazy fractal transform for tied embeddings (from ggml-cann.cpp) */
+/* lm_head NPU: lazy fractal transform for tied embeddings (implemented in ggml-cann.cpp) */
 void ggml_backend_cann_transform_kq_pub(ggml_tensor * tensor, const void * src, void * dst);
 
 #include <cstdlib>
@@ -619,6 +619,20 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst);
 void ggml_cann_rope_cache_preload(ggml_backend_cann_context & ctx, ggml_tensor * dst);
 
 /**
+ * @brief Warms a constant-tensor cache (device malloc + fill) OUTSIDE graph
+ * capture. Used by the capture path to pre-create the rms_norm ones/zeros
+ * constants so their first use never happens under capture.
+ */
+acl_tensor_ptr ggml_cann_warm_cache_acl_tensor(ggml_backend_cann_context & ctx,
+                                               void **                     buffer,
+                                               int64_t &                   cache_element,
+                                               int64_t *                   ne,
+                                               size_t *                    nb,
+                                               ggml_type                   dtype,
+                                               int64_t                     dims,
+                                               float                       value);
+
+/**
  * @brief   Computes the index of the maximum value along the specified dimension
  *          of a ggml tensor using the CANN backend.
  *
@@ -994,10 +1008,15 @@ void ggml_cann_op_add_rms_norm_fused(ggml_backend_cann_context & ctx,
 static bool is_matmul_weight(const ggml_tensor * tensor) {
     std::string                                  name = ggml_get_name(tensor);
     static const std::unordered_set<std::string> weight_suffixes{ "output.weight",      "attn_q.weight",
-                                                                   "attn_k.weight",      "attn_v.weight",
-                                                                   "attn_output.weight", "ffn_gate.weight",
-                                                                   "ffn_up.weight",      "ffn_down.weight",
-                                                                   "token_embd.weight" };
+                                                                  "attn_k.weight",      "attn_v.weight",
+                                                                  "attn_output.weight", "ffn_gate.weight",
+                                                                  "ffn_up.weight",      "ffn_down.weight",
+                                                                  // linear attention (GatedDeltaNet) projections.
+                                                                  // ssm_beta/ssm_alpha stay out: the W8A8 path
+                                                                  // diverges on these narrow [k, 16] weights.
+                                                                  "attn_qkv.weight",    "attn_gate.weight",
+                                                                  "ssm_out.weight",
+                                                                  "token_embd.weight" };
     /* token_embd.weight: tied-embedding lm_head (Qwen3.5 etc., no standalone
      * output.weight). Routing it to W8A8 requires the lazy transform: skip the
      * load-time transform (GET_ROWS needs the original Q8_0) and do the one-time

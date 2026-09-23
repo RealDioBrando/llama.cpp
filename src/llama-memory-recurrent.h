@@ -73,6 +73,8 @@ public:
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
+    uint32_t get_n_seq_max() const { return n_seq_max; }
+
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
