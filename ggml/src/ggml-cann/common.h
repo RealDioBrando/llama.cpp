@@ -726,6 +726,75 @@ struct ggml_cann_tensor_cache {
 };
 
 /**
+ * @brief Device-side index buffers for the gated delta net aclnn op calls.
+ *
+ * @details The aclnn op takes seq_lens and state_indices as device tensors.
+ *          Buffers are allocated ONCE at a fixed capacity and never
+ *          reallocated - a realloc on growth would invalidate device pointers
+ *          held by already-captured ACL graphs. Content is prefix-stable, so
+ *          graphs captured with a smaller batch keep reading valid data.
+ *          Growth needs a host-to-device copy and must happen outside of ACL
+ *          graph capture.
+ */
+struct ggml_cann_gdn_cache {
+    ~ggml_cann_gdn_cache() {
+        if (seq_lens != nullptr) {
+            ACL_CHECK(aclrtFree(seq_lens));
+        }
+        if (state_indices != nullptr) {
+            ACL_CHECK(aclrtFree(state_indices));
+        }
+        if (block_lens != nullptr) {
+            ACL_CHECK(aclrtFree(block_lens));
+        }
+        if (block_indices != nullptr) {
+            ACL_CHECK(aclrtFree(block_indices));
+        }
+    }
+
+    void *  seq_lens      = nullptr; /**< int32[max_batch], all ones (decode). */
+    void *  state_indices = nullptr; /**< int32[max_batch], value = index (decode). */
+    void *  block_lens    = nullptr; /**< int32[8] = {1..8}, a [1] view at (len-1) holds len. */
+    void *  block_indices = nullptr; /**< int32[max_batch*8], row b = [b]*8 (prefill blocks). */
+    int64_t max_batch     = 0;
+
+    /**
+     * @brief Grow the device index buffers to cover the given batch size.
+     */
+    void ensure_batch(int64_t batch) {
+        if (batch <= max_batch) {
+            return;
+        }
+        int32_t * host = (int32_t *) malloc(batch * 8 * sizeof(int32_t));
+        GGML_ASSERT(host != nullptr);
+        ACL_CHECK(aclrtMalloc(&seq_lens, batch * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST));
+        ACL_CHECK(aclrtMalloc(&state_indices, batch * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST));
+        ACL_CHECK(aclrtMalloc(&block_indices, batch * 8 * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST));
+        for (int64_t i = 0; i < batch; i++) {
+            host[i] = 1;
+        }
+        ACL_CHECK(aclrtMemcpy(seq_lens, batch * sizeof(int32_t), host, batch * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE));
+        for (int64_t i = 0; i < batch; i++) {
+            host[i] = (int32_t) i;
+        }
+        ACL_CHECK(aclrtMemcpy(state_indices, batch * sizeof(int32_t), host, batch * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE));
+        for (int64_t b = 0; b < batch; b++) {
+            for (int64_t i = 0; i < 8; i++) {
+                host[b * 8 + i] = (int32_t) b;
+            }
+        }
+        ACL_CHECK(aclrtMemcpy(block_indices, batch * 8 * sizeof(int32_t), host, batch * 8 * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE));
+        free(host);
+        if (block_lens == nullptr) {
+            int32_t lens[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+            ACL_CHECK(aclrtMalloc(&block_lens, 8 * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST));
+            ACL_CHECK(aclrtMemcpy(block_lens, 8 * sizeof(int32_t), lens, 8 * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE));
+        }
+        max_batch = batch;
+    }
+};
+
+/**
  * @brief Context for managing CANN backend operations.
  */
 #ifdef ASCEND_310P
@@ -768,6 +837,8 @@ struct ggml_backend_cann_context {
     // Constant Pool
     ggml_cann_tensor_cache rms_norm_one_tensor_cache;
     ggml_cann_tensor_cache rms_norm_zero_tensor_cache;
+    // Gated delta net index cache
+    ggml_cann_gdn_cache    gdn_cache;
 
     aclrtStream streams[GGML_CANN_MAX_STREAMS] = { nullptr }; /**< Array of streams for the device. */
 
