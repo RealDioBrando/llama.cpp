@@ -3615,16 +3615,17 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 return true;
             }
         case GGML_OP_SSM_CONV: {
-            // The 310P Conv2D output requires a FzToDst format conversion
-            // that costs far more than the conv itself at decode shapes.
-            // Route single-token (decode) convs to the CPU to avoid the
-            // conversion, and keep multi-token (prefill) convs on the NPU
-            // where the batch throughput outweighs it.
-            //   GGML_CANN_SSM_CONV=npu|cpu|auto (auto = shape-routed)
+            // Routing for the GDN causal conv on 310P. Historically "auto"
+            // sent single-token (decode) convs to the CPU because the old
+            // aclnnConvolution path paid a ~1.3 ms FzToDst weight repack per
+            // call. That no longer applies: the handler now prefers the
+            // vendor SsmConv1d custom op (verified, ppl-identical) and has a
+            // two-elementwise decode fast path as fallback — both avoid the
+            // Conv2D repack entirely. Decode convs on the CPU instead cost
+            // one backend split per GDN layer and blocked full-graph ACL
+            // capture, so auto now keeps every conv on the NPU.
+            //   GGML_CANN_SSM_CONV=npu|cpu|auto (auto = NPU for all shapes)
             //   GGML_CANN_SSM_CONV_OFF=1 is a legacy alias for cpu.
-            // Shape test: sx = concat(conv_states, qkv_mixed), so
-            // ne[0] == (d_conv - 1) + n_tokens; a single-token step has
-            // sx->ne[0] == kernel->ne[0].
             static const int conv_mode = []() {
                 const char * legacy = getenv("GGML_CANN_SSM_CONV_OFF");
                 if (legacy != nullptr && legacy[0] == '1') {
@@ -3635,18 +3636,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     if (mode[0] == 'c' || mode[0] == 'C' || mode[0] == '1') return 1;  // cpu
                     if (mode[0] == 'n' || mode[0] == 'N' || mode[0] == '0') return 2;  // npu
                 }
-                return 0;  // auto (shape-routed)
+                return 2;  // auto: NPU (custom op preferred, elementwise fallback)
             }();
             if (conv_mode == 1) {
-                return false;
-            }
-            if (conv_mode == 2) {
-                return true;
-            }
-            // auto: single-token conv -> CPU, multi-token -> NPU
-            const ggml_tensor * sx = op->src[0];
-            const ggml_tensor * kernel = op->src[1];
-            if (sx != nullptr && kernel != nullptr && sx->ne[0] == kernel->ne[0]) {
                 return false;
             }
             return true;
