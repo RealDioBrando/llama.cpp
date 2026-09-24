@@ -3156,11 +3156,26 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
         if (getenv("GGML_CANN_DEBUG_DECISION")) {
             static std::atomic<int> g_dec_call(0);
             int call_no = g_dec_call.fetch_add(1);
-            fprintf(stderr, "[GDEC] call#%d nodes=%d op0=%d cache=%zu -> %s\n",
+            fprintf(stderr, "[GDEC] call#%d nodes=%d op0=%d cache=%zu -> %s",
                 call_no, (int) cgraph->n_nodes,
                 (int) (cgraph->n_nodes > 0 ? cgraph->nodes[0]->op : -1),
                 cann_ctx->graph_lru_cache.cache_list.size(),
                 graph_capture_required ? "CAPTURE" : "REPLAY");
+            // op-name dump: GGML_CANN_DEBUG_DECISION=ops prints the full op
+            // sequence of each backend split (first 24 entries), used to map
+            // scheduler splits to concrete ops.
+            {
+                const char * dm = getenv("GGML_CANN_DEBUG_DECISION");
+                if (dm && strcmp(dm, "ops") == 0) {
+                    fprintf(stderr, " ops=[");
+                    for (int j = 0; j < cgraph->n_nodes && j < 24; j++) {
+                        fprintf(stderr, "%s%s", j ? "," : "",
+                            ggml_op_name(cgraph->nodes[j]->op));
+                    }
+                    fprintf(stderr, "]");
+                }
+            }
+            fprintf(stderr, "\n");
             fflush(stderr);
         }
 
