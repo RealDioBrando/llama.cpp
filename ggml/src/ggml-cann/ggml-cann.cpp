@@ -3168,7 +3168,7 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
                 const char * dm = getenv("GGML_CANN_DEBUG_DECISION");
                 if (dm && strcmp(dm, "ops") == 0) {
                     fprintf(stderr, " ops=[");
-                    for (int j = 0; j < cgraph->n_nodes && j < 24; j++) {
+                    for (int j = 0; j < cgraph->n_nodes && j < 96; j++) {
                         fprintf(stderr, "%s%s", j ? "," : "",
                             ggml_op_name(cgraph->nodes[j]->op));
                     }
