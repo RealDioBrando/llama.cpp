@@ -95,9 +95,11 @@
 #include <float.h>
 
 #include <atomic>
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <dlfcn.h>
 #include <exception>
 #include <string>
@@ -5189,10 +5191,10 @@ void ggml_cann_gated_linear_attn(ggml_backend_cann_context & ctx, ggml_tensor * 
 
 namespace {
 
-// aclnnRecurrentGatedDeltaRuleV310 ships in the custom op package
-// (libcust_opapi.so) instead of the toolkit's libopapi.so, so resolve it at
-// runtime. The dlopen handle leaks on purpose: the resolved symbols must stay
-// valid for the process lifetime.
+// aclnnRecurrentGatedDeltaRuleV310 / aclnnChunkGatedDeltaRuleV310 ship in the
+// custom op package (libcust_opapi.so) instead of the toolkit's libopapi.so,
+// so resolve them at runtime. The dlopen handle leaks on purpose: the resolved
+// symbols must stay valid for the process lifetime.
 struct gdn_v310_api {
     using get_workspace_size_t = aclnnStatus (*)(const aclTensor *, const aclTensor *, const aclTensor *,
                                                  const aclTensor *, aclTensor *, const aclTensor *,
@@ -5200,9 +5202,19 @@ struct gdn_v310_api {
                                                  const aclTensor *, float, aclTensor *, uint64_t *,
                                                  aclOpExecutor **);
     using run_t = aclnnStatus (*)(void *, uint64_t, aclOpExecutor *, aclrtStream);
+    using chunk_get_workspace_size_t = aclnnStatus (*)(const aclTensor *, const aclTensor *, const aclTensor *,
+                                                       const aclTensor *, const aclTensor *, const aclTensor *,
+                                                       const aclTensor *, float, const aclTensor *,
+                                                       const aclTensor *, uint64_t *, aclOpExecutor **);
 
-    get_workspace_size_t get_workspace_size = nullptr;
-    run_t                run                = nullptr;
+    get_workspace_size_t       get_workspace_size       = nullptr;
+    run_t                      run                      = nullptr;
+    chunk_get_workspace_size_t chunk_get_workspace_size = nullptr;
+    // The chunk executor must run through the chunk entry point. Both run
+    // functions forward to CommonOpExecutorRun today, but the binding must
+    // not rely on that - op-specific logic in either run would silently
+    // break the other path (wrong DFX attribution at minimum).
+    run_t                      chunk_run                = nullptr;
 };
 
 const gdn_v310_api & gdn_v310_symbols() {
@@ -5213,8 +5225,8 @@ const gdn_v310_api & gdn_v310_symbols() {
             const std::string paths(opp_path);
             size_t            pos = 0;
             while (pos < paths.size()) {
-                size_t       end  = paths.find(':', pos);
-                const size_t last = (end == std::string::npos) ? paths.size() : end;
+                size_t         end  = paths.find(':', pos);
+                const size_t   last = (end == std::string::npos) ? paths.size() : end;
                 const std::string entry = paths.substr(pos, last - pos);
                 if (!entry.empty()) {
                     candidates.push_back(entry + "/op_api/lib/libcust_opapi.so");
@@ -5237,6 +5249,14 @@ const gdn_v310_api & gdn_v310_symbols() {
             if (get_ws != nullptr && run != nullptr) {
                 result.get_workspace_size = get_ws;
                 result.run                = run;
+                result.chunk_get_workspace_size = (gdn_v310_api::chunk_get_workspace_size_t) dlsym(
+                    handle, "aclnnChunkGatedDeltaRuleV310GetWorkspaceSize");
+                // Resolve the chunk run whenever the chunk GetWS exists; the
+                // chunk branch requires BOTH symbols.
+                if (result.chunk_get_workspace_size != nullptr) {
+                    result.chunk_run = (gdn_v310_api::run_t) dlsym(
+                        handle, "aclnnChunkGatedDeltaRuleV310");
+                }
                 break;
             }
         }
@@ -5289,14 +5309,41 @@ bool ggml_cann_gdn_v310_available() {
     return gdn_v310_symbols().get_workspace_size != nullptr;
 }
 
+bool ggml_cann_gdn_chunk_v310_available() {
+    return gdn_v310_symbols().chunk_get_workspace_size != nullptr;
+}
+
 void ggml_cann_gdn_cache_preload(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
-    // grow the index buffers before capture, they need a host-to-device copy
+    // Prepare BOTH the buffer capacity and the prefill_lens ENTRY for this
+    // (batch, T) before capture - the first chunk prefill inside the capture
+    // interval must not issue the entry's H2D memcpy.
+    // T comes from the value tensor's token dim (same source the chunk branch
+    // uses at runtime); B from the batch dim.
     const int64_t b = dst->src[2]->ne[3];
-    ctx.gdn_cache.ensure_batch(b);
+    const int64_t t = dst->src[2]->ne[2];
+    ctx.gdn_cache.prepare_prefill(b, t);
 }
 
 // kernel MAX_MTP: a single kernel call processes at most 8 tokens per sequence
 constexpr int64_t GDN_PREFILL_BLOCK = 8;
+
+// prefill via the chunk kernel (single call for the whole batch) when its
+// symbols resolve; GGML_CANN_GDN_PREFILL_CHUNK=0 forces the block loop (A/B)
+static bool gdn_prefill_use_chunk() {
+    static bool use_chunk = parse_bool(get_env_as_lowercase("GGML_CANN_GDN_PREFILL_CHUNK").value_or("1"));
+    return use_chunk;
+}
+
+// Shape-eligibility mirror of the chunk host contract
+// (chunk_gated_delta_rule_v310_tiling.cpp CheckDerivedDimConstraints):
+// the backend accepts up to 256 heads but the chunk op only declares 64;
+// out-of-contract shapes must fall back to the recurrent loop, not fail the
+// graph at GetWorkspaceSize.
+static bool gdn_chunk_eligible(int64_t nk, int64_t nv, int64_t dk, int64_t dv) {
+    return nk > 0 && nv > 0 && nk <= 64 && nv <= 64 &&
+           dk > 0 && dv > 0 && dk <= 128 && dv <= 128 &&
+           dk % 16 == 0 && dv % 16 == 0 && nv % nk == 0;
+}
 
 void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * q     = dst->src[0];
@@ -5327,8 +5374,14 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
     ggml_cann_pool_alloc beta16_alloc(ctx.pool(), T * B * nv * sizeof(uint16_t));
     ggml_cann_pool_alloc state16_alloc(ctx.pool(), state_elems * sizeof(uint16_t));
     ggml_cann_pool_alloc out16_alloc(ctx.pool(), v_elems * sizeof(uint16_t));
-    // workspace must stay alive across the async op run, so it lives at
-    // function scope and is allocated per call below
+    // The chunk branch's final-state staging buffer must outlive the branch
+    // scope - state_final points into it and is read by the dst cast after
+    // the branch. Default-constructed here, allocated only when the chunk
+    // branch actually runs.
+    ggml_cann_pool_alloc state_out16_alloc(ctx.pool());
+    // Workspace must stay alive across the async op run (pool free notes all
+    // CANN ops run async). Default-constructed at function scope, allocated
+    // per call below.
     ggml_cann_pool_alloc workspace_allocator(ctx.pool());
 
     // q/k/v may be strided views (rows-contiguous), the cast gathers them into dense fp16
@@ -5352,11 +5405,14 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
     size_t  nb_state[4] = { sizeof(uint16_t), (size_t) dk * 2, (size_t) dk * dv * 2, (size_t) dk * dv * nv * 2 };
     size_t  nb_g[2]     = { sizeof(float), (size_t) nv * 4 };
 
-    // the prefill loop calls the op once per (sequence, 8-token block); a naive
-    // alloc() per call would trip the pool's assert on the second block, so
-    // allocate once at the first call and reuse for the rest (same stream,
-    // sequential submits; lifetime to the function end is guaranteed by the
-    // function-scope allocator)
+    // The recurrent fallback loop calls call_op once per (sequence, 8-token
+    // block); a naive alloc() per call hits ggml_cann_pool_alloc's
+    // GGML_ASSERT(ptr == nullptr) on the second block. Strategy: allocate
+    // ONCE at the first call, record the capacity, and let subsequent calls
+    // reuse the same address (their workspace requirement is bounded by the
+    // same 8-token block shape, and any smaller requirement fits). Same
+    // stream, sequential submits - lifetime to the function end is guaranteed
+    // by the function-scope allocator.
     uint64_t gdn_ws_allocated = 0;
     auto call_op = [&](aclTensor * q_t, aclTensor * k_t, aclTensor * v_t, aclTensor * beta_t, aclTensor * state_t,
                        aclTensor * seq_t, aclTensor * idx_t, aclTensor * g_t, aclTensor * out_t) {
@@ -5367,11 +5423,13 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
         void * workspace_addr = nullptr;
         if (workspace_size > 0) {
             if (gdn_ws_allocated == 0) {
+                // first call in this graph node: allocate at the (max) block size
                 workspace_addr = workspace_allocator.alloc(workspace_size);
                 gdn_ws_allocated = workspace_size;
             } else {
-                // subsequent blocks: reuse (the requirement is bounded by the
-                // same 8-token block shape)
+                // subsequent fallback blocks: reuse (workspace_size is bounded
+                // by the same shapes; GetWorkspaceSize is shape-driven so a
+                // smaller/equal request inside the same allocation is safe)
                 GGML_ASSERT(workspace_size <= gdn_ws_allocated);
                 workspace_addr = workspace_allocator.get();
             }
@@ -5380,6 +5438,10 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
     };
 
     ctx.gdn_cache.ensure_batch(B);
+
+    // buffer holding the final state after the branch runs (the recurrent op
+    // updates state16 in place, the chunk op writes a separate output)
+    void * state_final = state16_alloc.get();
 
     if (T == 1) {
         // decode: all B sequences (one token each) in a single call
@@ -5400,8 +5462,56 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
 
         call_op(acl_q16.get(), acl_k16.get(), acl_v16.get(), acl_beta16.get(), acl_state16.get(), acl_seq_lens.get(),
                 acl_state_indices.get(), acl_g.get(), acl_out16.get());
+    } else if (api.chunk_get_workspace_size != nullptr && api.chunk_run != nullptr && gdn_prefill_use_chunk() &&
+               gdn_chunk_eligible(nk, nv, dk, dv)) {
+        // prefill via the chunk kernel: one call for the whole batch. The kernel
+        // splits the T*B staged tokens by seq_lens ([T]*B, batch-major order),
+        // threads the state across its internal chunk groups and writes the
+        // final state to a separate output tensor.
+        // The branch requires BOTH chunk symbols (GetWS + run) and the shape
+        // eligibility mirror of the chunk host contract (NK/NV<=64, DK/DV<=128
+        // multiples of 16, NV%NK==0) - out-of-contract shapes (65..256 heads
+        // pass the backend check but would fail inside the op) fall through to
+        // the recurrent loop below instead of hard-failing the graph.
+        acl_tensor_ptr acl_q16       = ggml_cann_create_tensor(q16_alloc.get(), ACL_FLOAT16, sizeof(uint16_t), ne_qk, nb_qk, 3);
+        acl_tensor_ptr acl_k16       = ggml_cann_create_tensor(k16_alloc.get(), ACL_FLOAT16, sizeof(uint16_t), ne_qk, nb_qk, 3);
+        acl_tensor_ptr acl_v16       = ggml_cann_create_tensor(v16_alloc.get(), ACL_FLOAT16, sizeof(uint16_t), ne_v, nb_v, 3);
+        acl_tensor_ptr acl_out16     = ggml_cann_create_tensor(out16_alloc.get(), ACL_FLOAT16, sizeof(uint16_t), ne_v, nb_v, 3);
+        acl_tensor_ptr acl_beta16    = ggml_cann_create_tensor(beta16_alloc.get(), ACL_FLOAT16, sizeof(uint16_t), ne_beta, nb_beta, 2);
+        acl_tensor_ptr acl_state16   = ggml_cann_create_tensor(state16_alloc.get(), ACL_FLOAT16, sizeof(uint16_t), ne_state, nb_state, 4);
+        acl_tensor_ptr acl_g         = ggml_cann_create_tensor(g->data, ACL_FLOAT, sizeof(float), ne_beta, nb_g, 2);
+
+        // Allocated on the function-scope allocator declared next to the other
+        // staging buffers; the pointer stays valid through the dst cast after
+        // this branch.
+        state_out16_alloc.alloc(state_elems * sizeof(uint16_t));
+        acl_tensor_ptr acl_state_out16 = ggml_cann_create_tensor(state_out16_alloc.get(), ACL_FLOAT16, sizeof(uint16_t), ne_state, nb_state, 4);
+
+        // per-node (batch, t) lookup: the entry was created by the preload
+        // (or an earlier eager call) and is never rewritten, so inside a
+        // captured graph this is a pure pointer query
+        void * prefill_lens = ctx.gdn_cache.ensure_prefill_lens(B, T);
+        int64_t ne_batch[1] = { B };
+        size_t  nb_batch[1] = { sizeof(int32_t) };
+        acl_tensor_ptr acl_seq_lens = ggml_cann_create_tensor(prefill_lens, ACL_INT32, sizeof(int32_t), ne_batch, nb_batch, 1);
+
+        uint64_t        workspace_size = 0;
+        aclOpExecutor * executor       = nullptr;
+        ACL_CHECK(api.chunk_get_workspace_size(acl_q16.get(), acl_k16.get(), acl_v16.get(), acl_beta16.get(),
+                                               acl_state16.get(), acl_seq_lens.get(), acl_g.get(), scale,
+                                               acl_out16.get(), acl_state_out16.get(), &workspace_size, &executor));
+        void * workspace_addr = nullptr;
+        if (workspace_size > 0) {
+            // The function-scope allocator keeps the workspace alive across
+            // the async run.
+            workspace_addr = workspace_allocator.alloc(workspace_size);
+        }
+        // Run the chunk executor through the chunk entry point.
+        ACL_CHECK(api.chunk_run(workspace_addr, workspace_size, executor, ctx.stream()));
+
+        state_final = state_out16_alloc.get();
     } else {
-        // prefill: one recurrent call per (sequence, block). The kernel
+        // prefill fallback: one recurrent call per (sequence, block). The kernel
         // reads the state from the slot at indices[first token] and writes every
         // token's post state back to it, so consecutive blocks thread the state
         // through the sequence slot.
@@ -5446,5 +5556,5 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
     // packed dst layout: attention output first, then the updated state snapshot
     float * out_base = (float *) dst->data;
     gdn_cast_f16_f32(ctx, out16_alloc.get(), out_base, v_elems);
-    gdn_cast_f16_f32(ctx, state16_alloc.get(), out_base + v_elems, state_elems);
+    gdn_cast_f16_f32(ctx, state_final, out_base + v_elems, state_elems);
 }

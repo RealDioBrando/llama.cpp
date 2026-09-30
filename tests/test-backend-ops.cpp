@@ -10893,6 +10893,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1)); // 16h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1)); // 16h PP-2048
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 64, 1, 2)); // GQA 8h->16v PP-64 (CPU)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 129, 1, 2)); // GQA 8h->16v PP-129 (cross-chunk; GQA falls back to the CPU reference by design)
 
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).

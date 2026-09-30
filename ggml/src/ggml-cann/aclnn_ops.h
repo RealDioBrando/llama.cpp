@@ -918,7 +918,7 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst
 void ggml_cann_gated_linear_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst);
 
 /**
- * @brief Forward Gated Delta Net on the CANN backend.
+ * @brief Forward Gated Delta Net on the CANN backend (decode and prefill).
  *
  * Expects dst->src[0..5] = {q, k, v, g, beta, state} with T tokens per sequence.
  * All ggml layouts map one to one onto the aclnn op layouts:
@@ -929,9 +929,12 @@ void ggml_cann_gated_linear_attn(ggml_backend_cann_context & ctx, ggml_tensor * 
  * then the updated state snapshot (K == 1).
  *
  * Decode (T == 1) runs all sequences in a single kernel call. Prefill (T > 1)
- * loops 8-token blocks per sequence through the recurrent kernel and threads
- * the state through the sequence slot between the calls. Inputs are cast once
- * to fp16 (g stays fp32), every call works on a view of the staging buffers.
+ * goes through the chunk kernel as a single call for the whole batch when it
+ * is loadable (see ggml_cann_gdn_chunk_v310_available; GGML_CANN_GDN_PREFILL_
+ * CHUNK=0 forces the fallback), the fallback loops 8-token blocks per sequence
+ * through the recurrent kernel and threads the state through the sequence
+ * slot between the calls. Inputs are cast once to
+ * fp16 (g stays fp32), every call works on a view of the staging buffers.
  * q/k/v may be rows-contiguous strided views (op contract), the input cast
  * gathers them into the dense staging layout.
  *
@@ -950,6 +953,14 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
  *         libcust_opapi.so under ASCEND_CUSTOM_OPP_PATH (or the library path).
  */
 bool ggml_cann_gdn_v310_available();
+
+/**
+ * @brief Check whether the custom ChunkGatedDeltaRuleV310 op is loadable.
+ *
+ * @return true if aclnnChunkGatedDeltaRuleV310GetWorkspaceSize was resolved
+ *         from libcust_opapi.so (the chunk kernel handles prefill in one call).
+ */
+bool ggml_cann_gdn_chunk_v310_available();
 
 /**
  * @brief Preload the gated delta net index cache before graph capture.

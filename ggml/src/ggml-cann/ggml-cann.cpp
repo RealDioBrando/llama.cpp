@@ -3519,8 +3519,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             return true;
         case GGML_OP_GATED_DELTA_NET:
             {
-                // fused path via the custom V310 kernel: decode is a single
-                // recurrent call, prefill loops 8-token blocks
+                // fused path via the custom V310 kernels: decode is a single
+                // recurrent call, prefill is a single chunk call (8-token block
+                // loop as fallback)
                 if (!ggml_cann_gdn_v310_available()) {
                     return false;
                 }
