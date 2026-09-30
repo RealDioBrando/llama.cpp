@@ -1830,6 +1830,12 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
             ggml_backend_cann_transform(tensor, data, transform_buffer);
             ACL_CHECK(aclrtMemcpy(tensor->data, size, transform_buffer, size, ACL_MEMCPY_HOST_TO_DEVICE));
             free(transform_buffer);
+#ifdef ASCEND_310P
+            /* lm_head NPU (Q8_0 tied): pre-warm the fractal copy now that the
+             * planar upload is complete — eager here, so a later captured
+             * decode graph only sees cache lookups. */
+            ggml_cann_prepare_lmhead_fractal_pub(tensor, kq_path);
+#endif
         } else {
             // NZ weight
             ACL_CHECK(aclrtMemcpy(tensor->data, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
@@ -1870,6 +1876,10 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
 
 #ifdef ASCEND_310P
         ggml_cann_prepare_tied_output_weight(tensor, &ctx->tied_output_weight_cache, ctx->device);
+        /* lm_head NPU (Q8_0 tied): pre-warm the fractal copy now that the
+         * planar upload is complete — eager here, so a later captured decode
+         * graph only sees cache lookups. */
+        ggml_cann_prepare_lmhead_fractal_pub(tensor, kq_path);
 #endif
 
         // Unlock before removing tracker, as remove_tracker destroys the mutex

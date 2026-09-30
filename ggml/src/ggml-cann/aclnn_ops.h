@@ -28,6 +28,11 @@
 
 /* lm_head NPU: lazy fractal transform for tied embeddings (implemented in ggml-cann.cpp) */
 void ggml_backend_cann_transform_kq_pub(ggml_tensor * tensor, const void * src, void * dst);
+/* lm_head NPU: load-time pre-warm of the tied-embedding (token_embd.weight)
+ * fractal copy. Runs host memcpy/malloc — MUST be called outside ACL graph
+ * capture (weight-load time is the intended point). Returns true when the
+ * copy is ready (cache hit or freshly prepared). */
+bool ggml_cann_prepare_lmhead_fractal_pub(ggml_tensor * src0, int path);
 
 #include <cstdlib>
 
