@@ -245,7 +245,7 @@ void llama_paged_scheduler_impl::register_completed_blocks(llama_sequence_group 
 }
 
 void llama_paged_scheduler_impl::maybe_create_checkpoint(llama_sequence_group & group) {
-    if (group.block_hashes.size() < group.n_past / block_size) {
+    if (group.block_hashes.empty() || group.n_past < block_size) {
         return;
     }
     const uint64_t chain_hash = group.block_hashes.back();
