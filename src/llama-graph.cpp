@@ -348,6 +348,14 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->s_copy(i);
         }
+
+        if (getenv("GGML_DEBUG_RS")) {
+            fprintf(stderr, "[RSDBG] n_rs=%d head=%u s_copy=[", (int) n_rs, mctx->get_head());
+            for (uint32_t i = 0; i < n_rs && i < 64; ++i) {
+                fprintf(stderr, "%d%s", data[i], (i + 1 < n_rs && i + 1 < 64) ? "," : "");
+            }
+            fprintf(stderr, "%s]\n", n_rs > 64 ? ",..." : "");
+        }
     }
 }
 
