@@ -207,7 +207,7 @@ void llama_paged_scheduler_impl::try_apply_prefix_cache(llama_sequence_group & g
     if (hybrid_memory_manager && prefix_cache.n_ckpt_slots() > 0) {
         const auto * ck = prefix_cache.find_ckpt(hashes.back());
         if (!ck) {
-            LLAMA_LOG_DEBUG("%s: no GDN checkpoint for the matched prefix, falling back to full prefill\n", __func__);
+            LLAMA_LOG("%s: no GDN checkpoint for the matched prefix, falling back to full prefill\n", __func__);
             return;
         }
         // Fork the GDN state at the matched boundary; the first suffix
@@ -245,17 +245,21 @@ void llama_paged_scheduler_impl::register_completed_blocks(llama_sequence_group 
 }
 
 void llama_paged_scheduler_impl::maybe_create_checkpoint(llama_sequence_group & group) {
-    if (group.block_hashes.size() < group.n_past / block_size) {
+    // Checkpoint at the second-to-last block boundary so that another
+    // request with the same prompt finds it after the mandatory last-block
+    // pop (which reserves one suffix token for prefill).
+    if (group.block_hashes.size() < 2 || group.n_past < 2 * block_size) {
         return;
     }
-    const uint64_t chain_hash = group.block_hashes.back();
-    const int32_t  slot_seq   = prefix_cache.acquire_ckpt_slot(chain_hash, (llama_pos) group.n_past);
+    const uint64_t chain_hash = group.block_hashes[group.block_hashes.size() - 2];
+    const llama_pos  ckpt_pos = (llama_pos)((group.block_hashes.size() - 1) * block_size);
+    const int32_t  slot_seq   = prefix_cache.acquire_ckpt_slot(chain_hash, ckpt_pos);
     if (slot_seq < 0) {
         return;
     }
     hybrid_memory_manager->seq_rm(slot_seq, -1, -1);
     hybrid_memory_manager->seq_cp(group.request_id, slot_seq, -1, -1);
-    LLAMA_LOG_DEBUG("%s: checkpoint for request %d at pos %d bound to seq %d\n", __func__, group.request_id,
+    LLAMA_LOG("%s: checkpoint for request %d at pos %d bound to seq %d\n", __func__, group.request_id,
                     (int) group.n_past, slot_seq);
 }
 
