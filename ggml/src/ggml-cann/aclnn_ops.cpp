@@ -2477,6 +2477,66 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
  *            [cast dst type]
  */
 #ifdef ASCEND_310P
+/* lm_head NPU: one-time prepare of the tied-embedding (token_embd.weight)
+ * fractal copy. Idempotent: returns true when the fractal device buffer
+ * exists (cache hit or freshly prepared). The host memcpy/malloc inside MUST
+ * run outside ACL graph capture — call at load time (preferred) or in eager
+ * compute; a first-use prepare inside a captured decode graph aborts. */
+static std::unordered_map<const void *, void *> s_lmhead_fractal_cache;
+static std::mutex                               s_lmhead_fractal_mutex;
+
+static bool ggml_cann_prepare_lmhead_fractal_impl(ggml_tensor * src0, int path) {
+    const std::string wname = ggml_get_name(src0);
+    if (wname.find("token_embd.weight") == std::string::npos) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(s_lmhead_fractal_mutex);
+    if (s_lmhead_fractal_cache.find(src0->data) != s_lmhead_fractal_cache.end()) {
+        return true;
+    }
+    const int64_t n_elems = ggml_nelements(src0);
+    const int64_t groups  = n_elems / 32; /* QK8_0 */
+    const size_t  nbytes  = ggml_nbytes(src0);
+    const size_t  layout  = ggml_cann_kq_layout_size(src0, path);
+
+    /* D2H: read the planar-format data */
+    void * h_planar = malloc(nbytes);
+    ACL_CHECK(aclrtMemcpy(h_planar, nbytes, src0->data, nbytes, ACL_MEMCPY_DEVICE_TO_HOST));
+
+    /* planar -> block reassembly: quants[0..n_elems) + scales[0..groups) -> block[i] = {d, qs[32]} */
+    const uint8_t *  planar_q = (const uint8_t *) h_planar;
+    const uint16_t * planar_s = (const uint16_t *) ((const char *) h_planar + n_elems);
+    void *           h_block = malloc(nbytes);
+    for (int64_t i = 0; i < groups; ++i) {
+        char *   blk = (char *) h_block + i * 34; /* sizeof(block_q8_0) = 2+32 */
+        uint16_t d   = planar_s[i];
+        memcpy(blk, &d, 2);
+        memcpy(blk + 2, planar_q + i * 32, 32);
+    }
+    free(h_planar);
+
+    /* block format -> fractal */
+    void * h_frac = malloc(layout);
+    ggml_backend_cann_transform_kq_pub(src0, h_block, h_frac);
+    free(h_block);
+
+    /* upload the fractal data to a separate device buffer */
+    void * d_frac = nullptr;
+    ACL_CHECK(aclrtMalloc(&d_frac, layout, ACL_MEM_MALLOC_HUGE_FIRST));
+    ACL_CHECK(aclrtMemcpy(d_frac, layout, h_frac, layout, ACL_MEMCPY_HOST_TO_DEVICE));
+    free(h_frac);
+    s_lmhead_fractal_cache[src0->data] = d_frac;
+    GGML_LOG_DEBUG("lm_head fractal prepare: '%s' %lld elems -> fractal %zuB (cached)\n",
+                   wname.c_str(), (long long) n_elems, layout);
+    return true;
+}
+
+/* lm_head NPU: load-time pre-warm entry point (called from ggml-cann.cpp after
+ * the planar upload completes — eager, before any ACL graph capture). */
+bool ggml_cann_prepare_lmhead_fractal_pub(ggml_tensor * src0, int path) {
+    return ggml_cann_prepare_lmhead_fractal_impl(src0, path);
+}
+
 static void ggml_cann_mul_mat_kquant(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * src0 = dst->src[0];  // weight (re-quantized device layout)
     ggml_tensor * src1 = dst->src[1];  // activation (k, m1, m2, ...)
@@ -2554,57 +2614,25 @@ static void ggml_cann_mul_mat_kquant(ggml_backend_cann_context & ctx, ggml_tenso
     // ---- 3. weight tensors from the device layout ----
     char * weight_base = (char *) src0->data;
 
-    /* lm_head NPU: tied embedding (token_embd.weight) went through the standard
-     * Q8_0 upload path at load time (planar layout: quants contiguous + scales
-     * contiguous), while the fractal transform expects the original GGUF block
-     * format (scale+quant interleaved). So here: D2H, reassemble back to block
-     * format, then fractal-repack; the result is cached in a separate device
-     * buffer. */
+    /* lm_head NPU: tied embedding (token_embd.weight) keeps the original Q8_0
+     * planar data for GET_ROWS; the fractal copy used by MUL_MAT is pre-warmed
+     * at load time (ggml-cann.cpp, right after the planar upload) so that
+     * compute-time captures only see cache lookups. The in-compute prepare
+     * below is a fallback for uncaptured paths only — host memcpy/malloc are
+     * illegal inside a captured region. */
     {
-        static std::unordered_map<const void *, void *> s_fractal_cache;
-        static std::mutex                               s_cache_mutex;
-        const std::string                               wname = ggml_get_name(src0);
+        const std::string wname = ggml_get_name(src0);
         if (wname.find("token_embd.weight") != std::string::npos) {
-            std::lock_guard<std::mutex> lock(s_cache_mutex);
-            auto it = s_fractal_cache.find(src0->data);
-            if (it == s_fractal_cache.end()) {
-                const int64_t  n_elems = ggml_nelements(src0);
-                const int64_t  groups  = n_elems / 32; /* QK8_0 */
-                const size_t   nbytes  = ggml_nbytes(src0);
-                const size_t   layout  = ggml_cann_kq_layout_size(src0, path);
-
-                /* D2H: read the planar-format data */
-                void * h_planar = malloc(nbytes);
-                ACL_CHECK(aclrtMemcpy(h_planar, nbytes, src0->data, nbytes, ACL_MEMCPY_DEVICE_TO_HOST));
-
-                /* planar -> block reassembly: quants[0..n_elems) + scales[0..groups) -> block[i] = {d, qs[32]} */
-                const uint8_t *  planar_q = (const uint8_t *) h_planar;
-                const uint16_t * planar_s = (const uint16_t *) ((const char *) h_planar + n_elems);
-                void *           h_block = malloc(nbytes);
-                for (int64_t i = 0; i < groups; ++i) {
-                    char *     blk = (char *) h_block + i * 34; /* sizeof(block_q8_0) = 2+32 */
-                    uint16_t   d   = planar_s[i];
-                    memcpy(blk, &d, 2);
-                    memcpy(blk + 2, planar_q + i * 32, 32);
+            if (ggml_cann_prepare_lmhead_fractal_impl(src0, path)) {
+                std::lock_guard<std::mutex> lock(s_lmhead_fractal_mutex);
+                auto it = s_lmhead_fractal_cache.find(src0->data);
+                if (it != s_lmhead_fractal_cache.end()) {
+                    weight_base = (char *) it->second;
+                } else {
+                    GGML_LOG_WARN("lm_head fractal cache miss for '%s'\n", wname.c_str());
                 }
-                free(h_planar);
-
-                /* block format -> fractal */
-                void * h_frac = malloc(layout);
-                ggml_backend_cann_transform_kq_pub(src0, h_block, h_frac);
-                free(h_block);
-
-                /* upload the fractal data to a separate device buffer */
-                void * d_frac = nullptr;
-                ACL_CHECK(aclrtMalloc(&d_frac, layout, ACL_MEM_MALLOC_HUGE_FIRST));
-                ACL_CHECK(aclrtMemcpy(d_frac, layout, h_frac, layout, ACL_MEMCPY_HOST_TO_DEVICE));
-                free(h_frac);
-                s_fractal_cache[src0->data] = d_frac;
-                GGML_LOG_DEBUG("lm_head lazy transform: '%s' %lld elems -> fractal %zuB (cached)\n",
-                               wname.c_str(), (long long) n_elems, layout);
-                weight_base = (char *) d_frac;
             } else {
-                weight_base = (char *) it->second;
+                GGML_LOG_WARN("lm_head fractal copy unavailable for '%s'\n", wname.c_str());
             }
         }
     }

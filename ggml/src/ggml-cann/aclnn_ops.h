@@ -28,6 +28,11 @@
 
 /* lm_head NPU: lazy fractal transform for tied embeddings (implemented in ggml-cann.cpp) */
 void ggml_backend_cann_transform_kq_pub(ggml_tensor * tensor, const void * src, void * dst);
+/* lm_head NPU: load-time pre-warm of the tied-embedding (token_embd.weight)
+ * fractal copy. Runs host memcpy/malloc — MUST be called outside ACL graph
+ * capture (weight-load time is the intended point). Returns true when the
+ * copy is ready (cache hit or freshly prepared). */
+bool ggml_cann_prepare_lmhead_fractal_pub(ggml_tensor * src0, int path);
 
 #include <cstdlib>
 
@@ -1011,9 +1016,9 @@ static bool is_matmul_weight(const ggml_tensor * tensor) {
                                                                   "attn_k.weight",      "attn_v.weight",
                                                                   "attn_output.weight", "ffn_gate.weight",
                                                                   "ffn_up.weight",      "ffn_down.weight",
-                                                                  // linear attention (GatedDeltaNet) projections.
-                                                                  // ssm_beta/ssm_alpha stay out: the W8A8 path
-                                                                  // diverges on these narrow [k, 16] weights.
+                                                                  // linear attention (GatedDeltaNet) projections:
+                                                                  // ssm_alpha/ssm_beta ([k,16] narrow weights)
+                                                                  // are routed via is_gdn_proj_weight.
                                                                   "attn_qkv.weight",    "attn_gate.weight",
                                                                   "ssm_out.weight",
                                                                   "token_embd.weight" };
@@ -1107,18 +1112,20 @@ static bool ggml_cann_qmat_debug() {
 }
 
 /**
- * @brief   GDN-layer projection weights (Qwen3.5 linear-attention blocks), Plan B.
+ * @brief   GDN-layer projection weights (Qwen3.5 linear-attention blocks).
  *
- * @details Routes attn_qkv/attn_gate/ssm_out (large q8_0 matmuls, k=2048) to the
- *          NPU W8A8 path by name suffix. ssm_alpha/ssm_beta ([2048,16]) are
- *          excluded by default pending clarification of the [2048,16]
- *          feedback support; opt in with GGML_CANN_GDN_SMALL=1 (independent
- *          of GGML_CANN_GDN_PROJ). GGML_CANN_GDN_PROJ=0 restores the CPU
- *          fallback for the large projections (default ON).
+ * @details Routes attn_qkv/attn_gate/ssm_out (large q8_0 matmuls, k=2048) and
+ *          ssm_alpha/ssm_beta (narrow [2048,16] q8_0 matmuls) to the NPU W8A8
+ *          path by name suffix. The [k,16] narrow weights were historically
+ *          held back over a suspected W8A8 divergence, but the ops-nn
+ *          regression suite now covers the [k,16] shape explicitly (PASS), so
+ *          they are enabled by default. GGML_CANN_GDN_SMALL=0 restores the
+ *          CPU fallback for the narrow projections; GGML_CANN_GDN_PROJ=0
+ *          restores the CPU fallback for all GDN projections.
  */
 static bool is_gdn_proj_weight(const ggml_tensor * tensor) {
     static const bool                            enabled  = !ggml_cann_env_off("GGML_CANN_GDN_PROJ");
-    static const bool                            small_on = ggml_cann_env_on("GGML_CANN_GDN_SMALL");
+    static const bool                            small_on = !ggml_cann_env_off("GGML_CANN_GDN_SMALL");
     static const std::unordered_set<std::string> gdn_suffixes{ "attn_qkv.weight", "attn_gate.weight",
                                                                "ssm_out.weight" };
     static const std::unordered_set<std::string> gdn_small_suffixes{ "ssm_alpha.weight", "ssm_beta.weight" };
