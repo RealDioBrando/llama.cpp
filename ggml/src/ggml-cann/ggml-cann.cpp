@@ -1561,6 +1561,11 @@ static void ggml_backend_cann_transform_kq(ggml_tensor * tensor, const void * sr
         GGML_ABORT("kq transform called for a tensor without an NPU path");
     }
 }
+
+/* lm_head NPU: public wrapper, called by the lazy transform in aclnn_ops.cpp */
+void ggml_backend_cann_transform_kq_pub(ggml_tensor * tensor, const void * src, void * dst) {
+    ggml_backend_cann_transform_kq(tensor, src, dst);
+}
 #endif  // ASCEND_310P
 
 /**
@@ -1756,6 +1761,17 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
     int kq_path = GGML_CANN_KQ_NONE;
 #endif
     bool is_kq = kq_path != GGML_CANN_KQ_NONE;
+#ifdef ASCEND_310P
+    /* lm_head NPU: tied embedding (token_embd.weight) serves both GET_ROWS
+     * (needs the original Q8_0) and MUL_MAT (needs fractal) — skip the transform
+     * at load time, lazily repack to a cached copy at compute time */
+    if (is_kq) {
+        const std::string tname = ggml_get_name((const ggml_tensor *) tensor);
+        if (tname.find("token_embd.weight") != std::string::npos) {
+            is_kq = false;  /* keep GET_ROWS; routing is decided by supports_op (compute side) */
+        }
+    }
+#endif
     bool is_nz = !is_quantized && !is_kq && tensor->type != GGML_TYPE_BF16 && weight_to_nz &&
                  ggml_cann_is_weight_layout_candidate((const ggml_tensor *) tensor);
 

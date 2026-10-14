@@ -26,6 +26,9 @@
 #include "acl_tensor.h"
 #include "common.h"
 
+/* lm_head NPU: lazy fractal transform for tied embeddings (implemented in ggml-cann.cpp) */
+void ggml_backend_cann_transform_kq_pub(ggml_tensor * tensor, const void * src, void * dst);
+
 #include <cstdlib>
 
 #include <aclnnop/aclnn_abs.h>
@@ -1012,7 +1015,12 @@ static bool is_matmul_weight(const ggml_tensor * tensor) {
                                                                   // ssm_beta/ssm_alpha stay out: the W8A8 path
                                                                   // diverges on these narrow [k, 16] weights.
                                                                   "attn_qkv.weight",    "attn_gate.weight",
-                                                                  "ssm_out.weight" };
+                                                                  "ssm_out.weight",
+                                                                  "token_embd.weight" };
+    /* token_embd.weight: tied-embedding lm_head (Qwen3.5 etc., no standalone
+     * output.weight). Routing it to W8A8 requires the lazy transform: skip the
+     * load-time transform (GET_ROWS needs the original Q8_0) and do the one-time
+     * fractal repack into a cached copy at compute time (in the mul_mat handler). */
 
     for (const auto & suffix : weight_suffixes) {
         if (name.find(suffix) != std::string::npos) {
