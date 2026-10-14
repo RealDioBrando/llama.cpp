@@ -3617,11 +3617,13 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 if (op->src[1]->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_F16) {
                     return false;
                 }
-                // The prefill path (q_len > 1) assumes a single sequence;
-                // route multi-sequence prefill to the CPU. Decode handles any B.
-                if (op->src[0]->ne[3] > 1 && op->src[0]->ne[1] > 1) {
-                    return false;
-                }
+                // Multi-sequence prefill (B > 1, q_len > 1) is handled by the
+                // per-batch-element PFA loop in ggml_cann_flash_attn_ext_310p.
+                // It must NOT be routed to the CPU backend: the scheduler's
+                // input materialization for these strided views is broken on
+                // the host side (v/mask arrive zeroed), which corrupted
+                // multi-sequence prefill and poisoned all downstream state
+                // (llama-server multi-slot GSM8K collapse).
                 return true;
 #endif
                 // derived from [ggml-cuda.cu]

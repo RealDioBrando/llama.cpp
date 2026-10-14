@@ -709,6 +709,24 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     used = std::count_if(cells.begin(), cells.end(),
         [](const mem_cell & cell){ return !cell.is_empty(); });
 
+    if (getenv("GGML_DEBUG_RS")) {
+        fprintf(stderr, "[FSDBG] n_seqs=%u n_seq_tokens=%u min=%d max=%d head=%u n=%u rs_z=%d\n",
+                ubatch.n_seqs, ubatch.n_seq_tokens, min, max, head, n, rs_z);
+        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+            const llama_seq_id sid = ubatch.seq_id[s*ubatch.n_seq_tokens][0];
+            const int32_t tail = cells[sid].tail;
+            fprintf(stderr, "[FSDBG]   s=%u seq=%d tail=%d src0=%d pos=%d cells={",
+                    s, sid, tail, tail >= 0 ? cells[tail].src0 : -1,
+                    tail >= 0 ? (int) cells[tail].pos : -1);
+            if (tail >= 0) {
+                for (int q : cells[tail].seq_id) {
+                    fprintf(stderr, "%d,", q);
+                }
+            }
+            fprintf(stderr, "}\n");
+        }
+    }
+
     // sanity check
     return n >= n_seqs;
 }
