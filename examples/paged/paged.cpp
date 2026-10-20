@@ -56,7 +56,7 @@ static void add_request_from_pool(struct llama_paged_scheduler * scheduler,
     // LLAMA_PAGED_SAME_PROMPT=1 makes every sequence use prompt 0, which
     // is the workload to exercise the prefix cache.
     static const bool   same_prompt   = getenv("LLAMA_PAGED_SAME_PROMPT") && atoi(getenv("LLAMA_PAGED_SAME_PROMPT")) != 0;
-    static const size_t prompt_index = same_prompt ? 0 : pool_index % k_n_prompts;
+    const size_t        prompt_index = same_prompt ? 0 : pool_index % k_n_prompts;
     const std::string   input_prompt = k_prompts[prompt_index];
     std::vector<llama_token> tokens       = common_tokenize(ctx, input_prompt, true);
 
