@@ -41,6 +41,7 @@
 #endif
 #include <stdarg.h>
 
+#include <cstdlib>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -778,6 +779,10 @@ std::unique_ptr<ggml_cann_pool> ggml_backend_cann_context::new_pool_for_device(i
 
     GGML_LOG_INFO("%s: device %d use buffer pool\n", __func__, device);
     return std::unique_ptr<ggml_cann_pool>(new ggml_cann_pool_buf(device));
+}
+
+std::unique_ptr<ggml_cann_pool> ggml_backend_cann_context::new_matmul_input_pool_for_device(int device) {
+    return std::unique_ptr<ggml_cann_pool>(new ggml_cann_pool_buf_prio(device));
 }
 
 // cann buffer
@@ -2446,7 +2451,7 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
             ggml_cann_mul_mat(ctx, dst);
             break;
         case GGML_OP_MUL_MAT_ID:
-            if (parse_bool(get_env_as_lowercase("GGML_CANN_MOE_GROUPED").value_or("off")) &&
+            if (ggml_cann_moe_grouped_enabled() &&
                 ggml_cann_mul_mat_id_grouped_supported(dst)) {
                 ggml_cann_mul_mat_id_grouped(ctx, dst);
             } else {
@@ -3036,6 +3041,7 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                                             ggml_cgraph *               cgraph,
                                             bool                        use_cann_graph,
                                             bool                        cann_graph_capture_required) {
+    cann_ctx->graph_capture_active = use_cann_graph && cann_graph_capture_required;
 #ifdef USE_ACL_GRAPH
     if (use_cann_graph && cann_ctx->piecewise_mode) {
         evaluate_and_capture_cann_graph_piecewise(cann_ctx, cgraph);
@@ -3122,6 +3128,11 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                 continue;
             }
 
+            if (getenv("GGML_CANN_OP_DEBUG")) {
+                fprintf(stderr, "[CANN op dev=%d %d/%d] op=%s name=%s\n", cann_ctx->device, i, cgraph->n_nodes,
+                        ggml_op_name(node->op), node->name);
+                fflush(stderr);
+            }
             bool ok = ggml_cann_compute_forward(*cann_ctx, node);
             if (!ok) {
                 GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
@@ -3148,6 +3159,7 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 
     }
 #endif  // USE_ACL_GRAPH
+    cann_ctx->graph_capture_active = false;
 }
 
 /**
@@ -3203,31 +3215,18 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     // graph fingerprint compares addresses, so this was causing re-capture
     // every step (see MATCH-FAIL diagnostics 8/27). The workspace is freed
     // on program exit instead (g_nz_workspaces is static).
+    cann_ctx->matmul_input_cache.begin_graph();
 
     // calculate rope cache for fist layer in current device.
     cann_ctx->rope_cache.cached = false;
 
     bool graph_capture_required = false;
 #ifdef USE_ACL_GRAPH
-    bool use_cann_graph = true;
-
-    static bool prefill_use_graph = parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
-    if (!prefill_use_graph) {
-        // Do not use acl_graph for prefill.
-        // Detect prefill vs decode from the token (batch) count of any matmul:
-        // every split carries a matmul whose activation src[1] has ne[1] = m.
-        // Decode has m == 1; prefill has m > 1. This must not rely on finding
-        // an attention op, because GDN-layer splits route the fused delta-net
-        // node to the CPU, so those splits contain no FA/GDN node and would
-        // otherwise be (wrongly) treated as decode and graph-captured.
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            ggml_tensor * node = cgraph->nodes[i];
-            if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr) {
-                use_cann_graph = (node->src[1]->ne[1] == 1);
-                break;
-            }
-        }
-    }
+    // llama_context supplies the execution phase explicitly. Infer from an op
+    // shape is unsafe for hybrid graphs with internal width-one matmuls.
+    static bool prefill_use_graph_override =
+        parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
+    bool use_cann_graph = !cann_ctx->graph_prefill || prefill_use_graph_override;
 
     if (!cann_ctx->acl_graph_mode) {
         use_cann_graph = false;
@@ -3648,6 +3647,15 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     return false;
                 }
 #ifdef ASCEND_310P
+                // Skip-mask PFA decode path: exact n_kv required, handled
+                // fully on device, so it is safe to capture.
+                static bool force_skip_mask_fa = getenv("GGML_CANN_SKIP_MASK_FA") != nullptr &&
+                    strcmp(getenv("GGML_CANN_SKIP_MASK_FA"), "0") != 0;
+                if (force_skip_mask_fa && op->src[3] != nullptr && op->src[0]->ne[1] == 1 &&
+                    op->src[3]->ne[1] == 1 && op->src[3]->ne[2] == 1 &&
+                    op->src[0]->ne[3] == op->src[3]->ne[3]) {
+                    return true;
+                }
                 // alibi bias cannot be fused on 310P (the prefill path has no
                 // free pseShift channel for it) - route it to the CPU instead
                 // of silently computing a wrong result.
@@ -4016,6 +4024,11 @@ static size_t ggml_backend_cann_reg_get_device_count(ggml_backend_reg_t reg) {
     return ctx->devices.size();
 }
 
+static void ggml_backend_cann_set_prefill(ggml_backend_t backend, bool prefill) {
+    auto * ctx = (ggml_backend_cann_context *) backend->context;
+    ctx->graph_prefill = prefill;
+}
+
 static ggml_backend_dev_t ggml_backend_cann_reg_get_device(ggml_backend_reg_t reg, size_t index) {
     ggml_backend_cann_reg_context * ctx = (ggml_backend_cann_reg_context *) reg->context;
     GGML_ASSERT(index < ctx->devices.size());
@@ -4023,9 +4036,9 @@ static ggml_backend_dev_t ggml_backend_cann_reg_get_device(ggml_backend_reg_t re
 }
 
 static void * ggml_backend_cann_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-    GGML_UNUSED(reg);
-    GGML_UNUSED(name);
-    // reserved for future use
+    if (strcmp(name, "ggml_backend_cann_set_prefill") == 0) {
+        return (void *) ggml_backend_cann_set_prefill;
+    }
     return nullptr;
 }
 

@@ -1477,7 +1477,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const auto compute_t0 = graph_timing ? ggml_time_us() : 0;
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, ubatch.n_seq_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2581,7 +2581,8 @@ llm_graph_params llama_context::graph_params(
 
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
-                   bool   batched) {
+                   bool   batched,
+                   bool   prefill) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -2596,6 +2597,15 @@ ggml_status llama_context::graph_compute(
     // set the number of threads for all the backends
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
+    }
+
+    using set_prefill_fn = void (*)(ggml_backend_t backend, bool prefill);
+    for (const auto & backend : backends) {
+        auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend.get()));
+        auto * set_prefill = (set_prefill_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cann_set_prefill");
+        if (set_prefill) {
+            set_prefill(backend.get(), prefill);
+        }
     }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);

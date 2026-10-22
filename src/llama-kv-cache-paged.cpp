@@ -68,6 +68,8 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
             ggml_new_tensor_4d(ctx_gpu, type, head_dim, block_size, n_heads_kv, n_gpu_blocks);
         ggml_tensor * v_layer_gpu =
             ggml_new_tensor_4d(ctx_gpu, type, head_dim, block_size, n_heads_kv, n_gpu_blocks);
+        ggml_format_name(k_layer_gpu, "cache_paged_k_l%u", il);
+        ggml_format_name(v_layer_gpu, "cache_paged_v_l%u", il);
         k_gpu_layers.push_back(k_layer_gpu);
         v_gpu_layers.push_back(v_layer_gpu);
     }
@@ -395,9 +397,30 @@ void llama_kv_cache_paged::clear(bool /*data*/) {
     sequence_positions.clear();
 }
 
-bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos /*p0*/, llama_pos /*p1*/) {
-    sequence_positions.erase(seq_id);
-    return true;
+bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    auto it = sequence_positions.find(seq_id);
+    if (it == sequence_positions.end()) {
+        return true;
+    }
+
+    // full clear (also covers free_blocks' (0, 0) call)
+    if (p0 <= it->second.min && (p1 == -1 || p1 <= p0)) {
+        sequence_positions.erase(it);
+        return true;
+    }
+
+    if (p1 == -1) {
+        // logical truncation: drop positions >= p0. Stale cells are never
+        // read (attention length comes from the batch context) and are
+        // rewritten by the next decode at these slots.
+        if (p0 <= it->second.max) {
+            it->second.max = p0 - 1;
+        }
+        return true;
+    }
+
+    GGML_ASSERT(false && "paged seq_rm: middle-range clears are not supported");
+    return false;
 }
 
 llama_pos llama_kv_cache_paged::seq_pos_min(llama_seq_id seq_id) const {

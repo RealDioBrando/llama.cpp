@@ -3,12 +3,15 @@
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
+#include "speculative.h"
 
 #include <algorithm>
 #include <cfloat>
 #include <clocale>
 #include <cstdlib>
 #include <chrono>
+#include <map>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -49,6 +52,23 @@ struct request_result {
     std::string response   = "";
 };
 
+// prompt tokens per request, consumed by common_speculative_begin
+static std::map<int32_t, llama_tokens> g_request_prompts;
+// per-request speculative state
+static std::map<int32_t, llama_tokens> g_draft_results;
+static std::set<int32_t>               g_spec_begun;
+static int64_t g_spec_draft_us      = 0;
+static int64_t g_spec_verify_us     = 0;
+static int64_t g_spec_decode_us     = 0;
+static int64_t g_spec_sync_us       = 0;
+static int64_t g_spec_process_us    = 0;
+static int64_t g_spec_accept_us     = 0;
+static int64_t g_spec_commit_us     = 0;
+static int32_t g_spec_cycles        = 0;
+static int32_t g_spec_proposed      = 0;
+static int32_t g_spec_accepted      = 0;
+static int32_t g_spec_fallbacks     = 0;
+
 static void add_request_from_pool(struct llama_paged_scheduler * scheduler,
                                   llama_context *                ctx,
                                   size_t                         pool_index,
@@ -86,6 +106,8 @@ static void add_request_from_pool(struct llama_paged_scheduler * scheduler,
     if (!success) {
         LOG_ERR("Failed to add request %ld from pool\n", pool_index);
     }
+    // stash the prompt tokens for the speculative draft context
+    g_request_prompts[seq_id] = tokens;
     LOG_INF("%s: Successfully added request %ld: %s\n", __func__, pool_index, input_prompt.c_str());
 }
 
@@ -163,6 +185,30 @@ int main(int argc, char ** argv) {
     callback_context cb_ctx = { ctx };
     llama_paged_scheduler_set_on_finish(scheduler, log_output, &cb_ctx);
 
+    // optional MTP speculative decoding: the draft (MTP head) context runs on
+    // a plain unified KV cache; only the target uses the paged scheduler
+    common_speculative_init_result_ptr spec_init;
+    common_speculative_ptr             spec;
+    llama_context *                    ctx_dft = nullptr;
+    const bool use_mtp = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                                   COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    if (use_mtp) {
+        spec_init = common_speculative_init_from_params(params, model, ctx);
+        ctx_dft   = spec_init->context();
+        if (!ctx_dft) {
+            LOG_ERR("%s: failed to create MTP draft context\n", __func__);
+            return 1;
+        }
+        params.speculative.draft.ctx_tgt = ctx;
+        params.speculative.draft.ctx_dft = ctx_dft;
+        spec.reset(common_speculative_init(params.speculative, params.n_parallel));
+        if (!spec) {
+            LOG_ERR("%s: failed to initialize speculative decoding\n", __func__);
+            return 1;
+        }
+        LOG_INF("%s: MTP speculative decoding enabled (n_max=%d)\n", __func__, params.speculative.draft.n_max);
+    }
+
     std::unordered_map<int32_t, common_sampler *> samplers;
     std::vector<request_result>              results;
     std::unordered_map<int32_t, std::string> accumulated_responses;
@@ -207,11 +253,149 @@ int main(int argc, char ** argv) {
                 params.n_batch, params.n_sequences, params.n_parallel);
         GGML_ASSERT(batch.n_tokens <= params.n_batch && "batch exceeds n_batch");
 
+        // MTP cycle: the prepared batch holds the pending token at pos n_past.
+        // Draft continuations, verify them with one paged decode, then commit
+        // the accepted prefix. Falls back to the normal path when the draft
+        // is empty or the append cannot be scheduled.
+        if (use_mtp) {
+            const llama_paged_batch_info * minfo = llama_paged_scheduler_get_batch_info(scheduler);
+            llama_paged_seq_state spec_state = {};
+            llama_paged_scheduler_get_seq_state(scheduler, batch.seq_id[0][0], &spec_state);
+            if (minfo && minfo->n_seq == 1 && minfo->batch_lens[0] == 1 && spec_state.n_decoded > 0) {
+                const int32_t      req_id = batch.seq_id[0][0];
+                const llama_seq_id seq_id = (llama_seq_id) req_id;
+                const llama_token  s      = batch.token[0];
+                const llama_pos    pos0   = batch.pos[0];
+
+                if (!g_spec_begun.count(req_id)) {
+                    common_speculative_begin(spec.get(), seq_id, g_request_prompts[req_id]);
+                    g_spec_begun.insert(req_id);
+                }
+
+                llama_tokens & draft = g_draft_results[req_id];
+                draft.clear();
+                common_speculative_get_draft_params(spec.get(), seq_id) = {
+                    /* .drafting = */ true,
+                    /* .n_max    = */ params.speculative.draft.n_max,
+                    /* .pos0     = */ pos0,
+                    /* .id_last  = */ s,
+                    /* .prompt   = */ &g_request_prompts[req_id],
+                    /* .result   = */ &draft,
+                };
+                {
+                    const int64_t t0 = ggml_time_us();
+                    common_speculative_draft(spec.get());
+                    g_spec_draft_us += ggml_time_us() - t0;
+                }
+                // draft() may fill the draft KV at pos0; verify needs to rebuild it
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pos0, -1);
+
+                if (!draft.empty()) {
+                    const int32_t n_draft   = (int32_t) draft.size();
+                    llama_batch   vbatch    = llama_batch_init(n_draft + 1, 0, 1);
+                    vbatch.n_tokens         = n_draft + 1;
+                    bool append_ok          = llama_paged_scheduler_prepare_append(scheduler, req_id, n_draft + 1);
+                    if (append_ok) {
+                        for (int32_t t = 0; t <= n_draft; ++t) {
+                            vbatch.token[t]     = (t == 0) ? s : draft[t - 1];
+                            vbatch.pos[t]       = pos0 + t;
+                            vbatch.n_seq_id[t]  = 1;
+                            vbatch.seq_id[t][0] = (llama_seq_id) req_id;
+                            vbatch.logits[t]    = 1;
+                        }
+                        const int64_t t0 = ggml_time_us();
+                        append_ok = llama_decode(ctx, vbatch) == 0;
+                        g_spec_decode_us += ggml_time_us() - t0;
+                        if (append_ok) {
+                            const int64_t t1 = ggml_time_us();
+                            llama_synchronize(ctx);
+                            g_spec_sync_us += ggml_time_us() - t1;
+                        }
+                        g_spec_verify_us += ggml_time_us() - t0;
+                    }
+                    if (append_ok) {
+                        {
+                            const int64_t t0 = ggml_time_us();
+                            common_speculative_process(spec.get(), vbatch);
+                            g_spec_process_us += ggml_time_us() - t0;
+                        }
+
+                        common_sampler * sampler = samplers[req_id];
+                        std::vector<int> idxs(n_draft + 1);
+                        for (int32_t t = 0; t <= n_draft; ++t) {
+                            idxs[t] = t;
+                        }
+                        const int64_t t0 = ggml_time_us();
+                        llama_tokens accepted = common_sampler_sample_and_accept_n(sampler, ctx, idxs, draft);
+                        g_spec_accept_us += ggml_time_us() - t0;
+                        const int32_t n_accepted = (int32_t) accepted.size() - 1;
+                        const llama_token t_next = accepted.back();
+                        g_spec_cycles++;
+                        g_spec_proposed += n_draft;
+                        g_spec_accepted += n_accepted;
+
+                        llama_paged_seq_state state = {};
+                        llama_paged_scheduler_get_seq_state(scheduler, req_id, &state);
+                        bool stop = state.n_decoded + 1 + n_accepted >= params.n_predict;
+                        for (int32_t i = 0; i < (int32_t) accepted.size() && !stop; ++i) {
+                            stop = llama_vocab_is_eog(vocab, accepted[i]);
+                        }
+
+                        {
+                            const int64_t t0 = ggml_time_us();
+                            llama_paged_scheduler_commit_append(scheduler, req_id, n_accepted, accepted.data(),
+                                                                t_next, stop ? 1 : 0);
+                            g_spec_commit_us += ggml_time_us() - t0;
+                        }
+                        common_speculative_accept(spec.get(), seq_id, n_accepted);
+                        // drop the rejected draft cells from the draft KV
+                        llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, pos0 + n_accepted + 1, -1);
+
+                        accumulated_responses[req_id] += common_token_to_piece(ctx, s);
+                        for (int32_t i = 0; i < n_accepted; ++i) {
+                            accumulated_responses[req_id] += common_token_to_piece(ctx, accepted[i]);
+                        }
+
+                        llama_batch_free(vbatch);
+
+                        if (stop) {
+                            request_result r;
+                            llama_paged_scheduler_get_seq_state(scheduler, req_id, &state);
+                            r.request_id = req_id;
+                            r.n_prompt   = state.n_prompt;
+                            r.n_decoded  = state.n_decoded;
+                            r.ttft_ms    = (state.t_first_token_us - state.t_arrival_us) / 1000.0f;
+                            r.e2e_ms     = (ggml_time_us() - state.t_arrival_us) / 1000.0f;
+                            r.tps        = state.n_decoded > 0 && r.e2e_ms > 0 ?
+                                               state.n_decoded / (r.e2e_ms / 1000.0f) : 0.0f;
+                            r.tpot_ms    = state.n_decoded > 1 && state.t_first_token_us > 0 ?
+                                               (r.e2e_ms - r.ttft_ms) / (state.n_decoded - 1) : 0.0f;
+                            r.response   = accumulated_responses.count(req_id) ? accumulated_responses[req_id] : "";
+                            results.push_back(r);
+                            accumulated_responses.erase(req_id);
+                            common_sampler_free(samplers[req_id]);
+                            samplers.erase(req_id);
+                        }
+                        continue;
+                    }
+                    llama_batch_free(vbatch);
+                    g_spec_fallbacks++;
+                    // fall through to the normal single-token decode path
+                }
+            }
+        }
+
         if (llama_decode(ctx, batch) != 0) {
             LOG_INF("%s: llama_decode failed\n", __func__);
             break;
         }
         llama_synchronize(ctx);
+
+        if (use_mtp) {
+            const int64_t t0 = ggml_time_us();
+            common_speculative_process(spec.get(), batch);
+            g_spec_process_us += ggml_time_us() - t0;
+        }
 
         std::vector<llama_token> sampled_tokens;
         std::vector<int8_t>      stop_flags;
@@ -352,6 +536,19 @@ int main(int argc, char ** argv) {
     LOG_INF("  tpot  avg             : %.1f ms/token\n", avg_tpot_ms);
     LOG_INF("  e2e   avg             : %.1f ms\n", avg_e2e_ms);
     LOG_INF("  tps   min / max       : %.1f / %.1f tokens/s\n", min_tps, max_tps);
+    if (use_mtp) {
+        LOG_INF("  --- MTP phase timing ---\n");
+        LOG_INF("  cycles / fallbacks    : %d / %d\n", g_spec_cycles, g_spec_fallbacks);
+        LOG_INF("  proposed / accepted   : %d / %d (avg %.2f)\n", g_spec_proposed, g_spec_accepted,
+                g_spec_cycles > 0 ? (float) g_spec_accepted / g_spec_cycles : 0.f);
+        LOG_INF("  draft propose         : %.1f ms/cycle\n", g_spec_cycles > 0 ? g_spec_draft_us / 1000.f / g_spec_cycles : 0.f);
+        LOG_INF("  paged verify          : %.1f ms/cycle\n", g_spec_cycles > 0 ? g_spec_verify_us / 1000.f / g_spec_cycles : 0.f);
+        LOG_INF("  verify decode launch  : %.1f ms/cycle\n", g_spec_cycles > 0 ? g_spec_decode_us / 1000.f / g_spec_cycles : 0.f);
+        LOG_INF("  verify sync wait      : %.1f ms/cycle\n", g_spec_cycles > 0 ? g_spec_sync_us / 1000.f / g_spec_cycles : 0.f);
+        LOG_INF("  draft process         : %.1f ms/cycle\n", g_spec_cycles > 0 ? g_spec_process_us / 1000.f / g_spec_cycles : 0.f);
+        LOG_INF("  sample/accept         : %.1f ms/cycle\n", g_spec_cycles > 0 ? g_spec_accept_us / 1000.f / g_spec_cycles : 0.f);
+        LOG_INF("  commit                : %.1f ms/cycle\n", g_spec_cycles > 0 ? g_spec_commit_us / 1000.f / g_spec_cycles : 0.f);
+    }
     LOG_INF("==============================\n");
 
     // Clean-up

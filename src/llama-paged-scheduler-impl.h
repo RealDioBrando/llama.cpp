@@ -25,6 +25,13 @@ class llama_paged_scheduler_impl {
     llama_scheduler_status step(llama_batch & batch);
     bool                   queue_request(llama_sequence_group group);
     void update(const llama_batch & batch, const std::vector<llama_token> & new_tokens, const int8_t * stop_flags);
+    // speculative decoding support: set the batch info for an externally
+    // built verify batch of n_append tokens at positions [n_past, n_past +
+    // n_append), then commit the accepted prefix afterwards. commit_append
+    // counts the re-decoded sampled token plus n_keep accepted drafts, and
+    // queues next_token as the pending decode for the next cycle.
+    bool prepare_append(int32_t request_id, int32_t n_append);
+    bool commit_append(int32_t request_id, int32_t n_keep, const llama_token * tokens, llama_token next_token, int8_t stop);
     void set_on_finish(llama_paged_on_finish_cb cb, void * user_data);
     llama_sequence_group *         get_group_from_id(int32_t request_id) const;
     const llama_paged_batch_info * get_curr_batch_info() const;
@@ -54,6 +61,7 @@ class llama_paged_scheduler_impl {
     int32_t calculate_global_slot_index(int32_t token_pos, std::vector<uint32_t> & block_table);
 
     void clear_batch(llama_batch & batch);
+    void free_curr_info();
     void populate_batch_from(const llama_sequence_group_raw_list & candidates, llama_batch & batch);
 
     // Prefix cache

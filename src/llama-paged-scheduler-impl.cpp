@@ -552,12 +552,7 @@ void llama_paged_scheduler_impl::clear_batch(llama_batch & batch) {
     // (MUST be called before the delete[]).
     kv_cache_manager->set_paged_batch_info(nullptr);
 
-    delete[] curr_info.write_slots;
-    delete[] curr_info.block_table;
-    delete[] curr_info.context_lens;
-    delete[] curr_info.batch_offsets;
-    delete[] curr_info.batch_lens;
-    curr_info = {};  // reset to defaults
+    free_curr_info();
 
     if (batch.n_tokens == 0) {
         return;
@@ -565,6 +560,15 @@ void llama_paged_scheduler_impl::clear_batch(llama_batch & batch) {
 
     llama_batch_free(batch);
     batch.n_tokens = 0;
+}
+
+void llama_paged_scheduler_impl::free_curr_info() {
+    delete[] curr_info.write_slots;
+    delete[] curr_info.block_table;
+    delete[] curr_info.context_lens;
+    delete[] curr_info.batch_offsets;
+    delete[] curr_info.batch_lens;
+    curr_info = {};  // reset to defaults
 }
 
 void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_raw_list & candidates,
@@ -717,6 +721,93 @@ void llama_paged_scheduler_impl::update(const llama_batch &              batch,
 void llama_paged_scheduler_impl::set_on_finish(llama_paged_on_finish_cb cb, void * user_data) {
     on_finish_cb        = cb;
     on_finish_user_data = user_data;
+}
+
+bool llama_paged_scheduler_impl::prepare_append(int32_t request_id, int32_t n_append) {
+    llama_sequence_group * group = get_group_from_id(request_id);
+    if (!group || n_append <= 0) {
+        return false;
+    }
+
+    // grow the block table so that positions [n_past, n_past + n_append) fit
+    while (group->block_table.size() * block_size < (uint32_t)(group->n_past + n_append)) {
+        bool success = kv_cache_manager->allocate(n_append, *group);
+        while (!success && evict_cached_blocks()) {
+            success = kv_cache_manager->allocate(1, *group);
+        }
+        if (!success) {
+            LLAMA_LOG_ERROR("%s: request %d cannot allocate a block for append\n", __func__, request_id);
+            return false;
+        }
+    }
+
+    // build a single-sequence batch info matching the verify batch the
+    // caller decodes next; the caller owns the batch itself (including
+    // logits on every row for acceptance checking)
+    free_curr_info();
+
+    const int32_t n_blocks = (int32_t) group->block_table.size();
+    curr_info.n_seq            = 1;
+    curr_info.n_tokens         = n_append;
+    curr_info.n_blocks_per_seq = n_blocks;
+    curr_info.write_slots      = new int32_t[n_append];
+    curr_info.block_table      = new int32_t[n_blocks];
+    curr_info.context_lens     = new int32_t[1];
+    curr_info.batch_offsets    = new int32_t[1];
+    curr_info.batch_lens       = new int32_t[1];
+
+    for (int32_t t = 0; t < n_append; ++t) {
+        const int32_t pos                     = group->n_past + t;
+        curr_info.write_slots[t]              = calculate_global_slot_index(pos, group->block_table);
+    }
+    for (int32_t b = 0; b < n_blocks; ++b) {
+        curr_info.block_table[b] = (int32_t) group->block_table[b];
+    }
+    curr_info.context_lens[0]  = group->n_past + n_append;
+    curr_info.batch_offsets[0] = 0;
+    curr_info.batch_lens[0]    = n_append;
+
+    kv_cache_manager->set_paged_batch_info(&curr_info);
+    return true;
+}
+
+bool llama_paged_scheduler_impl::commit_append(int32_t request_id, int32_t n_keep, const llama_token * tokens,
+                                               llama_token next_token, int8_t stop) {
+    llama_sequence_group * group = get_group_from_id(request_id);
+    if (!group || n_keep < 0 || !tokens) {
+        return false;
+    }
+
+    // the verify batch re-decoded the sampled token that was already queued
+    // as logical_seq.back(); count it and append the accepted drafts
+    if (group->n_decoded == 0) {
+        group->t_first_token_us = ggml_time_us();
+    }
+    group->n_decoded += 1 + n_keep;
+    group->n_past     += 1 + n_keep;
+    for (int32_t i = 0; i < n_keep; ++i) {
+        group->logical_seq.push_back(tokens[i]);
+    }
+    group->logical_seq.push_back(next_token);
+
+    if (group->n_past >= n_seq_max_ctx || stop) {
+        group->status = llama_sequence_group_status::FINISHED;
+    }
+
+    // roll attention and recurrent state back to the kept prefix; stale cells
+    // stay owned by the sequence and are rewritten by later decodes
+    kv_cache_manager->seq_rm(request_id, group->n_past, -1);
+    kv_cache_manager->set_seq_max_pos(request_id, group->n_past - 1);
+    if (hybrid_memory_manager) {
+        if (!hybrid_memory_manager->seq_rm(request_id, group->n_past, -1)) {
+            return false;
+        }
+    }
+
+    if (prefix_cache_enabled) {
+        register_completed_blocks(*group);
+    }
+    return true;
 }
 
 bool llama_paged_scheduler_impl::set_prefix_cache_enabled(bool enabled) {

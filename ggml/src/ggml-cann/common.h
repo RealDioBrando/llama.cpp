@@ -725,6 +725,45 @@ struct ggml_cann_tensor_cache {
     int64_t size  = 0;
 };
 
+struct ggml_cann_gdn_metadata_cache {
+    ~ggml_cann_gdn_metadata_cache() {
+        for (auto & it : seq_lens) {
+            if (it.second) {
+                ACL_CHECK(aclrtFree(it.second));
+            }
+        }
+        for (auto & it : state_indices) {
+            if (it.second) {
+                ACL_CHECK(aclrtFree(it.second));
+            }
+        }
+    }
+
+    std::map<int64_t, void *> seq_lens;
+    std::map<int64_t, void *> state_indices;
+};
+
+struct ggml_cann_matmul_input_cache {
+    struct entry {
+        int64_t ne[GGML_MAX_DIMS] = { 0 };
+        size_t  nb[GGML_MAX_DIMS] = { 0 };
+        int64_t dims              = 0;
+        std::unique_ptr<ggml_cann_pool_alloc> buffer;
+        uint64_t epoch            = 0;
+    };
+
+    std::map<const ggml_tensor *, entry> entries;
+    uint64_t epoch = 0;
+
+    void begin_graph() {
+        epoch++;
+    }
+
+    void clear() {
+        entries.clear();
+    }
+};
+
 /**
  * @brief Context for managing CANN backend operations.
  */
@@ -763,11 +802,18 @@ struct ggml_backend_cann_context {
     bool                      capturing       = false;   /**< true between CaptureBegin/End. */
 #endif
     bool                   async_mode;
+    bool                   graph_capture_active = false;
+    bool                   graph_prefill = false;
     // Rope Cache
     ggml_cann_rope_cache   rope_cache;
     // Constant Pool
     ggml_cann_tensor_cache rms_norm_one_tensor_cache;
     ggml_cann_tensor_cache rms_norm_zero_tensor_cache;
+    ggml_cann_tensor_cache l2_norm_gamma_cache;
+    ggml_cann_gdn_metadata_cache gdn_metadata_cache;
+    std::unique_ptr<ggml_cann_pool> matmul_input_pool;
+    // Casted activations reused by multiple matmul nodes in one graph.
+    ggml_cann_matmul_input_cache matmul_input_cache;
 
     aclrtStream streams[GGML_CANN_MAX_STREAMS] = { nullptr }; /**< Array of streams for the device. */
 
@@ -795,6 +841,10 @@ struct ggml_backend_cann_context {
      */
     ~ggml_backend_cann_context() {
         ggml_cann_set_device(device);
+        if (!matmul_input_cache.entries.empty()) {
+            ACL_CHECK(aclrtSynchronizeStream(stream()));
+        }
+        matmul_input_cache.clear();
         if (copy_event != nullptr) {
             ACL_CHECK(aclrtDestroyEvent(copy_event));
         }
@@ -836,6 +886,7 @@ struct ggml_backend_cann_context {
      * @return A unique pointer to the new memory pool.
      */
     static std::unique_ptr<ggml_cann_pool> new_pool_for_device(int device);
+    static std::unique_ptr<ggml_cann_pool> new_matmul_input_pool_for_device(int device);
 
     /**
      * @brief Get or create the memory pool for the context.
@@ -846,6 +897,13 @@ struct ggml_backend_cann_context {
             mem_pool = new_pool_for_device(device);
         }
         return *mem_pool;
+    }
+
+    ggml_cann_pool & matmul_cache_pool() {
+        if (matmul_input_pool == nullptr) {
+            matmul_input_pool = new_matmul_input_pool_for_device(device);
+        }
+        return *matmul_input_pool;
     }
 };
 
