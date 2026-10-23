@@ -1566,6 +1566,11 @@ static void ggml_backend_cann_transform_kq(ggml_tensor * tensor, const void * sr
         GGML_ABORT("kq transform called for a tensor without an NPU path");
     }
 }
+
+/* lm_head NPU: public wrapper, called by the lazy transform in aclnn_ops.cpp */
+void ggml_backend_cann_transform_kq_pub(ggml_tensor * tensor, const void * src, void * dst) {
+    ggml_backend_cann_transform_kq(tensor, src, dst);
+}
 #endif  // ASCEND_310P
 
 /**
@@ -1761,6 +1766,17 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
     int kq_path = GGML_CANN_KQ_NONE;
 #endif
     bool is_kq = kq_path != GGML_CANN_KQ_NONE;
+#ifdef ASCEND_310P
+    /* lm_head NPU: tied embedding (token_embd.weight) serves both GET_ROWS
+     * (needs the original Q8_0) and MUL_MAT (needs fractal) — skip the transform
+     * at load time, lazily repack to a cached copy at compute time */
+    if (is_kq) {
+        const std::string tname = ggml_get_name((const ggml_tensor *) tensor);
+        if (tname.find("token_embd.weight") != std::string::npos) {
+            is_kq = false;  /* keep GET_ROWS; routing is decided by supports_op (compute side) */
+        }
+    }
+#endif
     bool is_nz = !is_quantized && !is_kq && tensor->type != GGML_TYPE_BF16 && weight_to_nz &&
                  ggml_cann_is_weight_layout_candidate((const ggml_tensor *) tensor);
 
@@ -1819,6 +1835,12 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
             ggml_backend_cann_transform(tensor, data, transform_buffer);
             ACL_CHECK(aclrtMemcpy(tensor->data, size, transform_buffer, size, ACL_MEMCPY_HOST_TO_DEVICE));
             free(transform_buffer);
+#ifdef ASCEND_310P
+            /* lm_head NPU (Q8_0 tied): pre-warm the fractal copy now that the
+             * planar upload is complete — eager here, so a later captured
+             * decode graph only sees cache lookups. */
+            ggml_cann_prepare_lmhead_fractal_pub(tensor, kq_path);
+#endif
         } else {
             // NZ weight
             ACL_CHECK(aclrtMemcpy(tensor->data, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
@@ -1859,6 +1881,10 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
 
 #ifdef ASCEND_310P
         ggml_cann_prepare_tied_output_weight(tensor, &ctx->tied_output_weight_cache, ctx->device);
+        /* lm_head NPU (Q8_0 tied): pre-warm the fractal copy now that the
+         * planar upload is complete — eager here, so a later captured decode
+         * graph only sees cache lookups. */
+        ggml_cann_prepare_lmhead_fractal_pub(tensor, kq_path);
 #endif
 
         // Unlock before removing tracker, as remove_tracker destroys the mutex
@@ -3247,11 +3273,26 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
         if (getenv("GGML_CANN_DEBUG_DECISION")) {
             static std::atomic<int> g_dec_call(0);
             int call_no = g_dec_call.fetch_add(1);
-            fprintf(stderr, "[GDEC] call#%d nodes=%d op0=%d cache=%zu -> %s\n",
+            fprintf(stderr, "[GDEC] call#%d nodes=%d op0=%d cache=%zu -> %s",
                 call_no, (int) cgraph->n_nodes,
                 (int) (cgraph->n_nodes > 0 ? cgraph->nodes[0]->op : -1),
                 cann_ctx->graph_lru_cache.cache_list.size(),
                 graph_capture_required ? "CAPTURE" : "REPLAY");
+            // op-name dump: GGML_CANN_DEBUG_DECISION=ops prints the full op
+            // sequence of each backend split (first 24 entries), used to map
+            // scheduler splits to concrete ops.
+            {
+                const char * dm = getenv("GGML_CANN_DEBUG_DECISION");
+                if (dm && strcmp(dm, "ops") == 0) {
+                    fprintf(stderr, " ops=[");
+                    for (int j = 0; j < cgraph->n_nodes && j < 96; j++) {
+                        fprintf(stderr, "%s%s", j ? "," : "",
+                            ggml_op_name(cgraph->nodes[j]->op));
+                    }
+                    fprintf(stderr, "]");
+                }
+            }
+            fprintf(stderr, "\n");
             fflush(stderr);
         }
 
@@ -3700,16 +3741,17 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 return true;
             }
         case GGML_OP_SSM_CONV: {
-            // The 310P Conv2D output requires a FzToDst format conversion
-            // that costs far more than the conv itself at decode shapes.
-            // Route single-token (decode) convs to the CPU to avoid the
-            // conversion, and keep multi-token (prefill) convs on the NPU
-            // where the batch throughput outweighs it.
-            //   GGML_CANN_SSM_CONV=npu|cpu|auto (auto = shape-routed)
+            // Routing for the GDN causal conv on 310P. Historically "auto"
+            // sent single-token (decode) convs to the CPU because the old
+            // aclnnConvolution path paid a ~1.3 ms FzToDst weight repack per
+            // call. That no longer applies: the handler now prefers the
+            // vendor SsmConv1d custom op (verified, ppl-identical) and has a
+            // two-elementwise decode fast path as fallback — both avoid the
+            // Conv2D repack entirely. Decode convs on the CPU instead cost
+            // one backend split per GDN layer and blocked full-graph ACL
+            // capture, so auto now keeps every conv on the NPU.
+            //   GGML_CANN_SSM_CONV=npu|cpu|auto (auto = NPU for all shapes)
             //   GGML_CANN_SSM_CONV_OFF=1 is a legacy alias for cpu.
-            // Shape test: sx = concat(conv_states, qkv_mixed), so
-            // ne[0] == (d_conv - 1) + n_tokens; a single-token step has
-            // sx->ne[0] == kernel->ne[0].
             static const int conv_mode = []() {
                 const char * legacy = getenv("GGML_CANN_SSM_CONV_OFF");
                 if (legacy != nullptr && legacy[0] == '1') {
@@ -3720,18 +3762,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     if (mode[0] == 'c' || mode[0] == 'C' || mode[0] == '1') return 1;  // cpu
                     if (mode[0] == 'n' || mode[0] == 'N' || mode[0] == '0') return 2;  // npu
                 }
-                return 0;  // auto (shape-routed)
+                return 2;  // auto: NPU (custom op preferred, elementwise fallback)
             }();
             if (conv_mode == 1) {
-                return false;
-            }
-            if (conv_mode == 2) {
-                return true;
-            }
-            // auto: single-token conv -> CPU, multi-token -> NPU
-            const ggml_tensor * sx = op->src[0];
-            const ggml_tensor * kernel = op->src[1];
-            if (sx != nullptr && kernel != nullptr && sx->ne[0] == kernel->ne[0]) {
                 return false;
             }
             return true;
