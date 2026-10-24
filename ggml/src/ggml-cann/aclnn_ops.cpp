@@ -3881,6 +3881,7 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     }
 }
 
+void ggml_cann_rope_cache_preload(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * src0 = dst->src[0];
 
     float     freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;

@@ -2477,7 +2477,7 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
             ggml_cann_mul_mat(ctx, dst);
             break;
         case GGML_OP_MUL_MAT_ID:
-            if (ggml_cann_moe_grouped_enabled() &&
+            if (parse_bool(get_env_as_lowercase("GGML_CANN_MOE_GROUPED").value_or("off")) &&
                 ggml_cann_mul_mat_id_grouped_supported(dst)) {
                 ggml_cann_mul_mat_id_grouped(ctx, dst);
             } else {

@@ -3,7 +3,6 @@
 #include "aclnn_ops.h"
 
 #include <aclnnop/aclnn_grouped_matmul_v4.h>
-#include <aclnnop/aclnn_grouped_matmul_weight_nz.h>
 #include <aclnnop/aclnn_gather_v2.h>
 #include <aclnnop/aclnn_copy.h>
 #include <aclnnop/aclnn_cast.h>
@@ -154,8 +153,7 @@ void ggml_cann_mul_mat_id_grouped(ggml_backend_cann_context & ctx, ggml_tensor *
     int64_t gmm_in_ne[2]  = { n_embd, n_rows };
     size_t  gmm_in_nb[2]  = { sizeof(uint16_t), n_embd * sizeof(uint16_t) };
     int64_t gmm_w_ne[3]   = { n_ff, n_embd, n_exp };
-    size_t  gmm_w_nb[3]   = { sizeof(uint16_t), n_ff * sizeof(uint16_t),
-                              n_ff * n_embd * sizeof(uint16_t) };
+    size_t  gmm_w_nb[3]   = { weight->nb[1], weight->nb[0], weight->nb[2] };
     int64_t gmm_out_ne[2] = { n_ff, n_rows };
     size_t  gmm_out_nb[2] = { sizeof(uint16_t), n_ff * sizeof(uint16_t) };
 
@@ -174,17 +172,10 @@ void ggml_cann_mul_mat_id_grouped(ggml_backend_cann_context & ctx, ggml_tensor *
     acl_tensor_list_ptr acl_w_list = ggml_cann_create_tensor_list(std::move(acl_gmm_weight));
     acl_tensor_list_ptr acl_out_list = ggml_cann_create_tensor_list(std::move(acl_gmm_out));
 
-    if (weight_format == ACL_FORMAT_FRACTAL_NZ) {
-        GGML_CANN_CALL_ACLNN_OP(ctx, GroupedMatmulWeightNz, acl_x_list.get(), acl_w_list.get(), nullptr,
-                                nullptr, nullptr, nullptr, nullptr, nullptr, acl_cumsum_i64.get(),
-                                nullptr, nullptr, nullptr, 2, 0, 0, 0, nullptr, 0,
-                                acl_out_list.get(), nullptr, nullptr);
-    } else {
-        GGML_CANN_CALL_ACLNN_OP(ctx, GroupedMatmulV4, acl_x_list.get(), acl_w_list.get(), nullptr,
-                                nullptr, nullptr, nullptr, nullptr, nullptr, acl_cumsum_i64.get(),
-                                nullptr, nullptr, nullptr, 2, 0, 0, 0, acl_out_list.get(),
-                                nullptr, nullptr);
-    }
+    GGML_CANN_CALL_ACLNN_OP(ctx, GroupedMatmulV4, acl_x_list.get(), acl_w_list.get(), nullptr,
+                            nullptr, nullptr, nullptr, nullptr, nullptr, acl_cumsum_i64.get(),
+                            nullptr, nullptr, nullptr, 2, 0, 0, 0, acl_out_list.get(),
+                            nullptr, nullptr);
 
     ggml_cann_pool_alloc out_f16_alloc(ctx.pool(), ggml_nelements(dst) * sizeof(uint16_t));
     int64_t out2d_ne[2] = { n_ff, n_rows };
