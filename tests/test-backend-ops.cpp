@@ -99,6 +99,13 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         }
 
         std::vector<uint8_t> dataq(ggml_row_size(tensor->type, nels));
+        if (tensor->type == GGML_TYPE_W8A8) {
+            GGML_ASSERT(tensor->ne[2] == 1 && tensor->ne[3] == 1);
+            ggml_quantize_chunk(GGML_TYPE_W8A8, data.data(), dataq.data(), 0, tensor->ne[1], tensor->ne[0],
+                                nullptr);
+            ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
+            return;
+        }
         {
             // parallel quantization by block
             size_t blck_size = ggml_blck_size(tensor->type);
@@ -4491,6 +4498,10 @@ struct test_mul_mat : public test_case {
     double max_nmse_err(ggml_backend_t backend) override {
         // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            return 2e-2;
+        }
+        // CANN A8 dynamically quantizes activations; the CPU reference uses exact F32 activations.
+        if (type_a == GGML_TYPE_W8A8) {
             return 2e-2;
         }
         return max_nmse_err();
@@ -9152,6 +9163,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 16,  3,  32,   {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 128, 1,  64,   {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 256, 32, 128,  {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W8A8, GGML_TYPE_F32, 16,  3,  32,   {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W8A8, GGML_TYPE_F32, 128, 1,  64,   {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W8A8, GGML_TYPE_F32, 256, 32, 128,  {1, 1}, {1, 1}));
+
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
             test_cases.emplace_back(new test_mul_mat(type_a,    GGML_TYPE_F32, 16,  i, 1*256, { 1,  1}, {1, 1}));
@@ -10128,6 +10146,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Dense W8A8 comparison cases: F16 baseline vs W8A8/W8A16 weights.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 16,  3,  32,  {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 128, 1,  64,  {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 256, 32, 128, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W8A8, GGML_TYPE_F32, 16,  3,  32,  {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W8A8, GGML_TYPE_F32, 128, 1,  64,  {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W8A8, GGML_TYPE_F32, 256, 32, 128, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 4096, 1,   4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 4096, 512, 4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W8A8, GGML_TYPE_F32, 4096, 1,   4096, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W8A8, GGML_TYPE_F32, 4096, 512, 4096, {1, 1}, {1, 1}));
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

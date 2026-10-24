@@ -255,6 +255,13 @@ typedef struct {
 } block_q8_0;
 static_assert(sizeof(block_q8_0) == sizeof(ggml_half) + QK8_0, "wrong q8_0 block size/padding");
 
+#define QK_W8A8 32
+typedef struct {
+    ggml_half d;       // repeated per-output-channel scale
+    int8_t    qs[QK_W8A8]; // symmetric INT8 payload
+} block_w8a8;
+static_assert(sizeof(block_w8a8) == sizeof(ggml_half) + QK_W8A8, "wrong w8a8 block size/padding");
+
 #define QK8_1 32
 typedef struct {
     GGML_EXTENSION union {

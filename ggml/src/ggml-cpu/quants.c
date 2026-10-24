@@ -50,6 +50,9 @@ void quantize_row_q8_0_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
     quantize_row_q8_0_ref(x, y, k);
 }
 
+void quantize_row_w8a8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_w8a8_ref(x, (block_w8a8 *) y, k);
+}
 void quantize_row_q8_1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q8_1_ref(x, y, k);
 }
