@@ -2275,10 +2275,10 @@ static void ggml_cann_mul_mat_w8a8_a8(ggml_backend_cann_context & ctx, ggml_tens
     GGML_ASSERT(dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32);
 
     ggml_cann_pool_alloc input_allocator(ctx.pool());
-    void * input_buffer = input->data;
-    if (input->type == GGML_TYPE_F32) {
-        input_buffer = input_allocator.alloc(static_cast<size_t>(m * k) * sizeof(uint16_t));
+    input_allocator.alloc(static_cast<size_t>(m * k) * sizeof(uint16_t));
+    void * input_buffer = input_allocator.get();
 
+    {
         int64_t input_cast_ne[GGML_MAX_DIMS];
         size_t  input_cast_nb[GGML_MAX_DIMS];
         memcpy(input_cast_ne, input->ne, sizeof(input_cast_ne));
@@ -2291,15 +2291,11 @@ static void ggml_cann_mul_mat_w8a8_a8(ggml_backend_cann_context & ctx, ggml_tens
         acl_tensor_ptr cast = ggml_cann_create_tensor(input_buffer, ACL_FLOAT16, sizeof(uint16_t),
                                                       input_cast_ne, input_cast_nb, GGML_MAX_DIMS);
         aclnn_cast(ctx, src.get(), cast.get(), ACL_FLOAT16);
-        input_buffer = input_allocator.get();
-    } else {
-        GGML_ASSERT(input->type == GGML_TYPE_F16);
     }
 
-    // src1 is stored [K,M]. DynamicQuant consumes a logical [M,K] view.
-    acl_tensor_ptr acl_input = input->type == GGML_TYPE_F32
-        ? ggml_cann_create_direct_tensor(input_buffer, { m, k }, { k, 1 }, ACL_FLOAT16)
-        : ggml_cann_create_direct_tensor(input_buffer, { m, k }, { 1, k }, ACL_FLOAT16);
+    // src1 is stored [K,M]. DynamicQuant requires a contiguous [M,K] input.
+    acl_tensor_ptr acl_input =
+        ggml_cann_create_direct_tensor(input_buffer, { m, k }, { k, 1 }, ACL_FLOAT16);
 
     ggml_cann_pool_alloc q_x_allocator(ctx.pool(), static_cast<size_t>(m * k));
     ggml_cann_pool_alloc act_scale_allocator(ctx.pool(), static_cast<size_t>(m) * sizeof(float));

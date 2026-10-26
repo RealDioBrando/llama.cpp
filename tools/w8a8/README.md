@@ -16,3 +16,23 @@ Example:
 ```bash
 python tools/w8a8/convert_w8a8.py input.npz output.gguf --tensor-name weight
 ```
+
+## Complete GGUF model quantization
+
+The tensor-only adapter above is useful for explicit weight artifacts. For a
+complete model GGUF, use `llama-quantize` with the fork-local `W8A8` file type:
+
+```bash
+llama-quantize input-f16.gguf output-w8a8.gguf W8A8
+```
+
+By default, dense layer weights are converted to W8A8, token embeddings remain
+F16 for `GET_ROWS`, and the output projection follows the quantizer's normal
+mixed-type policy. To force the output projection to W8A8 as well:
+
+```bash
+llama-quantize --output-tensor-type w8a8 input-f16.gguf output-w8a8.gguf W8A8
+```
+
+The A8 runtime path is enabled by default. Set `GGML_CANN_W8A8_A8=0` to use
+the W8A16 fallback.
