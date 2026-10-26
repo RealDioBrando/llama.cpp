@@ -1749,6 +1749,17 @@ extern "C" {
     LLAMA_API void llama_paged_scheduler_set_on_finish(struct llama_paged_scheduler * sched,
                                                        llama_paged_on_finish_cb       cb,
                                                        void *                         user_data);
+
+    // Cancel a queued or in-flight request. The request is removed from the
+    // scheduler, its blocks are released (CPU-pool blocks included) and the
+    // finish callback fires synchronously. Returns false when request_id is
+    // unknown (already finished or never added).
+    LLAMA_API bool llama_paged_scheduler_cancel(struct llama_paged_scheduler * sched,
+                                                int32_t                        request_id);
+
+    // Exclusive upper bound for request ids: the paged memory's n_seq_max,
+    // minus the prefix-cache checkpoint slot reservation on hybrid models.
+    LLAMA_API int32_t llama_paged_scheduler_max_request_id(const struct llama_paged_scheduler * sched);
 #ifdef __cplusplus
 }
 #endif

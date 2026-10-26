@@ -167,6 +167,11 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-cms, --checkpoint-min-step N` | minimum spacing between context checkpoints in tokens (default: 8192, 0 = no minimum)<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
+| `-kvp, --kv-paged, -no-kvp, --no-kv-paged` | use paged KV buffer with a continuous-batching scheduler, shared across all sequences (default: disabled), see [Paged KV cache](#paged-kv-cache)<br/>(env: LLAMA_ARG_KV_PAGED) |
+| `-ncpub, --n-cpu-blocks N` | number of physical CPU blocks for paged KV cache (default: 1) |
+| `-ngpub, --n-gpu-blocks N` | number of physical GPU blocks for paged KV cache (default: auto-fitted from free device memory) |
+| `-kvbls, --kv-block-size N` | number of tokens per paged KV block, must be a power of 2 (default: 16) |
+| `--kv-paged-watermark N` | fraction of KV blocks reserved before processing new requests (default: 0.05, range [0.0, 1.0)) |
 | `--cache-idle-slots, --no-cache-idle-slots` | save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)<br/>(env: LLAMA_ARG_CACHE_IDLE_SLOTS) |
 | `--context-shift, --no-context-shift` | whether to use context shift on infinite text generation (default: disabled)<br/>(env: LLAMA_ARG_CONTEXT_SHIFT) |
 | `-r, --reverse-prompt PROMPT` | halt generation at PROMPT, return control in interactive mode |
@@ -334,6 +339,32 @@ services:
       LLAMA_ARG_ENDPOINT_METRICS: 1
       LLAMA_ARG_PORT: 8080
 ```
+
+### Paged KV cache
+
+`--kv-paged` switches the server from the per-slot KV management to a block-pooled paged KV
+cache driven by a vLLM-style continuous-batching scheduler (the same engine as the
+`llama-paged` example). Requests are queued, admitted and preempted dynamically based on the
+number of free KV blocks instead of fixed per-slot contexts.
+
+Phase-1 restrictions:
+
+- Single device: the model must be fully offloaded to one GPU (`-sm none -mg <id>` on
+  multi-GPU machines) or run on CPU, and `-b` must equal `-ub`.
+- `-c` (context size) becomes the per-request context limit; there is no context shift, so a
+  request ends when its context is full.
+- Only text completion is served: `/completion` and `/v1/completions`, including streaming,
+  sampling parameters, `stop` strings and `n_predict`. Chat completions, infill, embeddings,
+  reranking, grammar/structured output, `n_cmpl > 1`, multimodal inputs, speculative decoding,
+  LoRA adapters, `--cache-ram` and the `/slots` save/restore endpoints return an error or are
+  rejected at startup.
+- Explicit `id_slot` requests are not supported.
+- SWA architectures (gemma3, llama4, etc.) are not yet supported; hybrid recurrent models
+  (Qwen3.5) reserve a few sequence ids internally, reducing the effective slot count.
+
+The number of slots (`-np`) caps how many requests run (or wait) inside the scheduler;
+additional requests are queued by the server as usual. KV blocks are auto-fitted from free
+device memory unless `-ngpub` is given explicitly.
 
 ### Multimodal support
 

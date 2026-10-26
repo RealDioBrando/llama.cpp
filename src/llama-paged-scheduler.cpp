@@ -236,3 +236,17 @@ LLAMA_API const struct llama_paged_batch_info * llama_paged_scheduler_get_batch_
     }
     return sched->impl.get_curr_batch_info();
 }
+
+LLAMA_API bool llama_paged_scheduler_cancel(struct llama_paged_scheduler * sched, int32_t request_id) {
+    if (!sched) {
+        return false;
+    }
+    return sched->impl.cancel(request_id);
+}
+
+LLAMA_API int32_t llama_paged_scheduler_max_request_id(const struct llama_paged_scheduler * sched) {
+    if (!sched) {
+        return 0;
+    }
+    return sched->impl.max_request_id();
+}

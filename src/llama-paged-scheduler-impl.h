@@ -28,12 +28,17 @@ class llama_paged_scheduler_impl {
     bool                   queue_request(llama_sequence_group group);
     void update(const llama_batch & batch, const std::vector<llama_token> & new_tokens, const int8_t * stop_flags);
     void set_on_finish(llama_paged_on_finish_cb cb, void * user_data);
+    bool cancel(int32_t request_id);
+    int32_t max_request_id() const;
     llama_sequence_group *         get_group_from_id(int32_t request_id) const;
     const llama_paged_batch_info * get_curr_batch_info() const;
     bool set_prefix_cache_enabled(bool enabled);
 
   private:
     void insert_sorted_by_arrival_time(llama_sequence_group_ptr new_group, llama_sequence_group_list & list);
+
+    // Remove and release-ownership the group with this request_id, or nullptr.
+    static llama_sequence_group_ptr take_from_list(llama_sequence_group_list & list, int32_t request_id);
 
     bool check_deadlock(uint32_t n_candidates, uint32_t n_swapped, uint32_t n_waiting) const;
     bool check_livelock(uint32_t n_swapped, uint32_t prev_n_swapped);

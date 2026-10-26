@@ -257,6 +257,112 @@ static void compare_results(const path_result & ref, const path_result & paged) 
     fprintf(stderr, "test-paged-kv-e2e: PASSED\n");
 }
 
+// Exercises cancel on waiting and running requests, unknown-id rejection and
+// request-id reuse after cancel.
+static void run_cancel(const std::string & model_path) {
+    common_params params;
+    params.model.path    = model_path;
+    params.n_ctx         = 256;
+    params.n_batch       = 64;
+    params.n_ubatch      = 64;
+    params.n_predict     = N_PREDICT;
+    params.sampling.temp = 0.0f;  // greedy
+    params.warmup        = false;
+    params.kv_paged      = true;
+    params.n_sequences   = 2;
+    params.n_parallel    = 2;
+    params.fit_params    = false;
+    params.n_gpu_blocks  = 4096;
+    params.n_cpu_blocks  = 512;
+    params.cpuparams.n_threads       = 1;
+    params.cpuparams_batch.n_threads = 1;
+
+    auto            init  = common_init_from_params(params);
+    llama_model *   model = init->model();
+    llama_context * ctx   = init->context();
+    EXPECT_TRUE(model != nullptr);
+    EXPECT_TRUE(ctx != nullptr);
+
+    llama_paged_scheduler * sched = llama_paged_scheduler_init(ctx);
+    EXPECT_TRUE(sched != nullptr);
+
+    EXPECT_TRUE(llama_paged_scheduler_max_request_id(sched) >= 2);
+
+    std::vector<int32_t> finished;
+    llama_paged_scheduler_set_on_finish(
+        sched,
+        [](int32_t request_id, const llama_token *, int32_t, void * ud) {
+            static_cast<std::vector<int32_t> *>(ud)->push_back(request_id);
+        },
+        &finished);
+
+    std::vector<llama_token> prompt_tokens = common_tokenize(ctx, TEST_PROMPT, true);
+    EXPECT_TRUE(!prompt_tokens.empty());
+
+    EXPECT_TRUE(llama_paged_scheduler_add_request(sched, prompt_tokens.data(), (int32_t) prompt_tokens.size(), 0));
+    EXPECT_TRUE(llama_paged_scheduler_add_request(sched, prompt_tokens.data(), (int32_t) prompt_tokens.size(), 1));
+    // duplicate id must be rejected while the request is queued
+    EXPECT_TRUE(!llama_paged_scheduler_add_request(sched, prompt_tokens.data(), (int32_t) prompt_tokens.size(), 0));
+
+    common_sampler * smpl = common_sampler_init(model, params.sampling);
+    EXPECT_TRUE(smpl != nullptr);
+
+    llama_batch batch = {};
+    int         steps = 0;
+    while (steps < 8) {
+        EXPECT_TRUE(llama_paged_scheduler_prepare_batch(sched, &batch));
+        if (batch.n_tokens == 0) {
+            break;
+        }
+
+        EXPECT_TRUE(llama_decode(ctx, batch) == 0);
+        llama_synchronize(ctx);
+
+        const llama_paged_batch_info * info = llama_paged_scheduler_get_batch_info(sched);
+        EXPECT_TRUE(info != nullptr);
+
+        std::vector<llama_token> tokens;
+        std::vector<int8_t>      stops;
+        for (int i = 0; i < info->n_seq; ++i) {
+            const int32_t off = info->batch_offsets[i];
+            const int32_t len = info->batch_lens[i];
+            llama_paged_seq_state st = {};
+            EXPECT_TRUE(llama_paged_scheduler_get_seq_state(sched, batch.seq_id[off][0], &st));
+            llama_token t = LLAMA_TOKEN_NULL;
+            if (len == 1 || (len > 1 && (int32_t) st.n_past + len == (int32_t) st.n_prompt_total)) {
+                t = common_sampler_sample(smpl, ctx, off + len - 1);
+                common_sampler_accept(smpl, t, true);
+            }
+            tokens.push_back(t);
+            stops.push_back(0);
+        }
+        llama_paged_scheduler_update(sched, &batch, tokens.data(), stops.data());
+        steps++;
+
+        if (steps == 1) {
+            // one waiting request is admitted per step, so request 1 is
+            // still waiting: cancel it and check the callback fired
+            EXPECT_TRUE(llama_paged_scheduler_cancel(sched, 1));
+            EXPECT_TRUE(!llama_paged_scheduler_cancel(sched, 42));
+            EXPECT_TRUE(finished.size() == 1 && finished[0] == 1);
+        } else if (steps == 2) {
+            // request 0 is running: cancel it mid-generation
+            EXPECT_TRUE(llama_paged_scheduler_cancel(sched, 0));
+            EXPECT_TRUE(finished.size() == 2 && finished[1] == 0);
+        }
+    }
+
+    EXPECT_TRUE(finished.size() == 2);
+
+    // the id is free again after cancel
+    EXPECT_TRUE(llama_paged_scheduler_add_request(sched, prompt_tokens.data(), (int32_t) prompt_tokens.size(), 0));
+    EXPECT_TRUE(llama_paged_scheduler_cancel(sched, 0));
+
+    common_sampler_free(smpl);
+    llama_paged_scheduler_free(sched);
+    fprintf(stderr, "test-paged-kv-e2e: cancel PASSED\n");
+}
+
 int main(int argc, char ** argv) {
     common_params params;
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_PAGED)) {
@@ -280,6 +386,9 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "  got %zu tokens, %d-vocab logits\n", paged.tokens.size(), paged.n_vocab);
 
     compare_results(ref, paged);
+
+    fprintf(stderr, "test-paged-kv-e2e: running cancel case\n");
+    run_cancel(params.model.path);
 
     llama_backend_free();
     return 0;

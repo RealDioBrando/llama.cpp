@@ -145,6 +145,11 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group) {
         return false;
     }
 
+    if (id_to_group.count(group.request_id)) {
+        LLAMA_LOG_ERROR("%s: request %d is still queued or running.\n", __func__, group.request_id);
+        return false;
+    }
+
     if (prefix_cache.seq_reserved(group.request_id)) {
         LLAMA_LOG_ERROR("%s: request %d uses a seq id reserved for prefix-cache checkpoints.\n", __func__,
                         group.request_id);
@@ -787,6 +792,56 @@ void llama_paged_scheduler_impl::update(const llama_batch &              batch,
 void llama_paged_scheduler_impl::set_on_finish(llama_paged_on_finish_cb cb, void * user_data) {
     on_finish_cb        = cb;
     on_finish_user_data = user_data;
+}
+
+llama_sequence_group_ptr llama_paged_scheduler_impl::take_from_list(llama_sequence_group_list & list,
+                                                                    int32_t                     request_id) {
+    for (auto it = list.begin(); it != list.end(); ++it) {
+        if (*it && (*it)->request_id == request_id) {
+            llama_sequence_group_ptr group_ptr = std::move(*it);
+            list.erase(it);
+            return group_ptr;
+        }
+    }
+    return nullptr;
+}
+
+bool llama_paged_scheduler_impl::cancel(int32_t request_id) {
+    auto it = id_to_group.find(request_id);
+    if (it == id_to_group.end()) {
+        return false;
+    }
+
+    llama_sequence_group_ptr group_ptr = take_from_list(running, request_id);
+    if (!group_ptr) {
+        group_ptr = take_from_list(swapped, request_id);
+    }
+    if (!group_ptr) {
+        group_ptr = take_from_list(waiting, request_id);
+    }
+    if (!group_ptr) {
+        return false;
+    }
+
+    LLAMA_LOG("%s: request %d cancelled (was waiting=%d swapped=%d running=%d)\n", __func__, request_id,
+              group_ptr->status == llama_sequence_group_status::WAITING,
+              group_ptr->status == llama_sequence_group_status::SWAPPED,
+              group_ptr->status == llama_sequence_group_status::RUNNING);
+
+    // Reap synchronously: free_blocks releases GPU and CPU-pool blocks alike,
+    // so a swapped-out request never needs a swap-in to be reaped.
+    group_ptr->status = llama_sequence_group_status::FINISHED;
+    finish(*group_ptr);
+    return true;
+}
+
+int32_t llama_paged_scheduler_impl::max_request_id() const {
+    int32_t n_seq = (int32_t) kv_cache_manager->get_n_seq_max();
+    const int32_t ckpt_base = prefix_cache.ckpt_slot_base();
+    if (ckpt_base >= 0 && ckpt_base < n_seq) {
+        return ckpt_base;
+    }
+    return n_seq;
 }
 
 bool llama_paged_scheduler_impl::set_prefix_cache_enabled(bool enabled) {
