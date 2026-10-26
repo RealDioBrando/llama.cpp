@@ -2546,17 +2546,12 @@ common_speculative_init_result::common_speculative_init_result(
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
 
-    // the paged scheduler does not drive draft decodes, so the draft context
-    // always uses a plain unified KV cache (the draft KV is tiny anyway)
-    cparams.kv_paged = false;
-
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
-    // recurrent MTP drafts need state snapshots for rolling back rejected tails
-    cparams.n_rs_seq  = params.speculative.need_n_rs_seq();
+    cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
     std::string model_path;

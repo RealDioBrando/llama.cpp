@@ -1697,24 +1697,6 @@ extern "C" {
                                                 const llama_token *            tokens,
                                                 const int8_t *                 stop_flags);
 
-    // Speculative decoding support. prepare_append routes the next decode of
-    // a single-sequence batch of n_append tokens at positions
-    // [n_past, n_past + n_append) through the paged block table. The caller
-    // builds that batch itself (logits on every row). commit_append counts
-    // the re-decoded sampled token plus n_keep accepted drafts (tokens,
-    // appended to the sequence) and queues next_token as the pending decode
-    // for the next cycle. KV cells beyond the kept prefix are rolled back.
-    LLAMA_API bool llama_paged_scheduler_prepare_append(struct llama_paged_scheduler * sched,
-                                                        int32_t                        request_id,
-                                                        int32_t                        n_append);
-
-    LLAMA_API bool llama_paged_scheduler_commit_append(struct llama_paged_scheduler * sched,
-                                                       int32_t                        request_id,
-                                                       int32_t                        n_keep,
-                                                       const llama_token *            tokens,
-                                                       llama_token                    next_token,
-                                                       int8_t                         stop);
-
     // Introspection.
     LLAMA_API bool llama_paged_scheduler_get_seq_state(struct llama_paged_scheduler * sched,
                                                        int32_t                        request_id,

@@ -398,30 +398,9 @@ void llama_kv_cache_paged::clear(bool /*data*/) {
     sequence_positions.clear();
 }
 
-bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    auto it = sequence_positions.find(seq_id);
-    if (it == sequence_positions.end()) {
-        return true;
-    }
-
-    // full clear (also covers free_blocks' (0, 0) call)
-    if (p0 <= it->second.min && (p1 == -1 || p1 <= p0)) {
-        sequence_positions.erase(it);
-        return true;
-    }
-
-    if (p1 == -1) {
-        // logical truncation: drop positions >= p0. Stale cells are never
-        // read (attention length comes from the batch context) and are
-        // rewritten by the next decode at these slots.
-        if (p0 <= it->second.max) {
-            it->second.max = p0 - 1;
-        }
-        return true;
-    }
-
-    GGML_ASSERT(false && "paged seq_rm: middle-range clears are not supported");
-    return false;
+bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos /*p0*/, llama_pos /*p1*/) {
+    sequence_positions.erase(seq_id);
+    return true;
 }
 
 llama_pos llama_kv_cache_paged::seq_pos_min(llama_seq_id seq_id) const {

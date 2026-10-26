@@ -177,27 +177,6 @@ LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler * sched
     sched->impl.update(*batch, tokens_vec, stop_flags);
 }
 
-LLAMA_API bool llama_paged_scheduler_prepare_append(struct llama_paged_scheduler * sched,
-                                                    int32_t                        request_id,
-                                                    int32_t                        n_append) {
-    if (!sched) {
-        return false;
-    }
-    return sched->impl.prepare_append(request_id, n_append);
-}
-
-LLAMA_API bool llama_paged_scheduler_commit_append(struct llama_paged_scheduler * sched,
-                                                   int32_t                        request_id,
-                                                   int32_t                        n_keep,
-                                                   const llama_token *            tokens,
-                                                   llama_token                    next_token,
-                                                   int8_t                         stop) {
-    if (!sched) {
-        return false;
-    }
-    return sched->impl.commit_append(request_id, n_keep, tokens, next_token, stop);
-}
-
 LLAMA_API void llama_paged_scheduler_set_on_finish(struct llama_paged_scheduler * sched,
                                                    llama_paged_on_finish_cb       cb,
                                                    void *                         user_data) {
