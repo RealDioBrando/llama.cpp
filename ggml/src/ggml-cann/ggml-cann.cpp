@@ -2655,7 +2655,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
 #ifdef ASCEND_310P
                     case GGML_TYPE_W8A8:
                         return op->src[0]->ne[0] % 32 == 0 &&
-                               op->src[0]->ne[0] <= 65535 && op->src[0]->ne[1] <= 65535 &&
+                               op->src[0]->ne[0] <= 65535 &&
                                op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
                                op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
                                (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
