@@ -2798,30 +2798,13 @@ static void ggml_backend_cann_synchronize(ggml_backend_t backend) {
 static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
                                int                                 node_idx,
                                std::initializer_list<enum ggml_op> ops) {
+    if (!ggml_can_fuse(cgraph, node_idx, ops)) {
+        return false;
+    }
+
     // CANN backend supports fusing ADD + RMS_NORM operations
     if ((ops.size() == 2) && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_RMS_NORM) {
-        // Bypass ggml_can_fuse() which requires single-use on ADD.
-        // aclnnAddRmsNorm writes both ADD result and RMS_NORM result,
-        // so fusing is safe even when ADD has multiple consumers
-        // (e.g. residual connection used by both norm and next ADD).
-        if (node_idx + 2 > cgraph->n_nodes) {
-            return false;
-        }
-
-        ggml_tensor * add_node  = cgraph->nodes[node_idx];
-        ggml_tensor * norm_node = cgraph->nodes[node_idx + 1];
-
-        if (add_node->op != GGML_OP_ADD || norm_node->op != GGML_OP_RMS_NORM) {
-            return false;
-        }
-        if (!(add_node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
-            !(norm_node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-            return false;
-        }
-        // RMS_NORM must consume the ADD result
-        if (norm_node->src[0] != add_node) {
-            return false;
-        }
+        ggml_tensor * add_node = cgraph->nodes[node_idx];
         // TODO: support broadcast for ADD + RMS_NORM
         if (add_node->src[0]->ne[0] != add_node->src[1]->ne[0] || add_node->src[0]->ne[1] != add_node->src[1]->ne[1] ||
             add_node->src[0]->ne[2] != add_node->src[1]->ne[2] || add_node->src[0]->ne[3] != add_node->src[1]->ne[3]) {
@@ -2830,83 +2813,6 @@ static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
         return true;
     }
 
-    // CANN backend supports fusing RMS_NORM + MUL(weight) operations
-    if ((ops.size() == 2) && ops.begin()[0] == GGML_OP_RMS_NORM && ops.begin()[1] == GGML_OP_MUL) {
-        if (node_idx + 2 > cgraph->n_nodes) {
-            return false;
-        }
-
-        ggml_tensor * norm_node = cgraph->nodes[node_idx];
-        ggml_tensor * mul_node  = cgraph->nodes[node_idx + 1];
-
-        if (norm_node->op != GGML_OP_RMS_NORM || mul_node->op != GGML_OP_MUL) {
-            return false;
-        }
-        if (!(norm_node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
-            !(mul_node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-            return false;
-        }
-        // MUL must consume the RMS_NORM result
-        ggml_tensor * mw = nullptr;
-        if (mul_node->src[0] == norm_node) {
-            mw = mul_node->src[1];
-        } else if (mul_node->src[1] == norm_node) {
-            mw = mul_node->src[0];
-        } else {
-            return false;
-        }
-        // weight must be 1D (broadcast along ne[0])
-        if (mw->ne[1] != 1 || mw->ne[2] != 1 || mw->ne[3] != 1) {
-            return false;
-        }
-        if (mw->ne[0] != norm_node->ne[0]) {
-            return false;
-        }
-        // weight type must match norm output type
-        if (mw->type != norm_node->type) {
-            return false;
-        }
-        return true;
-    }
-
-    if (!ggml_can_fuse(cgraph, node_idx, ops)) {
-        return false;
-    }
-
-    return false;
-}
-
-// Check if node after RMS_NORM is a MUL with norm weight (for three-way fusion)
-static bool cann_can_fuse_norm_mul(const struct ggml_cgraph * cgraph, int norm_idx) {
-    if (norm_idx + 2 > cgraph->n_nodes) {
-        return false;
-    }
-    ggml_tensor * norm_node = cgraph->nodes[norm_idx];
-    ggml_tensor * mul_node  = cgraph->nodes[norm_idx + 1];
-    if (norm_node->op != GGML_OP_RMS_NORM || mul_node->op != GGML_OP_MUL) {
-        return false;
-    }
-    if (!(norm_node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
-        !(mul_node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
-        return false;
-    }
-    ggml_tensor * mw = nullptr;
-    if (mul_node->src[0] == norm_node) {
-        mw = mul_node->src[1];
-    } else if (mul_node->src[1] == norm_node) {
-        mw = mul_node->src[0];
-    } else {
-        return false;
-    }
-    if (mw->ne[1] != 1 || mw->ne[2] != 1 || mw->ne[3] != 1) {
-        return false;
-    }
-    if (mw->ne[0] != norm_node->ne[0]) {
-        return false;
-    }
-    if (mw->type != norm_node->type) {
-        return false;
-    }
     return true;
 }
 
@@ -3100,7 +3006,7 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 #endif  // USE_ACL_GRAPH
     // Only perform the graph execution if CANN graphs are not enabled, or we are capturing the graph.
     // With the use of CANN graphs, the execution will be performed by the graph launch.
-    static bool opt_fusion = parse_bool(get_env_as_lowercase("GGML_CANN_OPERATOR_FUSION").value_or("true"));
+    static bool opt_fusion = parse_bool(get_env_as_lowercase("GGML_CANN_OPERATOR_FUSION").value_or(""));
 
     if (!use_cann_graph || cann_graph_capture_required) {
         int fused_until = -1;
@@ -3114,22 +3020,9 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
             }
 
             if (opt_fusion) {
-                // Three-way: ADD + RMS_NORM + MUL(weight)
-                if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM }) &&
-                    cann_can_fuse_norm_mul(cgraph, i + 1)) {
-                    ggml_cann_op_add_rms_norm_mul_fused(*cann_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
-                    i += 2;
-                    continue;
-                }
                 // Two-way: ADD + RMS_NORM
                 if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM })) {
                     ggml_cann_op_add_rms_norm_fused(*cann_ctx, node, cgraph->nodes[i + 1]);
-                    i++;
-                    continue;
-                }
-                // Two-way: RMS_NORM + MUL(weight)
-                if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
-                    ggml_cann_op_rms_norm_mul_fused(*cann_ctx, node, cgraph->nodes[i + 1]);
                     i++;
                     continue;
                 }
@@ -3154,11 +3047,6 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                 continue;
             }
 
-            if (getenv("GGML_CANN_OP_DEBUG")) {
-                fprintf(stderr, "[CANN op dev=%d %d/%d] op=%s name=%s\n", cann_ctx->device, i, cgraph->n_nodes,
-                        ggml_op_name(node->op), node->name);
-                fflush(stderr);
-            }
             bool ok = ggml_cann_compute_forward(*cann_ctx, node);
             if (!ok) {
                 GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
@@ -3273,26 +3161,11 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
         if (getenv("GGML_CANN_DEBUG_DECISION")) {
             static std::atomic<int> g_dec_call(0);
             int call_no = g_dec_call.fetch_add(1);
-            fprintf(stderr, "[GDEC] call#%d nodes=%d op0=%d cache=%zu -> %s",
+            fprintf(stderr, "[GDEC] call#%d nodes=%d op0=%d cache=%zu -> %s\n",
                 call_no, (int) cgraph->n_nodes,
                 (int) (cgraph->n_nodes > 0 ? cgraph->nodes[0]->op : -1),
                 cann_ctx->graph_lru_cache.cache_list.size(),
                 graph_capture_required ? "CAPTURE" : "REPLAY");
-            // op-name dump: GGML_CANN_DEBUG_DECISION=ops prints the full op
-            // sequence of each backend split (first 24 entries), used to map
-            // scheduler splits to concrete ops.
-            {
-                const char * dm = getenv("GGML_CANN_DEBUG_DECISION");
-                if (dm && strcmp(dm, "ops") == 0) {
-                    fprintf(stderr, " ops=[");
-                    for (int j = 0; j < cgraph->n_nodes && j < 96; j++) {
-                        fprintf(stderr, "%s%s", j ? "," : "",
-                            ggml_op_name(cgraph->nodes[j]->op));
-                    }
-                    fprintf(stderr, "]");
-                }
-            }
-            fprintf(stderr, "\n");
             fflush(stderr);
         }
 
@@ -3688,15 +3561,6 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     return false;
                 }
 #ifdef ASCEND_310P
-                // Skip-mask PFA decode path: exact n_kv required, handled
-                // fully on device, so it is safe to capture.
-                static bool force_skip_mask_fa = getenv("GGML_CANN_SKIP_MASK_FA") != nullptr &&
-                    strcmp(getenv("GGML_CANN_SKIP_MASK_FA"), "0") != 0;
-                if (force_skip_mask_fa && op->src[3] != nullptr && op->src[0]->ne[1] == 1 &&
-                    op->src[3]->ne[1] == 1 && op->src[3]->ne[2] == 1 &&
-                    op->src[0]->ne[3] == op->src[3]->ne[3]) {
-                    return true;
-                }
                 // alibi bias cannot be fused on 310P (the prefill path has no
                 // free pseShift channel for it) - route it to the CPU instead
                 // of silently computing a wrong result.

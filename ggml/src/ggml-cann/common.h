@@ -725,24 +725,6 @@ struct ggml_cann_tensor_cache {
     int64_t size  = 0;
 };
 
-struct ggml_cann_gdn_metadata_cache {
-    ~ggml_cann_gdn_metadata_cache() {
-        for (auto & it : seq_lens) {
-            if (it.second) {
-                ACL_CHECK(aclrtFree(it.second));
-            }
-        }
-        for (auto & it : state_indices) {
-            if (it.second) {
-                ACL_CHECK(aclrtFree(it.second));
-            }
-        }
-    }
-
-    std::map<int64_t, void *> seq_lens;
-    std::map<int64_t, void *> state_indices;
-};
-
 struct ggml_cann_matmul_input_cache {
     struct entry {
         int64_t ne[GGML_MAX_DIMS] = { 0 };
@@ -809,8 +791,6 @@ struct ggml_backend_cann_context {
     // Constant Pool
     ggml_cann_tensor_cache rms_norm_one_tensor_cache;
     ggml_cann_tensor_cache rms_norm_zero_tensor_cache;
-    ggml_cann_tensor_cache l2_norm_gamma_cache;
-    ggml_cann_gdn_metadata_cache gdn_metadata_cache;
     std::unique_ptr<ggml_cann_pool> matmul_input_pool;
     // Casted activations reused by multiple matmul nodes in one graph.
     ggml_cann_matmul_input_cache matmul_input_cache;

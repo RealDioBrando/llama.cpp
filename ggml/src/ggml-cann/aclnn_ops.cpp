@@ -47,7 +47,6 @@
 #include <aclnnop/aclnn_exp.h>
 #include <aclnnop/aclnn_fill_scalar.h>
 #include <aclnnop/aclnn_fused_infer_attention_score_v2.h>
-#include <aclnnop/aclnn_fused_infer_attention_score_v5.h>
 #include <aclnnop/aclnn_incre_flash_attention_v4.h>
 #include <aclnnop/aclnn_prompt_flash_attention_v3.h>
 #include <aclnnop/aclnn_ger.h>
@@ -73,7 +72,6 @@
 #include <aclnnop/aclnn_pow.h>
 #include <aclnnop/aclnn_quant_matmul_v5.h>
 #include <aclnnop/aclnn_pow_tensor_tensor.h>
-#include <aclnnop/aclnn_prompt_flash_attention_v3.h>
 #include <aclnnop/aclnn_recurrent_gated_delta_rule.h>
 #include <aclnnop/aclnn_reduce_sum.h>
 #include <aclnnop/aclnn_reflection_pad1d.h>
@@ -1131,51 +1129,6 @@ static void cann_copy(ggml_backend_cann_context & ctx, aclTensor * acl_src, aclT
     GGML_CANN_CALL_ACLNN_OP(ctx, InplaceCopy, acl_dst, acl_src);
 }
 
-// Try 2D memcpy for non-contiguous tensors with a single strided dimension.
-// Returns true if handled, false if caller should fall back.
-static bool cann_memcpy2d(ggml_backend_cann_context & ctx,
-                          const ggml_tensor * src, const ggml_tensor * dst) {
-    if (src->type != dst->type || src->data == dst->data) {
-        return src->data == dst->data;
-    }
-
-    size_t ts = ggml_type_size(src->type);
-    if (src->nb[0] != ts || dst->nb[0] != ts) return false;
-
-    // find innermost contiguous dims shared by src and dst
-    int cd = 1;
-    for (int i = 1; i < GGML_MAX_DIMS; i++) {
-        bool sc = (src->nb[i] == src->nb[i-1] * src->ne[i-1]);
-        bool dc = (dst->nb[i] == dst->nb[i-1] * dst->ne[i-1]);
-        if (sc && dc) cd = i + 1;
-        else break;
-    }
-    if (cd >= GGML_MAX_DIMS) return false; // fully contig, handled by caller
-
-    // width = contiguous block bytes
-    size_t width = ts;
-    for (int i = 0; i < cd; i++) width *= src->ne[i];
-
-    size_t spitch = src->nb[cd];
-    size_t dpitch = dst->nb[cd];
-
-    // remaining dims must be uniformly strided
-    for (int i = cd + 1; i < GGML_MAX_DIMS; i++) {
-        if (src->nb[i] != src->nb[i-1] * src->ne[i-1]) return false;
-        if (dst->nb[i] != dst->nb[i-1] * dst->ne[i-1]) return false;
-    }
-
-    size_t inner = 1;
-    for (int i = 0; i < cd; i++) inner *= src->ne[i];
-    size_t height = ggml_nelements(src) / inner;
-
-    if (spitch < width || dpitch < width || width == 0 || height == 0) return false;
-
-    ACL_CHECK(aclrtMemcpy2dAsync(dst->data, dpitch, src->data, spitch,
-                                 width, height, ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
-    return true;
-}
-
 void ggml_cann_dup(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * src0 = dst->src[0];
 
@@ -1183,19 +1136,7 @@ void ggml_cann_dup(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         acl_tensor_ptr acl_src = ggml_cann_create_tensor(src0);
         acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
         if (dst->type == src0->type) {
-            bool src_contig = ggml_is_contiguous(src0);
-            bool dst_contig = ggml_is_contiguous(dst);
-            if (src_contig && dst_contig) {
-                size_t nbytes = ggml_nbytes(src0);
-                if (nbytes > 0 && src0->data != dst->data) {
-                    ACL_CHECK(aclrtMemcpyAsync(dst->data, nbytes, src0->data, nbytes,
-                                               ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
-                }
-            } else {
-                if (!cann_memcpy2d(ctx, src0, dst)) {
-                    cann_copy(ctx, acl_src.get(), acl_dst.get());
-                }
-            }
+            cann_copy(ctx, acl_src.get(), acl_dst.get());
         } else {
             aclnn_cast(ctx, acl_src.get(), acl_dst.get(), ggml_cann_type_mapping(dst->type));
         }
@@ -4795,8 +4736,6 @@ static void ggml_cann_flash_attn_ext_310p(ggml_backend_cann_context & ctx, ggml_
 #endif  // ASCEND_310P
 
 void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
-    static bool use_fa_v5 = getenv("GGML_CANN_FA_V5") == nullptr ||
-                            strcmp(getenv("GGML_CANN_FA_V5"), "0") != 0;
 #ifdef ASCEND_310P
     ggml_cann_flash_attn_ext_310p(ctx, dst);
     return;
@@ -4805,98 +4744,6 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst
     ggml_tensor * src1 = dst->src[1];  // k, fp16 | B, N, S, D (uncont) -> B, S, N, D (cont)
     ggml_tensor * src2 = dst->src[2];  // v, fp16 | B, N, S, D (uncont) -> B, S, N, D (cont)
     ggml_tensor * src3 = dst->src[3];  // mask, fp16
-
-#ifdef ASCEND_310P
-    // Decode-only skip-mask path. PFA infers the causal boundary from
-    // actual_seq_lengths_kv, so the padded mask tensor is not launched.
-    static bool use_skip_mask_fa = getenv("GGML_CANN_SKIP_MASK_FA") != nullptr &&
-                                   strcmp(getenv("GGML_CANN_SKIP_MASK_FA"), "0") != 0;
-    if (use_skip_mask_fa && src3 != nullptr && src0->ne[1] == 1 && src3->ne[1] == 1 &&
-        src3->ne[2] == 1 && src0->ne[3] == src3->ne[3]) {
-        const int64_t n_stream = src3->ne[3];
-        std::vector<int64_t> actual_seq_lengths_q(n_stream, 1);
-        std::vector<int64_t> actual_seq_lengths_kv(n_stream, src1->ne[1]);
-
-        int64_t src0_bsnd_ne[GGML_MAX_DIMS];
-        size_t  src0_bsnd_nb[GGML_MAX_DIMS];
-        int64_t src1_bsnd_ne[GGML_MAX_DIMS];
-        size_t  src1_bsnd_nb[GGML_MAX_DIMS];
-        int64_t src2_bsnd_ne[GGML_MAX_DIMS];
-        size_t  src2_bsnd_nb[GGML_MAX_DIMS];
-        memcpy(src0_bsnd_ne, src0->ne, GGML_MAX_DIMS * sizeof(int64_t));
-        memcpy(src0_bsnd_nb, src0->nb, GGML_MAX_DIMS * sizeof(size_t));
-        memcpy(src1_bsnd_ne, src1->ne, GGML_MAX_DIMS * sizeof(int64_t));
-        memcpy(src1_bsnd_nb, src1->nb, GGML_MAX_DIMS * sizeof(size_t));
-        memcpy(src2_bsnd_ne, src2->ne, GGML_MAX_DIMS * sizeof(int64_t));
-        memcpy(src2_bsnd_nb, src2->nb, GGML_MAX_DIMS * sizeof(size_t));
-
-        auto transpose12 = [](int64_t * ne, size_t * nb) {
-            int64_t ne_tmp = ne[1];
-            size_t  nb_tmp = nb[1];
-            ne[1]          = ne[2];
-            nb[1]          = nb[2];
-            ne[2]          = ne_tmp;
-            nb[2]          = nb_tmp;
-        };
-        transpose12(src0_bsnd_ne, src0_bsnd_nb);
-        transpose12(src1_bsnd_ne, src1_bsnd_nb);
-        transpose12(src2_bsnd_ne, src2_bsnd_nb);
-
-        float scaleValue = 1.0f;
-        memcpy(&scaleValue, (float *) dst->op_params + 0, sizeof(float));
-
-        const size_t    faElemSize = sizeof(uint16_t);
-        acl_tensor_ptr  acl_q_tensor;
-        ggml_cann_pool_alloc src0_f16_allocator(ctx.pool());
-        if (ggml_cann_type_mapping(src0->type) != ACL_FLOAT16) {
-            acl_tensor_ptr acl_src0_tensor = ggml_cann_create_tensor(src0, src0_bsnd_ne, src0_bsnd_nb, GGML_MAX_DIMS);
-            void * src0_f16_buffer = src0_f16_allocator.alloc(ggml_nelements(src0) * faElemSize);
-            size_t src0_f16_nb[GGML_MAX_DIMS];
-            src0_f16_nb[0] = faElemSize;
-            for (int i = 1; i < GGML_MAX_DIMS; ++i) {
-                src0_f16_nb[i] = src0_f16_nb[i - 1] * src0_bsnd_ne[i - 1];
-            }
-            acl_q_tensor = ggml_cann_create_tensor(src0_f16_buffer, ACL_FLOAT16, faElemSize, src0_bsnd_ne,
-                                                   src0_f16_nb, GGML_MAX_DIMS);
-            aclnn_cast(ctx, acl_src0_tensor.get(), acl_q_tensor.get(), ACL_FLOAT16);
-        } else {
-            acl_q_tensor = ggml_cann_create_tensor(src0, src0_bsnd_ne, src0_bsnd_nb, GGML_MAX_DIMS);
-        }
-        acl_tensor_ptr acl_k_tensor = ggml_cann_create_tensor(src1, src1_bsnd_ne, src1_bsnd_nb, GGML_MAX_DIMS);
-        acl_tensor_ptr acl_v_tensor = ggml_cann_create_tensor(src2, src2_bsnd_ne, src2_bsnd_nb, GGML_MAX_DIMS);
-        acl_int_array_ptr acl_actual_q = ggml_cann_create_int_array(actual_seq_lengths_q.data(), n_stream);
-        acl_int_array_ptr acl_actual_kv = ggml_cann_create_int_array(actual_seq_lengths_kv.data(), n_stream);
-        GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
-        acl_tensor_ptr acl_dst_tensor;
-        ggml_cann_pool_alloc out_f16_allocator(ctx.pool());
-        if (dst->type != GGML_TYPE_F16) {
-            size_t out_f16_nb[GGML_MAX_DIMS];
-            out_f16_nb[0] = faElemSize;
-            for (int i = 1; i < GGML_MAX_DIMS; ++i) {
-                out_f16_nb[i] = out_f16_nb[i - 1] * src0_bsnd_ne[i - 1];
-            }
-            void * out_f16_buffer = out_f16_allocator.alloc(ggml_nelements(dst) * faElemSize);
-            acl_dst_tensor = ggml_cann_create_tensor(out_f16_buffer, ACL_FLOAT16, faElemSize, src0_bsnd_ne,
-                                                     out_f16_nb, GGML_MAX_DIMS);
-        } else {
-            acl_dst_tensor = ggml_cann_create_tensor(dst);
-        }
-
-        char layout[] = "BSND";
-        GGML_CANN_CALL_ACLNN_OP(ctx, PromptFlashAttentionV3,
-            acl_q_tensor.get(), acl_k_tensor.get(), acl_v_tensor.get(),
-            nullptr, nullptr, acl_actual_q.get(), acl_actual_kv.get(),
-            nullptr, nullptr, nullptr, nullptr, nullptr,
-            src0->ne[2], (double) scaleValue, (int64_t) 65535, (int64_t) 0,
-            layout, src1->ne[2], (int64_t) 0, (int64_t) 0,
-            acl_dst_tensor.get());
-        if (dst->type != GGML_TYPE_F16) {
-            acl_tensor_ptr dst_tensor = ggml_cann_create_tensor(dst);
-            aclnn_cast(ctx, acl_dst_tensor.get(), dst_tensor.get(), ggml_cann_type_mapping(dst->type));
-        }
-        return;
-    }
-#endif
 
     // B, N, S, D (uncont) -> B, S, N, D (cont)
     int64_t src0_bsnd_ne[GGML_MAX_DIMS];
@@ -5113,58 +4960,29 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst
             fa_dst_tensor = ggml_cann_create_tensor(dst);
         }
 
-        if (use_fa_v5) {
-            GGML_CANN_CALL_ACLNN_OP(ctx, FusedInferAttentionScoreV5, acl_q_tensor.get(), acl_k_tensor_list.get(),
-                                    acl_v_tensor_list.get(),               // q, k, v
-                                    bcast_pse_tensor.get(), nullptr,       // pse, mask
-                                    nullptr, nullptr,                      // actSeqLen, actSeqLenkv
-                                    nullptr, nullptr,                      // deqScale1, quantScale1
-                                    nullptr, nullptr, nullptr,             // deqScale2, quantScale2, quantOffset2
-                                    nullptr, nullptr,                      // antiquantScale, antiquantOffset
-                                    nullptr,                               // blockTable
-                                    nullptr, nullptr,                      // qPadSize, kvPadSize
-                                    nullptr, nullptr,                      // kAntiquantScale, kAntiQuantOffset
-                                    nullptr, nullptr,                      // vAntiquantScale, vAntiQuantOffset
-                                    nullptr, nullptr, nullptr,             // kSharedPrefix, vSharedPrefix, actSharedLen
-                                    nullptr, nullptr, nullptr,             // queryRope, keyRope, keyRopeAntiqScale
-                                    nullptr, nullptr, nullptr, nullptr,    // dequantScaleQuery, sink, qStartIdx, kvStartIdx
-                                    numHeads, scaleValue,                  // heads, scaleValue
-                                    preTokens, nextTokens,                 // preTokens, nextTokens
-                                    layout,                                // inputLayout
-                                    numKeyValueHeads,                      // numKVHeads
-                                    sparseMode, innerPrecise,              // sparseMode, innerPrecise
-                                    blockSize, antiquantMode,              // blockSize, antiquantMode
-                                    softmaxLseFlag,                        // softmaxLseFlag
-                                    keyAntiquantMode, valueAntiquantMode,  // keyAntiqMode, valueAntiqMode
-                                    0, 0,                                  // queryQuantMode, pseType
-                                    fa_dst_tensor.get(),                   // attentionOut
-                                    nullptr                                // softmaxLse
-            );
-        } else {
-            GGML_CANN_CALL_ACLNN_OP(ctx, FusedInferAttentionScoreV2, acl_q_tensor.get(), acl_k_tensor_list.get(),
-                                    acl_v_tensor_list.get(),               // q, k, v
-                                    bcast_pse_tensor.get(), nullptr,       // pse, mask
-                                    nullptr, nullptr,                      // actSeqLen, actSeqLenkv
-                                    nullptr, nullptr,                      // deqScale1, quantScale1
-                                    nullptr, nullptr, nullptr,             // deqScale2, quantScale2, quantOffset2
-                                    nullptr, nullptr,                      // antiquantScale, antiquantOffset
-                                    nullptr,                               // blockTable
-                                    nullptr, nullptr,                      // qPadSize, kvPadSize
-                                    nullptr, nullptr,                      // kAntiquantScale, kAntiQuantOffset
-                                    nullptr, nullptr,                      // vAntiquantScale, vAntiQuantOffset
-                                    nullptr, nullptr, nullptr,             // kSharedPrefix, vSharedPrefix, actSharedLen
-                                    numHeads, scaleValue,                  // heads, scaleValue
-                                    preTokens, nextTokens,                 // preTokens, nextTokens
-                                    layout,                                // inputLayout
-                                    numKeyValueHeads,                      // numKVHeads
-                                    sparseMode, innerPrecise,              // sparseMode, innerPrecise
-                                    blockSize, antiquantMode,              // blockSize, antiquantMode
-                                    softmaxLseFlag,                        // softmaxLseFlag
-                                    keyAntiquantMode, valueAntiquantMode,  // keyAntiqMode, valueAntiqMode
-                                    fa_dst_tensor.get(),                   // attentionOut
-                                    nullptr                                // softmaxLse
-            );
-        }
+        GGML_CANN_CALL_ACLNN_OP(ctx, FusedInferAttentionScoreV2, acl_q_tensor.get(), acl_k_tensor_list.get(),
+                                acl_v_tensor_list.get(),               // q, k, v
+                                bcast_pse_tensor.get(), nullptr,       // pse, mask
+                                nullptr, nullptr,                      // actSeqLen, actSeqLenkv
+                                nullptr, nullptr,                      // deqScale1, quantScale1
+                                nullptr, nullptr, nullptr,             // deqScale2, quantScale2, quantOffset2
+                                nullptr, nullptr,                      // antiquantScale, antiquantOffset
+                                nullptr,                               // blockTable
+                                nullptr, nullptr,                      // qPadSize, kvPadSize
+                                nullptr, nullptr,                      // kAntiquantScale, kAntiQuantOffset
+                                nullptr, nullptr,                      // vAntiquantScale, vAntiQuantOffset
+                                nullptr, nullptr, nullptr,             // kSharedPrefix, vSharedPrefix, actSharedLen
+                                numHeads, scaleValue,                  // heads, scaleValue
+                                preTokens, nextTokens,                 // preTokens, nextTokens
+                                layout,                                // inputLayout
+                                numKeyValueHeads,                      // numKVHeads
+                                sparseMode, innerPrecise,              // sparseMode, innerPrecise
+                                blockSize, antiquantMode,              // blockSize, antiquantMode
+                                softmaxLseFlag,                        // softmaxLseFlag
+                                keyAntiquantMode, valueAntiquantMode,  // keyAntiqMode, valueAntiqMode
+                                fa_dst_tensor.get(),                   // attentionOut
+                                nullptr                                // softmaxLse
+        );
 
         // Step 6: post-processing — slice padded output and/or cast to f32
         if (needs_padding) {
@@ -5580,91 +5398,6 @@ void ggml_cann_op_add_rms_norm_fused(ggml_backend_cann_context & ctx,
     GGML_CANN_CALL_ACLNN_OP(ctx, AddRmsNorm, acl_x1.get(), acl_x2.get(), acl_gamma.get(),
                             eps,  // double type
                             acl_yout.get(), acl_rstd.get(), acl_xout.get());
-}
-
-// Helper: find the weight tensor in a MUL node (the 1D broadcast src)
-static ggml_tensor * get_mul_weight(ggml_tensor * mul_node, ggml_tensor * norm_node) {
-    if (mul_node->src[0] == norm_node) {
-        return mul_node->src[1];
-    }
-    return mul_node->src[0];
-}
-
-void ggml_cann_op_rms_norm_mul_fused(ggml_backend_cann_context & ctx,
-                                     ggml_tensor *               rms_norm_node,
-                                     ggml_tensor *               mul_node) {
-    ggml_tensor * src = rms_norm_node->src[0];
-    ggml_tensor * mw  = get_mul_weight(mul_node, rms_norm_node);
-
-    acl_tensor_ptr acl_src = ggml_cann_create_tensor(src);
-    // output goes to mul_node's buffer since rms_norm output has single use
-    acl_tensor_ptr acl_dst = ggml_cann_create_tensor(mul_node);
-
-    float eps;
-    memcpy(&eps, rms_norm_node->op_params, sizeof(float));
-
-    // use actual norm weight as gamma instead of all-ones
-    size_t acl_gamma_nb[GGML_MAX_DIMS];
-    acl_gamma_nb[0] = ggml_type_size(mw->type);
-    for (int i = 1; i < GGML_MAX_DIMS; i++) {
-        acl_gamma_nb[i] = acl_gamma_nb[i - 1] * mw->ne[i - 1];
-    }
-    acl_tensor_ptr acl_gamma = ggml_cann_create_tensor(mw, mw->ne, acl_gamma_nb, 1);
-
-    int64_t acl_rstd_ne[] = { 1, src->ne[1], src->ne[2], src->ne[3] };
-    size_t  acl_rstd_nb[GGML_MAX_DIMS - 1];
-    acl_rstd_nb[0] = sizeof(float);
-    for (int i = 1; i < GGML_MAX_DIMS - 1; i++) {
-        acl_rstd_nb[i] = acl_rstd_nb[i - 1] * acl_rstd_ne[i - 1];
-    }
-    acl_tensor_ptr acl_rstd =
-        get_cache_acl_tensor(ctx, &ctx.rms_norm_zero_tensor_cache.cache,
-                             ctx.rms_norm_zero_tensor_cache.size,
-                             acl_rstd_ne, acl_rstd_nb, GGML_TYPE_F32, GGML_MAX_DIMS, 0.0f);
-
-    GGML_CANN_CALL_ACLNN_OP(ctx, RmsNorm, acl_src.get(), acl_gamma.get(),
-                            eps, acl_dst.get(), acl_rstd.get());
-}
-
-void ggml_cann_op_add_rms_norm_mul_fused(ggml_backend_cann_context & ctx,
-                                         ggml_tensor *               add_node,
-                                         ggml_tensor *               rms_norm_node,
-                                         ggml_tensor *               mul_node) {
-    ggml_tensor * x1  = add_node->src[0];
-    ggml_tensor * x2  = add_node->src[1];
-    ggml_tensor * mw  = get_mul_weight(mul_node, rms_norm_node);
-
-    acl_tensor_ptr acl_x1 = ggml_cann_create_tensor(x1);
-    acl_tensor_ptr acl_x2 = ggml_cann_create_tensor(x2);
-
-    float eps;
-    memcpy(&eps, rms_norm_node->op_params, sizeof(float));
-
-    // use actual norm weight as gamma
-    size_t acl_gamma_nb[GGML_MAX_DIMS];
-    acl_gamma_nb[0] = ggml_type_size(mw->type);
-    for (int i = 1; i < GGML_MAX_DIMS; i++) {
-        acl_gamma_nb[i] = acl_gamma_nb[i - 1] * mw->ne[i - 1];
-    }
-    acl_tensor_ptr acl_gamma = ggml_cann_create_tensor(mw, mw->ne, acl_gamma_nb, 1);
-
-    int64_t acl_rstd_ne[] = { 1, x1->ne[1], x1->ne[2], x1->ne[3] };
-    size_t  acl_rstd_nb[GGML_MAX_DIMS - 1];
-    acl_rstd_nb[0] = sizeof(float);
-    for (int i = 1; i < GGML_MAX_DIMS - 1; i++) {
-        acl_rstd_nb[i] = acl_rstd_nb[i - 1] * acl_rstd_ne[i - 1];
-    }
-    acl_tensor_ptr acl_rstd =
-        get_cache_acl_tensor(ctx, &ctx.rms_norm_zero_tensor_cache.cache,
-                             ctx.rms_norm_zero_tensor_cache.size,
-                             acl_rstd_ne, acl_rstd_nb, GGML_TYPE_F32, GGML_MAX_DIMS, 0.0f);
-
-    acl_tensor_ptr acl_xout = ggml_cann_create_tensor(add_node);
-    // yout goes to mul_node's buffer
-    acl_tensor_ptr acl_yout = ggml_cann_create_tensor(mul_node);
-
-    GGML_CANN_CALL_ACLNN_OP(ctx, AddRmsNorm, acl_x1.get(), acl_x2.get(), acl_gamma.get(),
-                            eps, acl_yout.get(), acl_rstd.get(), acl_xout.get());
 }
 
 void ggml_cann_gated_linear_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
