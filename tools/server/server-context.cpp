@@ -545,6 +545,11 @@ private:
             {
                 common_params params_dft = common_base_params_to_speculative(params_base);
 
+                // the draft stays on classic KV: only the target is routed by
+                // the paged scheduler, and the probe decode below asserts on a
+                // paged context (no routing metadata)
+                params_dft.kv_paged = false;
+
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;
