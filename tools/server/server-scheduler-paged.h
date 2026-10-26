@@ -24,6 +24,21 @@ class server_scheduler_paged final : public server_scheduler_interface {
     void on_finish(int32_t request_id);
     static void on_finish_thunk(int32_t request_id, const llama_token * tokens, int32_t n_tokens, void * user_data);
 
+    // n_cmpl > 1: fork the prefilled parent into the waiting child slots and
+    // sample each child's first token out-of-batch from the parent's logits
+    void fork_children(server_slot & parent, int32_t tok_idx,
+                       std::vector<llama_token> & fb_tok, std::vector<llama_paged_feedback> & fb);
+
+    // speculative decoding: generate drafts for the generating slots, attach
+    // them to the scheduler and extend the prompt state
+    void prepare_drafts();
+
+    // speculative decoding: verify the attached drafts for one slot, roll back
+    // on partial acceptance and emit the accepted tokens. returns false when
+    // a stop condition fired during emission
+    bool verify_slot(server_slot & slot, int32_t off, int32_t len,
+                     std::vector<llama_token> & fb_tok, std::vector<llama_paged_feedback> & fb);
+
     server_scheduler_host & host;
 
     llama_paged_scheduler * sched = nullptr;

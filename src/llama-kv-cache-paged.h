@@ -43,6 +43,11 @@ class llama_kv_cache_paged : public llama_memory_i {
     uint32_t block_ref_count(uint32_t block_id) const;
     bool is_block_gpu(uint32_t block_id) const;
 
+    // Copy the KV content of one allocated block into another allocated
+    // block (same pool). Used by fork to give a child its own copy of a
+    // partially-filled tail block.
+    void copy_block_content(uint32_t src_block_id, uint32_t dst_block_id);
+
     // Notified with (chain_hash, new_block_id) whenever a swap moves a
     // registered block between the GPU and CPU pools.
     void set_block_move_cb(std::function<void(uint64_t, uint32_t)> cb) { block_move_cb = std::move(cb); }

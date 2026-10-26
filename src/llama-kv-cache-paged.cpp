@@ -174,6 +174,33 @@ bool llama_kv_cache_paged::release_block(uint32_t block_id) {
     return true;
 }
 
+void llama_kv_cache_paged::copy_block_content(uint32_t src_block_id, uint32_t dst_block_id) {
+    const bool same_pool  = block_manager.is_gpu(src_block_id) == block_manager.is_gpu(dst_block_id);
+    const bool dst_is_gpu = block_manager.is_gpu(dst_block_id);
+
+    // do_block_copy models a cross-pool transfer; for a same-pool copy feed it
+    // the matching src/dst layer sets directly
+    if (same_pool) {
+        const auto & k = dst_is_gpu ? k_gpu_layers : k_cpu_layers;
+        const auto & v = dst_is_gpu ? v_gpu_layers : v_cpu_layers;
+        const uint32_t src_local = dst_is_gpu ? src_block_id : src_block_id - num_gpu_blocks;
+        const uint32_t dst_local = dst_is_gpu ? dst_block_id : dst_block_id - num_gpu_blocks;
+
+        std::vector<uint8_t> staging(block_bytes);
+        for (uint32_t il = 0; il < n_layers; ++il) {
+            const size_t src_offset = (size_t) src_local * block_bytes;
+            const size_t dst_offset = (size_t) dst_local * block_bytes;
+            ggml_backend_tensor_get(k[il], staging.data(), src_offset, block_bytes);
+            ggml_backend_tensor_set(k[il], staging.data(), dst_offset, block_bytes);
+            ggml_backend_tensor_get(v[il], staging.data(), src_offset, block_bytes);
+            ggml_backend_tensor_set(v[il], staging.data(), dst_offset, block_bytes);
+        }
+        return;
+    }
+
+    do_block_copy({src_block_id}, {dst_block_id}, /*to_gpu=*/dst_is_gpu);
+}
+
 uint32_t llama_kv_cache_paged::n_free_gpu_blocks() const {
     return (uint32_t) block_manager.n_free_gpu_blocks();
 }

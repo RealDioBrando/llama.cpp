@@ -11,9 +11,11 @@
 
 #include "llama.h"
 
+#include <functional>
 #include <memory>
 
 struct common_params;
+struct common_speculative;
 struct server_queue;
 
 // host services a scheduler may use. implemented by server_context_impl.
@@ -49,6 +51,13 @@ struct server_scheduler_host {
     virtual void metrics_flush_prompt() = 0;
     virtual void metrics_flush_idle() = 0;
     virtual server_metrics & srv_metrics() = 0;
+
+    // speculative decoding context, nullptr when disabled
+    virtual common_speculative * spec_ctx() = 0;
+
+    // run work on the main thread while a worker serves the task queue,
+    // keeping /metrics responsive (see server_queue::yield_to_queue)
+    virtual void yield(std::function<void()> && work) = 0;
 
     // keep the main loop spinning while requests are in flight
     virtual void post_next_response() = 0;
