@@ -2570,6 +2570,9 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
         case GGML_OP_GATED_LINEAR_ATTN:
             ggml_cann_gated_linear_attn(ctx, dst);
             break;
+        case GGML_OP_GATED_DELTA_NET:
+            ggml_cann_gated_delta_net(ctx, dst);
+            break;
         case GGML_OP_SSM_CONV:
             ggml_cann_ssm_conv(ctx, dst);
             break;
@@ -3207,6 +3210,16 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
                 }
             }
 
+            // Grow the gated delta net index cache before capture, it needs a
+            // host-to-device copy which is not allowed during capture.
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                ggml_tensor * node = cgraph->nodes[i];
+                if (node->op == GGML_OP_GATED_DELTA_NET) {
+                    ggml_cann_gdn_cache_preload(*cann_ctx, node);
+                    break;
+                }
+            }
+
             // Pre-create the rms_norm constant caches (ones / zeros
             // vectors) before capture: their first use runs aclrtMalloc +
             // fill, and the malloc is forbidden inside the capture region.
@@ -3525,6 +3538,54 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_GATED_LINEAR_ATTN:
             return true;
+        case GGML_OP_GATED_DELTA_NET:
+            {
+                // fused path via the custom V310 kernels: decode is a single
+                // recurrent call, prefill is a single chunk call (8-token block
+                // loop as fallback)
+                if (!ggml_cann_gdn_v310_available()) {
+                    return false;
+                }
+                const ggml_tensor * q = op->src[0];
+                const ggml_tensor * v = op->src[2];
+                const ggml_tensor * g = op->src[3];
+                // recurrent kernel supports scalar gating only
+                if (g->ne[0] != 1) {
+                    return false;
+                }
+                // single state snapshot
+                if (ggml_get_op_params_i32(op, 0) != 1) {
+                    return false;
+                }
+                // kernel fold reduction is only correct for head dim 64 and 128, other sizes run on CPU
+                if (q->ne[0] != v->ne[0] || (q->ne[0] != 64 && q->ne[0] != 128) || v->ne[1] % q->ne[1] != 0 ||
+                    q->ne[1] > 256 || v->ne[1] > 256) {
+                    return false;
+                }
+                // GQA head-mapping divergence: the V310 kernel (fla lineage)
+                // maps v-head h to k-head h / (Nv/Nk), the llama.cpp reference
+                // kernels use modulo (h % Nk). The two only agree when
+                // NK == NV; the dispatcher expands q/k for integral ratios.
+                if (v->ne[1] % q->ne[1] != 0) {
+                    return false;
+                }
+                // the glue casts every source via F32 readers, an F16 (or
+                // other type) source would be reinterpreted with wrong
+                // strides/values. F32 in, F32 dst only.
+                for (int i = 0; i < 6; i++) {
+                    if (op->src[i]->type != GGML_TYPE_F32) {
+                        return false;
+                    }
+                }
+                if (op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                // q/k/v only need rows-contiguous (op contract): the model feeds v as a
+                // strided view of the fused qkv projection, the glue gathers it while casting
+                return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]) &&
+                       ggml_is_contiguous_rows(op->src[2]) && ggml_is_contiguous(op->src[3]) &&
+                       ggml_is_contiguous(op->src[4]) && ggml_is_contiguous(op->src[5]);
+            }
         case GGML_OP_OUT_PROD:
             {
 #ifdef ASCEND_310P
