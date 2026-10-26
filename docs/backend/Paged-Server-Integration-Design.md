@@ -441,14 +441,17 @@ server 层合计:新增约 975-1300 行(其中 S2 为 ~500 行纯移动,新逻�
 
 | 功能 | 预估路径 |
 |---|---|
-| chat/工具调用 | HTTP 层已就绪(`task_result_state` 流式解析),开启端点验收即可,调度器零改动 |
-| 结构化输出(grammar) | 已随每槽采样链存在,补验收测试即可 |
+| chat/工具调用 | HTTP 层已就绪(`task_result_state` 流式解析),开启端点验收即可,调度器零改动(已细化,见 12.1) |
+| 结构化输出(grammar) | 已随每槽采样链存在,补验收测试即可(随 12.1 一并放开) |
 | embedding/rerank | 需验证 `llama_set_embeddings` + 池化在 paged 图上的支持(llama 层) |
-| `n_cmpl>1` 并行采样 | 基于块引用共享实现调度器侧 fork(复制 block_table 引用),替代 seq_cp |
+| `n_cmpl>1` 并行采样 | 基于块引用共享实现调度器侧 fork(复制 block_table 引用),替代 seq_cp(已细化,见 12.2) |
 | 槽位存取/RAM 提示缓存 | paged 内存的块级 `state_write/read` 序列化 |
-| 投机推理 | 需调度器支持每步多 token 反馈与 draft 上下文 paged 化,复杂度最高,需专项设计 |
-| 多模态 | mtmd 块编码发生在 prefill 中途,与"整段 prompt 一次性入队"冲突,需分段入队 API |
+| 投机推理 | 目标侧验证经调度器,draft 上下文保持经典 KV;需变长反馈与位置级回滚(已细化,见 12.3) |
+| 多模态 | 分段入队 + embd 批 + prefill 中途编码暂停态(已细化,见 12.4) |
 | 动态准入 | 评估去掉 server slot 池、请求全量入调度器 waiting 的 vLLM 式模型(需 request 注册表与取消重构) |
+
+> 注:12.3 的早期预判"draft 上下文 paged 化"已修正——draft 是独立 context,保持经典 KV
+> 即可,复杂度集中在目标侧验证与回滚。
 
 ## 8. 风险与开放问题
 
@@ -521,23 +524,399 @@ server 层合计:新增约 975-1300 行(其中 S2 为 ~500 行纯移动,新逻�
 8. L4 无需改码:`fit_params` 默认开启,`common_init_from_params` 已对 kv_paged 自动适配块数。
 9. paged warmup 失败降级为告警(默认 warmup 失败同样非致命)。
 
-## 11. 调试记录(910B4 + CANN 9.0.0)
+## 11. 调试记录:910B4 + CANN 9.0.0
 
-编译:openEuler 22.03 aarch64、CANN 9.0.0(ops + nnal 9.0.0)、GCC 10.3,`-DGGML_CANN=on`
-下 llama-server 与 test-paged-kv-e2e 构建通过。
+编译环境为 openEuler 22.03 aarch64、CANN 9.0.0,含 ops 与 nnal 9.0.0,以及 GCC 10.3。在
+`-DGGML_CANN=on` 下 llama-server 与 test-paged-kv-e2e 构建通过。
 
 | 问题 | 结论 |
 |---|---|
-| 服务器缺 aclnn 算子头文件 | 补装 `Ascend-cann-910b-ops_9.0.0`;nnal 原为 8.5.0,与 toolkit 9.0.0 错配,已换装 9.0.0 |
-| ggml-cann.cpp 910B 编译失败 | 上游 bug:`transform_kq` 定义在 `#ifdef ASCEND_310P` 内,`buffer_set_tensor` 的调用点未加保护。已按文件既有模式把 `if (is_kq)` 块包进 `ASCEND_310P`(910B 下该块运行时本就不可达) |
-| server_tokens 拷贝赋值 | `server_tokens` 有意禁止拷贝(留有 TODO),paged launch 改用 `get_text_tokens()` 构造后 move 赋值 |
+| 服务器缺 aclnn 算子头文件 | 补装 `Ascend-cann-910b-ops_9.0.0`。nnal 原为 8.5.0,与 toolkit 9.0.0 版本错配,已换装 9.0.0 |
+| ggml-cann.cpp 910B 编译失败 | 上游 bug:`transform_kq` 定义在 `#ifdef ASCEND_310P` 内,而 `buffer_set_tensor` 的调用点未加保护。已按文件既有模式把 `if (is_kq)` 块包进 `ASCEND_310P`。910B 下 `kq_path` 恒为 `GGML_CANN_KQ_NONE`,该块运行时本就不可达,行为无变化 |
+| server_tokens 拷贝赋值 | `server_tokens` 有意禁止拷贝,源码留有 TODO;paged launch 改为 `get_text_tokens()` 构造后 move 赋值 |
 
-运行时:非 paged 路径(NPU)正常出 token;**paged 路径在 910B4 上被 ATB PagedAttention
-内核阻塞**:`op->Setup` 返回 error 8(ERROR_INVALID_TENSOR_DIM),ATB 日志明确报
-`headSize of keyCache and query should be same`。本仓库的 CANN paged-attn wrapper
-按 310P ATB 编写(KV 池以 FRACTAL_NZ 解释,`K_CACHE_V_CACHE_NZ` 写入路径,310P 的
-SelfAttention/PA 支持 NZ cache),910B 的 ATB 9.0.0 PagedAttention 对 NZ cache 的
-维度解释不同,直接复用会触发维度校验失败。head_dim=80(Qwen3-4B)非 2 的幂亦需复核
-310P 约束。**结论:paged attention 内核的 910B 适配是独立的内核层工作**(评估方向:
-改喂 ND 布局 cache 或改用 910B 对应的 ATB/原生算子),不在本次调度器集成范围内;
-LLAMA_PAGED 前缀的调度器与 server 集成代码与设备无关,内核打通后即可复验。
+运行时:非 paged 路径在 NPU 上正常出 token。paged 路径在 910B4 上被 ATB PagedAttention
+内核阻塞:`op->Setup` 返回 error 8,即 ERROR_INVALID_TENSOR_DIM,ATB 日志明确报
+`headSize of keyCache and query should be same`。原因:本仓库的 CANN paged-attn wrapper
+按 310P ATB 编写,KV 池以 FRACTAL_NZ 解释并走 `K_CACHE_V_CACHE_NZ` 写入路径,而 310P 的
+SelfAttention/PA 支持 NZ cache;910B 的 ATB 9.0.0 PagedAttention 对 NZ cache 的维度解释
+不同,直接复用会触发维度校验失败。另外 Qwen3-4B 的 head_dim 为 80,不是 2 的幂,是否满足
+310P 约束亦需复核。
+
+结论:paged attention 内核的 910B 适配是独立的内核层工作,评估方向为改喂 ND 布局 cache,
+或改用 910B 对应的 ATB/原生算子;该项不在本次调度器集成范围内。LLAMA_PAGED 前缀的调度器
+与 server 集成代码与设备无关,内核打通后即可复验。
+
+## 12. 第二阶段设计:四个明确支持的特性
+
+范围:a) 投机推理、b) 多模态、c) `n_cmpl > 1` 并行采样、d) `/v1/chat/completions`。
+共性前提:默认路径行为不变;所有扩展只作用于 `--kv-paged` 分支;由于 910B 内核问题
+尚未解决,见第 11 节,运行时验收仍以 CPU/310P 为准。
+
+### 12.0 前置小修与统一反馈契约
+
+**P0,必须先做**:phase-1 的 paged launch 未检查 `task.tokens.has_mtmd`,多模态请求会被
+`get_text_tokens()` 静默丢掉媒体内容,位置在 `server-scheduler-paged.cpp:124`。补一道闸,
+使媒体请求在 b) 落地前明确返回未支持错误。约 10 行。
+
+**统一反馈契约,一次设计到位**:由于 c) 需要 fork 出的子请求的批外反馈,a) 需要投机验证
+一次接受多个 token 的每 seq 变长 token 列表,直接将 `llama_paged_scheduler_update` 的
+签名改为 feedback 数组形式,不引入 `_v2` 新符号。理由:该 API 的调用方全部在树内且仅
+4 处,即 examples/paged、tests/test-paged-kv-e2e、shim 内 warmup、server-scheduler-paged,
+一次机械迁移即可;本 fork 新增 API 无外部消费者;llama.cpp 惯例是原位演进 C API 签名,
+`_ext` 类后缀仅在两种能力需长期并存时使用,而新形式是严格超集,旧语义等价于每项
+n_tokens = 1,无并存价值:
+
+```c
+struct llama_paged_feedback {
+    int32_t            request_id;
+    const llama_token * tokens;    // accepted/sampled tokens this step
+    int32_t            n_tokens;   // 1 for plain decode, 1..n_draft+1 for spec verify
+    int8_t             stop;       // finish the request after applying this feedback
+};
+
+// batch may be NULL when all feedback entries are out-of-batch (n_cmpl children)
+LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler * sched,
+                                             struct llama_batch * batch,
+                                             const struct llama_paged_feedback * feedback,
+                                             int32_t n_feedback);
+```
+
+语义:批内 seq 先按 `n_past += batch_lens[i]` 推进,再以 feedback 的 token 列表为准推进
+`logical_seq/n_decoded`;token 数少于批行数即为隐式回滚,供 a) 的投机部分接受使用;批外的
+fork 子请求只做 token 追加与状态推进。4 处旧调用点原为两个并行数组的用法,随签名一并
+迁移,各约 5-10 行,计入 c) 的工作量。
+
+### 12.1 d) /v1/chat/completions,含工具调用
+
+**结论:调度器层零结构改动,纯放闸 + 验收。**
+
+- 任务到达 `process_single_task` 时端点无关:chat 经 `oaicompat_chat_params_parse` 在
+  HTTP 层套模板后,与 `/completion` 一样是 `SERVER_TASK_TYPE_COMPLETION`,仅 `res_type`
+  不同;而 `res_type` 只被结果层消费,即 `server_task_result_*::to_json` 与 SSE 格式选择;
+- 工具调用 grammar 由 chat 模板解析器自动生成,类型为 `COMMON_GRAMMAR_TYPE_TOOL_CALLS`,
+  完全活在 `common_sampler` 链内;paged 的每槽采样链与默认路径一致,技术上已兼容;
+- 流式工具调用解析位于 `task_result_state::update_chat_msg`,与 reasoning 解析一样均在
+  结果层。
+
+改动:
+
+| 位置 | 内容 | 行数 |
+|---|---|---|
+| `server-scheduler-paged.cpp` | `paged_task_supported` 放开 `OAI_CHAT` 与 grammar 闸 | ~10 |
+| 同上 | P0 的 `has_mtmd` 闸 | ~10 |
+| `README.md` | 限制章节更新 | ~10 |
+
+风险:低。验收矩阵:chat 流式与非流式、工具调用含流式 tool_call 增量、reasoning 解析、
+`logprobs`,以及 grammar 与 n_predict/stop 的组合。llama 层 0 行,server 层约 15-25 行。
+
+### 12.2 c) `n_cmpl > 1` 并行采样
+
+默认路径:父槽加 N-1 个子槽,由 `add_child` 派生并递增种子;子槽处于 WAIT_OTHER 状态等待
+父槽 DONE_PROMPT,`decode()` 内 `copy_state_to` 通过 `mem.seq_cp` 整段复制父 prompt KV,
+子槽从继承的 `i_batch` 行采各自的首 token,见 `server-context.cpp:3198-3219`。
+
+paged 方案:由于 KV 池的 `seq_cp` 是桩,改用块引用 fork,直接复用前缀缓存的引用计数
+共享机制 `add_ref_blocks`:
+
+```c
+// fork a fully-prefilled request: dst shares src's full prompt blocks by
+// reference; a partially-filled tail block is eagerly copied per child.
+// hybrid recurrent state is seq_cp-ed. src must have n_past == n_prompt_total.
+LLAMA_API bool llama_paged_scheduler_fork_request(struct llama_paged_scheduler * sched,
+                                                   int32_t src_id, int32_t dst_id);
+```
+
+- 实现要点:校验 src 已完成 prefill;复制 group,包括 `block_table` 引用与
+  `add_ref_blocks`、`logical_seq` 截到 `n_prompt_total`、`n_past` 继承、`n_decoded = 0`,
+  状态置 RUNNING 并按到达时间插入 running 列表;hybrid 模型补
+  `hybrid_memory_manager->seq_cp`,与 GDN checkpoint fork 同机制,
+  `llama-paged-scheduler-impl.cpp:215` 已有先例;重复 id 复用 `queue_request` 的拒绝逻辑;
+- 尾块处理:若 `n_past` 不在块边界上,部分填充的尾块是多写者冲突点,因为父请求与全部
+  子请求的下一个 decode 都要往该尾块的同一位置写入各自的 token。处理方式为**整块共享 +
+  尾块急拷贝**:满块按引用共享,部分填充的尾块为每个子序列即时复制一份,父请求保留原尾块
+  所有权;需要在 `llama_kv_cache_paged` 增加块内容拷贝入口,复用 swap 路径 `do_block_copy`
+  的设备内拷贝,每个子请求只多一次单块拷贝。不选 vLLM 式 copy-on-write,因为调度器没有
+  懒拷贝基础设施;也不选把 `n_past` 回退到块边界让子请求重 prefill 尾部,因为那会推迟
+  同批首 token 采样;
+- 子请求首 token:fork 发生在父槽 final_prefill 的同一 `update()` 迭代内,采样前 logits
+  仍在 ctx 缓冲,所以子槽直接用父槽的末行下标采样,即
+  `common_sampler_sample(child.smpl, ctx, tok_idx)`,经 `process_token` 后以批外 feedback
+  回填。语义等价于默认路径的 `i_batch` 继承。
+
+| 层 | 位置 | 内容 | 行数 |
+|---|---|---|---|
+| llama | `-impl.{h,cpp}` + shim + `llama.h` | `fork_request`,含 `llama_kv_cache_paged` 的块拷贝入口 | ~125-175 |
+| llama | 同上 | 批外反馈路径,与 12.0 共享 | ~60-80 |
+| server | `server-scheduler-paged.cpp` | launch:父任务需同时容纳全部子槽,空闲槽不足则整体 defer,对齐 `launch_slots_with_parent_task`;子槽 WAIT_OTHER 且不 `add_request` | ~80-110 |
+| server | 同上 | update:父 final_prefill 时 fork + 子槽同批首采样 + stats/prompt 继承 + 批外 feedback | ~90-130 |
+| server | 同上 | 释放与取消路径,子槽 finish 时块引用自然减引用;门禁移除 | ~30-40 |
+
+合计约 385-535 行。风险:中。hybrid GDN fork 的 recurrent seq_cp 有现成机制;子槽首 token
+依赖 logits 在同迭代内有效,该前提成立,因为下一次 decode 才会覆盖 logits;尾块急拷贝走
+设备内单块复制,与 swap 同路径;finish 时父与子的尾块各自独立释放,无引用纠缠;n_parallel
+需大于等于 n_cmpl,与默认路径一致,schema 层已限制。
+
+### 12.3 a) 投机推理
+
+默认路径结构:draft 是独立 context,使用经典 KV,与 paged 目标正交;`common_speculative_draft`
+产 draft,验证批含已采样 token 加 draft 且每行都要 logits,由 `handle_last_sampled_token`
+装批;`common_sampler_sample_and_accept_n` 逐位验证,部分接受时 checkpoint 恢复或 `seq_rm`
+回滚;`common_speculative_process` 把验证批镜像进 draft ctx,见
+`server-context.cpp:2424-2541, 3338-3462`。
+
+paged 方案:draft ctx 保持经典 KV,启动时强制 draft 参数 `kv_paged = false`,其 `seq_rm`
+与 state 操作全部可用;目标侧验证经调度器,新增两个原语:
+
+```c
+// tentatively extend the next decode step with draft tokens: the next batch
+// holds 1 + n_draft rows for this seq, logits on every row. auto-cleared
+// after the step; acceptance is decided by the caller via the update feedback.
+LLAMA_API bool llama_paged_scheduler_attach_draft(struct llama_paged_scheduler * sched,
+                                                   int32_t request_id,
+                                                   const llama_token * draft, int32_t n_draft);
+
+// roll the request back to n_past_new tokens (KV beyond is released, partial
+// tail block kept). used on partial draft rejection.
+LLAMA_API bool llama_paged_scheduler_truncate(struct llama_paged_scheduler * sched,
+                                               int32_t request_id, int32_t n_past_new);
+```
+
+- `attach_draft`:draft 暂存于 group,`populate_batch_from` 对该 seq 产出 `1 + n_draft` 行,
+  块预算按 `allocate(n_draft + 1)` 预留,`batch.logits` 全 1,行位置为 `n_past + i`;行下标
+  由 `batch_info` 的 offsets/lens 推导,等价默认路径的 `spec_i_batch`;
+- 验证与回滚,在 server 侧 `update()` 内:先以 `common_sampler_clone` 备份,再用
+  `sample_and_accept_n` 验证;`n_rollback > 0` 时执行
+  `truncate(sched, id, n_past_before + accepted.size())`,并以 `common_sampler_copy` 恢复
+  采样器、`prompt.tokens.keep_first` 收缩 prompt。由于 paged 支持位置级 seq_rm 加块收缩,
+  无需 checkpoint,对齐默认路径 PART 分支;最后 update 反馈携带 accepted 列表;
+- `update()` 内 draft 生成:上一轮采样后,按 `get_n_draft_max` 与 `spec_draft` 是否为空
+  组装 `common_speculative_get_draft_params`,并经 host yield 钩子调
+  `common_speculative_draft`;draft ctx 解码期间让 queue 保持响应,对齐默认路径
+  `yield_to_queue`;
+- `common_speculative_process(spec, batch)`:直接喂 paged 产出的验证批,seq_id 即槽位 id,
+  与 draft ctx 的 n_seq_max 约定一致,无需改动;
+- `common_context_can_seq_rm` 特判:由于探测式分类会对 paged ctx 断言失败,探测 decode 缺
+  `set_paged_batch_info`,在 `common.cpp` 对 `kv_paged` 直接返回
+  `COMMON_CONTEXT_SEQ_RM_TYPE_PART`;paged 支持范围 seq_rm,走最简单的无 checkpoint 回滚;
+- 统计:`n_accepted_per_pos`、`spec_is_replay` 与 draft 计数全部沿用槽位字段,与默认路径
+  同构。
+
+| 层 | 内容 | 行数 |
+|---|---|---|
+| llama | `attach_draft` + populate 草稿行/全行 logits/块预算 | ~150-200 |
+| llama | update 变长反馈语义,与 12.0 共享,含隐式回滚 | ~100-140 |
+| llama | `truncate`:位置级 seq_rm + 块表收缩释放,需对齐块边界 | ~80-110 |
+| llama | `can_seq_rm` paged 特判 | ~20-30 |
+| server | 启动门禁放开,spec 加 kv_paged 允许;draft ctx 强制非 paged;n_outputs 预算沿用 `server_output_limits` | ~40-60 |
+| server | update:draft 生成与 yield、验证、部分接受回滚、replay、逐位置统计 | ~250-350 |
+
+合计约 600-890 行,四项中复杂度最高。风险:update 契约重构依赖 12.0 先行;块部分释放需
+对齐 block_size 边界;`spec_is_replay` 语义迁移;draft ctx 与 paged 目标的流同步。
+spec 加多模态的组合第一版禁用,默认路径支持,paged 侧两个特性都落地后再开。
+
+### 12.4 b) 多模态:prefill 中途编码,对齐默认路径
+
+默认路径:媒体块在 `server_tokens` 里是 `LLAMA_TOKEN_NULL` 哨兵行,index 与 position 不
+相等,`n_tokens != n_pos`;prefill 遇哨兵即暂停 token 装批,经 `process_mtmd_chunk` 编码
+后,由 `mtmd_helper_decode_image_chunk` 用自带的 `llama_decode` 把 embd 行写入 KV 并自行
+管理位置,再以 `push_back_placeholder` 记账。该 helper 完全绕过调度器,与 paged 的
+`write_slots/block_table` 路由不兼容,所以不能复用其解码半段,只复用编码半段,即
+`mtmd_batch_*` 加 `mtmd_batch_get_output_embd`。
+
+**阶段对齐**:两条路径跑在同一个循环阶段。server_queue 主循环每轮迭代经 on_update_slots
+回调驱动一次推理:默认路径进入 `server_context_impl::update_slots`,子阶段为
+pre_decode 装批 -> decode -> post_decode 采样;paged 路径进入
+`server_scheduler_paged::update`,子阶段为 prepare_batch 装批 -> decode -> 采样/反馈。
+所以默认路径的 pre_decode 装批与 paged 的 update 迭代是同一阶段的对应物,差异在回调
+内部:装批归属不同,默认路径由 server 构建 `server_batch`,paged 路径由调度器
+prepare_batch 构建、server 不接触批内容;媒体编码时点基本等价,两条路径的编码都落在
+迭代 A 的 decode 与迭代 B 的 decode 之间,默认路径发生在 B 的 pre_decode 开头,paged
+路径发生在 A 的迭代尾部,墙钟顺序几乎相同;真正多付的一个调度步来自媒体行的解码方式:
+默认路径的媒体行由 helper 在 B 的 pre_decode 内私有 `llama_decode` 写 KV,不占共享批,
+B 的共享 decode 直接装 text2,请求两轮迭代走完 prefill;paged 路径的媒体行必须作为
+纯 embd 切片经 prepare_batch 进共享 decode,而文本行与 embd 行不能混批,embd 切片
+独占迭代 B,text2 顺延到迭代 C,请求三轮迭代走完 prefill。这一步是调度器统一批入口、
+禁止混批的设计代价。
+
+默认路径流程,以 [text1][img][text2] 三段 prompt 为例,哨兵把 text1 与 text2 拆进
+相邻两轮迭代:
+
+```
+queue 循环迭代 A -> on_update_slots -> server_context_impl::update_slots
+  +-- pre_decode: 装批,server 拥有批构建
+  |     text1 token 逐个 add 进 server_batch
+  |     text 装批循环遇 LLAMA_TOKEN_NULL 哨兵即 break,该槽本轮装批结束
+  +-- decode: llama_decode(batch)                        text1 行,共享 decode
+  +-- post_decode: text1 为中途 prefill,无 logits,不采样
+
+queue 循环迭代 B -> on_update_slots -> update_slots
+  +-- pre_decode:
+  |     mtmd 循环见哨兵,yield_to_queue 内执行 process_mtmd_chunk:
+  |       mtmd_batch_encode                               vision 上下文编码
+  |       mtmd_helper_decode_image_chunk                  自带 llama_decode,
+  |                                                        embd 行、自管位置,
+  |                                                        不经 server_batch
+  |       push_back_placeholder                           prompt.tokens 记账,
+  |                                                        pos_next 前进
+  |     img 段消费完毕,text 装批循环继续,text2 进 server_batch
+  +-- decode: llama_decode(batch)                         text2 行,共享 decode
+  +-- post_decode: 末行 logits -> 采样
+```
+
+paged 方案:分段入队加外部暂停态。请求以分段骨架入队,媒体段先声明规模,编码前
+`n_tokens/n_pos` 已知,编码数据后补;调度器把 embd 行当普通逻辑行调度,批构建时产出纯
+embd 切片:
+
+```c
+struct llama_paged_segment {
+    const llama_token * tokens;  // text segment: n_tokens ids
+    const float *       embd;    // media segment: n_tokens rows x n_embd; NULL = pending
+    int32_t             n_tokens;
+    int32_t             n_pos;   // positions spanned; 0 = same as n_tokens (text)
+};
+
+// media segments may pass embd = NULL (declared size only): the request pauses
+// at that boundary until append_segment supplies the encoder output
+LLAMA_API bool llama_paged_scheduler_add_request_segs(struct llama_paged_scheduler * sched,
+                                                       const struct llama_paged_segment * segs,
+                                                       int32_t n_segs, int32_t request_id);
+LLAMA_API bool llama_paged_scheduler_append_segment(struct llama_paged_scheduler * sched,
+                                                     int32_t request_id,
+                                                     const struct llama_paged_segment * seg);
+```
+
+paged 路径流程,同一 [text1][img][text2] 请求,与默认路径逐迭代对照:
+
+```
+launch
+  -> add_request_segs
+       text1 段:tokens 实数据
+       img 段:  embd = NULL,仅声明 n_tokens/n_pos          pending 声明
+       text2 段:tokens 实数据
+
+queue 循环迭代 A -> on_update_slots -> server_scheduler_paged::update
+  +-- prepare_batch: 装批,调度器拥有批构建
+  |     text1 段可跑 -> 产出 token 切片
+  |     到达 img 段边界且 embd 为 NULL -> 请求置 PAUSED_EXTERNAL
+  |       不进候选,不计入 check_deadlock 分母
+  |       其余请求照常组批,互不阻塞
+  +-- decode: llama_decode(本批切片)                     text1 段行
+  +-- 采样/反馈: text1 为中途 prefill 块,无 logits、无反馈
+  +-- 迭代尾部: server 查 seq_state,发现该请求 PAUSED_EXTERNAL
+        经 host yield 钩子编码:mtmd_batch_encode -> mtmd_batch_get_output_embd
+        append_segment(id, embd):拷入调度器自有缓冲,请求回 RUNNING
+
+queue 循环迭代 B -> on_update_slots -> update
+  +-- prepare_batch: 为 img 段产出纯 embd 切片
+  |     batch.token = NULL,batch.embd 指向段缓冲
+  |     write_slots 按每行位置数组路由,KV 写入块池
+  +-- decode: llama_decode(embd 切片)
+  +-- img 段完成
+
+queue 循环迭代 C -> on_update_slots -> update
+  +-- prepare_batch: text2 段回到普通 token 切片
+  +-- decode: llama_decode(text2 切片)
+  +-- 采样/反馈: text2 为最终段,末行 logits -> 采样
+```
+
+**时延影响**:默认路径两轮迭代走完 prefill,paged 三轮,多的一个调度步代价如下。
+
+- 计算量不变:目标模型的 decode 调用两边都是三次(text1、embd 行、text2),KV 计算与
+  写入完全相同,多的只是循环边界的组织方式;
+- 单请求场景:额外开销仅为一轮循环边界的主机侧工作(prepare_batch 调度与反馈记账,
+  亚毫秒级),相对图片编码的几十到几百毫秒可忽略;
+- 编码批处理两路径等价:mtmd_batch_encode 在 vision 上下文执行,默认路径会把同请求
+  后续图片贪婪攒入一个 encoder 批;paged 的迭代尾部编码复用同一逻辑,同样可一次编完
+  该请求全部 pending 媒体段,编码次数与耗时相同,与节拍延迟无关;
+- 并发场景:循环节拍由在跑 decode 的批决定,媒体请求的 TTFT 约延后一个节拍,即系统
+  当前 TPOT,典型 10-50ms 量级;n 张图片累积 n 个节拍,原因在解码侧而非编码侧:图片
+  之间隔着文本段时,受位置顺序约束,后面图片的 embd 行要等中间文本行写入 KV 才能
+  计算,非相邻 embd 段无法合并,每个 embd 段独占一步,即使编码已一次完成;相对编码
+  与 prefill 总耗时通常为个位数百分比;
+- 吞吐不受影响,并发多模态时甚至更优:默认路径的 helper 私有 decode 逐槽串行、永远
+  单请求;paged 的 embd 步只要求同型、不限请求,多个请求的 pending embd 段可合入
+  同一调度步。n 节拍惩罚只作用于单个请求自身的 TTFT,系统总计算量不变;
+- 若需消除该步,后续可评估同一轮内连续两次 llama_decode(先 embd 后文本)或内核支持
+  混合 ubatch,第一版不做。
+
+- 序列模型:`llama_sequence_group` 增加分段描述与每行位置数组,打破现有"序号等于位置"的
+  假设,`pos = n_past + token_idx` 改为查表;`write_slots` 按位置算块,天然兼容;
+- PAUSED_EXTERNAL 调度态:到达 pending 段边界即暂停,不进候选、不计入死锁/活锁检测,
+  `check_deadlock` 分母排除;`append_segment` 供给 embd 后回到 WAITING/RUNNING,embd 拷入
+  调度器自有缓冲以规避 mbatch 生命周期;`llama_paged_seq_state` 增加状态枚举供 server
+  检测暂停;
+- 批构建:同段同型才可同批,因为文本 token 与 embd 行不混批,`build_inp_embd` 只在
+  `ubatch.token == nullptr` 时走 embd 路径;embd 切片中 `batch.token = nullptr`、
+  `batch.embd` 指向段缓冲;logits 仍只在最终段末行;
+- server 侧:`update()` 每轮迭代检查暂停请求,经 host yield 钩子编码,mtmd vision 上下文
+  独立,期间其余请求照常跑批,然后 `append_segment` 恢复;`prompt.tokens` 以 placeholder
+  记账,`pos_next()` 仍是位置权威;embedding/rerank 依旧禁用,`need_embd` 与 paged 池化
+  问题相互独立。
+
+| 层 | 内容 | 行数 |
+|---|---|---|
+| llama | 序列分段模型 + 每行位置数组 | ~120-160 |
+| llama | `add_request_segs` / `append_segment`,含 pending 声明与 embd 缓冲 | ~80-110 |
+| llama | PAUSED_EXTERNAL 状态机 + seq_state 状态枚举 + 死锁排除 | ~60-90 |
+| llama | populate 纯 embd 切片 + 段边界不混批 + logits 规则 | ~120-170 |
+| server | host yield 钩子 | ~15 |
+| server | launch:分段骨架入队,复用 `find_chunk` 遍历 | ~50-70 |
+| server | update:暂停检测 -> 编码 -> 恢复,复用 `process_mtmd_chunk` 编码半段 | ~130-180 |
+| server | placeholder 记账 + 释放路径 | ~60-80 |
+
+合计约 535-875 行,风险最高。风险点:paged 图的 embd 输入分支,`build_inp_embd` 选择逻辑
+内核侧待验证;M-RoPE 每行多位置,第一版可按架构闸掉,仅支持单位置媒体;编码期间调度空转
+的边界,其余请求全部空闲且唯一请求暂停时,update 返回空闲并由编码驱动唤醒。
+
+### 12.5 特性交互与实施顺序
+
+| 组合 | 默认路径 | paged 第二阶段 |
+|---|---|---|
+| d + 任意 | - | 无冲突 |
+| c + a,n_cmpl 加投机 | 支持,fork 不复制 spec 状态,子槽独立起草 | 支持,fork 同理只复制 prompt 段 |
+| b + a,多模态加投机 | 支持 | 第一版禁,因为 draft prompt 的媒体段文本化有问题,后开 |
+| b + c | 支持 | 支持,fork 含媒体段,块引用共享不受段型影响 |
+
+实施顺序:P0 -> d,放闸即刻可用 -> c,fork 基础设施与契约重构 -> a,复用新契约,工作量
+最大 -> b,独立、可与 a 并行开发,运行时验收依赖内核 embd 支持。12.0 的契约重构必须先于
+c/a 落地。
+
+### 12.6 工作量汇总
+
+| 特性 | llama 层 | server 层 | 合计 | 风险 |
+|---|---|---|---|---|
+| P0 + d) chat/工具调用 | 0 | ~25-35 | ~25-35 | 低 |
+| c) n_cmpl>1 | ~185-255 | ~200-280 | ~385-535 | 中 |
+| a) 投机推理 | ~350-480 | ~290-410 | ~600-890 | 高 |
+| b) 多模态 | ~380-530 | ~255-345 | ~535-875 | 最高 |
+| **合计** | **~915-1265** | **~770-1070** | **~1545-2335** | - |
+
+验收沿用第 9 节框架,按特性补矩阵:chat 工具调用流式增量、n_cmpl 多路种子一致性,
+与默认路径同 prompt 对比;投机接受率与无投机等价性,top-k 对比复用 `test-paged-kv-e2e`
+思路;多模态图文混合 prompt 与默认路径逐 token 等价。
+
+### 12.7 第二阶段实施记录
+
+范围:P0 + 12.1 + 12.2 + 12.3;12.4 多模态按计划暂缓。
+
+实现与设计偏差:
+
+1. `update` 契约按 12.0 修订原位改签名,4 处树内调用点(examples/paged、e2e 测试两处、
+   shim 内 warmup)随签名迁移。
+2. `can_seq_rm` 的 paged 特判落在 `server-context.cpp` 的 `ctx_tgt_seq_rm_type` 赋值处
+   (以 `params_base.kv_paged` 判 PART),而非 `common.cpp`:common 层只有 C API,看不到
+   cparams,server 侧判断零成本且避免新增公共接口。该特判同时修复了一个 phase-1 隐患:
+   探测式分类会对 paged ctx 断言失败,此前 server 带 `--kv-paged` 启动会在 load 阶段崩溃。
+3. 投机推理走 PART 语义:部分接受经 `prompt.tokens.keep_first + insert` 修复后直接
+   `truncate` 到新的验证末尾,无 checkpoint、无 replay(`spec_is_replay` 恒为 false),
+   与默认路径 PART 分支同构;synthetic acceptance 在 `--kv-paged` 下启动期拒绝。
+4. 验证采样复用 `common_sampler_sample_and_accept_n`,不在 server 侧重写逐行采样。
+5. fork 的尾块急拷贝:满块 `add_ref_blocks` 引用共享,`n_past % block_size != 0` 时为
+   子请求分配私有块并经新增的 `copy_block_content`(同池直拷/跨池走 `do_block_copy`)
+   复制父尾块;`truncate` 释放块时调用新增的 `prefix_cache.drop_block` 撤销已释放块的
+   前缀缓存登记,避免 LRU 驱逐命中陈旧块号。
+
+验证:CANN 9.0.0 aarch64 编译通过(llama-server + test-paged-kv-e2e);910B4 上默认
+调度回归通过(/completion、/v1/completions、/v1/chat/completions 含工具调用、n=2 并行)。
+paged 路径运行时验收依赖第 11 节的 910B 内核适配,当前以 CPU/310P 为准。

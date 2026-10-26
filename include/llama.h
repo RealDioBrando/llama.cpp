@@ -1730,10 +1730,56 @@ extern "C" {
     LLAMA_API bool llama_paged_scheduler_prepare_batch(struct llama_paged_scheduler * sched,
                                                        struct llama_batch *           batch);
 
-    LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler * sched,
-                                                struct llama_batch *           batch,
-                                                const llama_token *            tokens,
-                                                const int8_t *                 stop_flags);
+    // post-decode feedback for one request. tokens are the target outputs
+    // generated this step and are appended to the request's logical sequence:
+    // - plain decode / final prefill chunk: n_tokens = 1 (the sampled token)
+    // - speculative verify: n_tokens = number of accepted tokens (drafts plus
+    //   the bonus), 1..n_draft + 1
+    // - forked children sampled out of batch: n_tokens = 1
+    // when the request is part of the batch, KV positions are advanced by the
+    // batch rows first; fewer accepted tokens than rows means the caller
+    // rejects the rest and rolls the request back via
+    // llama_paged_scheduler_truncate. entries not found in the batch are
+    // applied out-of-batch (token bookkeeping only). batch may be NULL when
+    // every entry is out-of-batch.
+    struct llama_paged_feedback {
+        int32_t             request_id;
+        const llama_token * tokens;
+        int32_t             n_tokens;
+        int8_t              stop;   // finish the request after applying this feedback
+    };
+
+    LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler *      sched,
+                                                struct llama_batch *               batch,
+                                                const struct llama_paged_feedback * feedback,
+                                                int32_t                             n_feedback);
+
+    // fork a fully-prefilled request: dst shares src's prompt blocks by
+    // reference and a partially-filled tail block is eagerly copied per child;
+    // hybrid recurrent state is seq_cp-ed. src must have completed its prompt
+    // (n_past not yet advanced by the final chunk is fine). dst must be a free
+    // request id. the child enters the running list ready for decode.
+    LLAMA_API bool llama_paged_scheduler_fork_request(struct llama_paged_scheduler * sched,
+                                                       int32_t                        src_id,
+                                                       int32_t                        dst_id);
+
+    // tentatively extend the next decode step with draft tokens: the batch
+    // holds 1 + n_draft rows for this seq with logits on every row. the draft
+    // is consumed by the next prepare_batch; acceptance is decided by the
+    // caller via llama_paged_scheduler_update, followed by truncate on
+    // partial rejection.
+    LLAMA_API bool llama_paged_scheduler_attach_draft(struct llama_paged_scheduler * sched,
+                                                       int32_t                        request_id,
+                                                       const llama_token *            draft,
+                                                       int32_t                        n_draft);
+
+    // roll a request back to n_past_new tokens: KV beyond is released (shared
+    // blocks drop their ref, owned blocks are freed, the partial tail block is
+    // kept). used after a speculative step that accepted fewer tokens than
+    // were tentatively decoded.
+    LLAMA_API bool llama_paged_scheduler_truncate(struct llama_paged_scheduler * sched,
+                                                   int32_t                        request_id,
+                                                   int32_t                        n_past_new);
 
     // Introspection.
     LLAMA_API bool llama_paged_scheduler_get_seq_state(struct llama_paged_scheduler * sched,

@@ -98,9 +98,12 @@ LLAMA_API bool llama_paged_scheduler_warmup(struct llama_paged_scheduler * sched
             llama_synchronize(ctx);
 
             const auto * info = llama_paged_scheduler_get_batch_info(sched);
-            std::vector<llama_token> next_tokens(info->n_seq, 0);
-            std::vector<int8_t> stop(info->n_seq, decoded ? 1 : 0);
-            llama_paged_scheduler_update(sched, &batch, next_tokens.data(), stop.data());
+            static const llama_token warm_token = 0;
+            std::vector<llama_paged_feedback> fb(info->n_seq);
+            for (int32_t i = 0; i < info->n_seq; ++i) {
+                fb[i] = { batch.seq_id[info->batch_offsets[i]][0], &warm_token, 1, decoded ? 1 : 0 };
+            }
+            llama_paged_scheduler_update(sched, &batch, fb.data(), (int32_t) fb.size());
             decoded = true;
         }
         return true;
@@ -167,18 +170,51 @@ LLAMA_API bool llama_paged_scheduler_add_request(struct llama_paged_scheduler * 
     return sched->impl.queue_request(group);
 }
 
-LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler * sched,
-                                            struct llama_batch *           batch,
-                                            const llama_token *            tokens,
-                                            const int8_t *                 stop_flags) {
-    if (!sched || !batch || !tokens || !stop_flags) {
+LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler *      sched,
+                                            struct llama_batch *               batch,
+                                            const struct llama_paged_feedback * feedback,
+                                            int32_t                             n_feedback) {
+    if (!sched) {
         return;
     }
+    // a batch of mid-prefill rows carries no feedback but must still advance
+    // the KV positions
+    if ((!feedback || n_feedback <= 0) && (!batch || batch->n_tokens == 0)) {
+        return;
+    }
+    if (batch != nullptr && batch->n_tokens > 0) {
+        const auto * info = sched->impl.get_curr_batch_info();
+        GGML_ASSERT(info != nullptr && "no batch info was set.");
+    }
+    sched->impl.update(batch, feedback, n_feedback);
+}
 
-    const auto * info = sched->impl.get_curr_batch_info();
-    GGML_ASSERT(info != nullptr && "no batch info was set.");
-    std::vector<llama_token> tokens_vec(tokens, tokens + info->n_seq);
-    sched->impl.update(*batch, tokens_vec, stop_flags);
+LLAMA_API bool llama_paged_scheduler_fork_request(struct llama_paged_scheduler * sched,
+                                                   int32_t                        src_id,
+                                                   int32_t                        dst_id) {
+    if (!sched) {
+        return false;
+    }
+    return sched->impl.fork_request(src_id, dst_id);
+}
+
+LLAMA_API bool llama_paged_scheduler_attach_draft(struct llama_paged_scheduler * sched,
+                                                   int32_t                        request_id,
+                                                   const llama_token *            draft,
+                                                   int32_t                        n_draft) {
+    if (!sched) {
+        return false;
+    }
+    return sched->impl.attach_draft(request_id, draft, n_draft);
+}
+
+LLAMA_API bool llama_paged_scheduler_truncate(struct llama_paged_scheduler * sched,
+                                               int32_t                        request_id,
+                                               int32_t                        n_past_new) {
+    if (!sched) {
+        return false;
+    }
+    return sched->impl.truncate(request_id, n_past_new);
 }
 
 LLAMA_API void llama_paged_scheduler_set_on_finish(struct llama_paged_scheduler * sched,

@@ -353,11 +353,11 @@ Phase-1 restrictions:
   multi-GPU machines) or run on CPU, and `-b` must equal `-ub`.
 - `-c` (context size) becomes the per-request context limit; there is no context shift, so a
   request ends when its context is full.
-- Only text completion is served: `/completion` and `/v1/completions`, including streaming,
-  sampling parameters, `stop` strings and `n_predict`. Chat completions, infill, embeddings,
-  reranking, grammar/structured output, `n_cmpl > 1`, multimodal inputs, speculative decoding,
-  LoRA adapters, `--cache-ram` and the `/slots` save/restore endpoints return an error or are
-  rejected at startup.
+- Supported: `/completion`, `/v1/completions` and `/v1/chat/completions` (including tool
+  calls and grammar), speculative decoding (`--spec-*`; the draft context always runs on
+  classic memory), and `n` / `n_cmpl > 1` parallel sampling. Multimodal inputs, infill,
+  embeddings, reranking, synthetic speculative acceptance, LoRA adapters, `--cache-ram` and
+  the `/slots` save/restore endpoints return an error or are rejected at startup.
 - Explicit `id_slot` requests are not supported.
 - SWA architectures (gemma3, llama4, etc.) are not yet supported; hybrid recurrent models
   (Qwen3.5) reserve a few sequence ids internally, reducing the effective slot count.

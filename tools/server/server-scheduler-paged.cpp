@@ -7,24 +7,20 @@
 #include <algorithm>
 
 static bool paged_task_supported(const server_task & task) {
-    // phase 1: text completion only (chat templates are applied in the HTTP
-    // layer and arrive here as COMPLETION tasks, gated by res_type below)
+    // chat templates are applied in the HTTP layer and arrive here as
+    // COMPLETION tasks; grammar lives in the per-slot sampler chain and works
+    // unchanged on the paged path; n_cmpl > 1 is handled by the parent/child
+    // launch flow
     if (task.type != SERVER_TASK_TYPE_COMPLETION) {
         return false;
     }
     switch (task.params.res_type) {
         case TASK_RESPONSE_TYPE_NONE:        // /completion
         case TASK_RESPONSE_TYPE_OAI_CMPL:    // /v1/completions
+        case TASK_RESPONSE_TYPE_OAI_CHAT:    // /v1/chat/completions
             break;
         default:
             return false;
-    }
-    // grammar / structured output is phase 2
-    if (task.params.sampling.grammar.type != COMMON_GRAMMAR_TYPE_NONE) {
-        return false;
-    }
-    if (task.params.n_cmpl > 1) {
-        return false;
     }
     return true;
 }
@@ -104,48 +100,102 @@ bool server_scheduler_paged::launch(server_task && task) {
         return true;
     }
 
+    if (task.tokens.has_mtmd) {
+        // P0: get_text_tokens() would silently drop the media chunks
+        host.send_error(task, "multimodal inputs are not supported with --kv-paged yet", ERROR_TYPE_NOT_SUPPORTED);
+        return true;
+    }
+
     if (!paged_task_supported(task)) {
         host.send_error(task, "this feature is not supported with --kv-paged", ERROR_TYPE_NOT_SUPPORTED);
         return true;
     }
 
-    server_slot * slot = pick_idle_slot();
-    if (slot == nullptr) {
-        return false; // no capacity: the caller defers the task
-    }
+    // launch one request and its prompt into the scheduler; returns false
+    // when the caller must defer the task
+    auto launch_single = [&](server_task && t, server_slot * forced_slot) -> bool {
+        server_slot * slot = forced_slot ? forced_slot : pick_idle_slot();
+        if (slot == nullptr) {
+            return false;
+        }
 
-    if (!host.launch_slot_with_task(*slot, std::move(task))) {
-        return true; // rejected, error already sent
-    }
+        if (!host.launch_slot_with_task(*slot, std::move(t))) {
+            // rejected, error already sent
+            return true;
+        }
 
-    server_slot & s = *slot;
-    s.stats.update_prompt_start();
-    // server_tokens is move-only; paged phase 1 is text-only (mtmd gated off)
-    s.prompt.tokens = server_tokens(s.task->tokens.get_text_tokens(), /* has_mtmd = */ false);
+        server_slot & s = *slot;
+        s.stats.update_prompt_start();
+        // server_tokens is move-only; paged inputs are text-only (mtmd gated off)
+        s.prompt.tokens = server_tokens(s.task->tokens.get_text_tokens(), /* has_mtmd = */ false);
 
-    llama_tokens prompt_tokens = s.task->tokens.get_text_tokens();
+        llama_tokens prompt_tokens = s.task->tokens.get_text_tokens();
 
-    if (prompt_tokens.empty()) {
-        // mirror the default path: an empty prompt completes immediately
-        SLT_WRN(s, "%s", "empty prompt - releasing slot\n");
-        s.print_timings();
-        host.send_final_response(s);
-        s.release();
+        if (prompt_tokens.empty()) {
+            // mirror the default path: an empty prompt completes immediately
+            SLT_WRN(s, "%s", "empty prompt - releasing slot\n");
+            s.print_timings();
+            host.send_final_response(s);
+            s.release();
+            return true;
+        }
+
+        if ((int32_t) prompt_tokens.size() >= s.n_ctx) {
+            host.send_error(s, "prompt is too long for the paged context", ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+            s.release();
+            return true;
+        }
+
+        if (!llama_paged_scheduler_add_request(sched, prompt_tokens.data(), (int32_t) prompt_tokens.size(), s.id)) {
+            host.send_error(s, "failed to queue the request in the paged scheduler", ERROR_TYPE_SERVER);
+            s.release();
+            return true;
+        }
         return true;
+    };
+
+    if (!task.is_parent()) {
+        return launch_single(std::move(task), nullptr);
     }
 
-    if ((int32_t) prompt_tokens.size() >= s.n_ctx) {
-        host.send_error(s, "prompt is too long for the paged context", ERROR_TYPE_EXCEED_CONTEXT_SIZE);
-        s.release();
-        return true;
+    // n_cmpl > 1: the parent plus every child needs a slot atomically,
+    // mirroring launch_slots_with_parent_task on the default path
+    const int64_t id_parent = task.id;
+    std::vector<server_slot *> free_slots;
+    for (auto & s : host.slot_pool()) {
+        if (!s.is_processing()) {
+            free_slots.push_back(&s);
+        }
+    }
+    std::sort(free_slots.begin(), free_slots.end(),
+              [](const server_slot * a, const server_slot * b) { return a->t_last_used < b->t_last_used; });
+
+    const size_t n_children = task.child_tasks.size();
+    if (free_slots.size() < 1 + n_children) {
+        return false; // no capacity: the caller defers the whole task
     }
 
-    if (!llama_paged_scheduler_add_request(sched, prompt_tokens.data(), (int32_t) prompt_tokens.size(), s.id)) {
-        host.send_error(s, "failed to queue the request in the paged scheduler", ERROR_TYPE_SERVER);
-        s.release();
-        return true;
+    auto release_task_slots = [&](int64_t id) {
+        for (auto & s : host.slot_pool()) {
+            if (s.task && (s.task->id == id || s.task->id_parent == id)) {
+                s.release();
+            }
+        }
+    };
+
+    // children first: they wait in SLOT_STATE_WAIT_OTHER without a scheduler
+    // request until the parent's prompt is done
+    for (size_t i = 0; i < n_children; ++i) {
+        if (!host.launch_slot_with_task(*free_slots[i + 1], std::move(task.child_tasks[i]))) {
+            release_task_slots(id_parent);
+            return true; // rejected, error already sent
+        }
     }
 
+    if (!launch_single(std::move(task), free_slots[0])) {
+        release_task_slots(id_parent);
+        return false;
+    }
     return true;
 }
 
@@ -234,6 +284,12 @@ void server_scheduler_paged::update() {
         return;
     }
 
+    // speculative decoding: draft for the generating slots and attach the
+    // drafts to the scheduler before the batch is built
+    if (host.spec_ctx() != nullptr) {
+        prepare_drafts();
+    }
+
     // reap finished requests, schedule waiting/swapped ones and build the batch
     if (!llama_paged_scheduler_prepare_batch(sched, &paged_batch)) {
         fail_all("paged scheduler deadlock: not enough KV blocks to make progress");
@@ -268,10 +324,12 @@ void server_scheduler_paged::update() {
 
     const int64_t t_now = ggml_time_us();
 
-    std::vector<llama_token> sampled_tokens;
-    std::vector<int8_t>      stop_flags;
-    sampled_tokens.reserve(info->n_seq);
-    stop_flags.reserve(info->n_seq);
+    // feedback storage; pointers into fb_tok must stay stable until the
+    // llama_paged_scheduler_update call below
+    std::vector<llama_token>            fb_tok;
+    std::vector<llama_paged_feedback>   fb;
+    fb_tok.reserve(2 * (size_t) info->n_seq + 32);
+    fb.reserve(2 * (size_t) info->n_seq + 32);
 
     uint64_t n_prompt_tokens = 0;
 
@@ -289,9 +347,6 @@ void server_scheduler_paged::update() {
 
         m.n_tokens_max = std::max<uint64_t>(m.n_tokens_max, st.n_past + len);
 
-        llama_token tok = LLAMA_TOKEN_NULL;
-        bool keep_generating = true;
-
         if (st.n_decoded == 0) {
             // prefill step for this sequence
             slot.state = final_prefill ? SLOT_STATE_DONE_PROMPT : SLOT_STATE_PROCESSING_PROMPT;
@@ -306,54 +361,75 @@ void server_scheduler_paged::update() {
                     host.send_partial_response(slot, {}, true);
                 }
             }
+        } else if (slot.state != SLOT_STATE_GENERATING) {
+            slot.state = SLOT_STATE_GENERATING;
+        }
+
+        if (!sample_now) {
+            // mid-prefill chunk: no logits, no feedback
+            continue;
+        }
+
+        // speculative verify: the batch holds 1 + n_draft rows for this seq,
+        // all with logits; sample_and_accept_n walks them
+        if (slot.can_speculate() && !slot.spec_draft.empty()) {
+            verify_slot(slot, off, len, fb_tok, fb);
+            continue;
+        }
+
+        // the last row of the sequence in this batch carries the logits
+        slot.i_batch = off + len - 1;
+        llama_token tok = common_sampler_sample(slot.smpl.get(), host.ctx(), slot.i_batch);
+        common_sampler_accept(slot.smpl.get(), tok, true);
+        slot.i_batch = -1;
+
+        slot.stats.n_gen += 1;
+        if (slot.stats.n_gen == 1) {
+            slot.stats.update_prompt_last();
+            slot.t_print_last = t_now;
+            slot.n_gen_last = 0;
+        }
+        slot.stats.update_gen_last();
+
+        // the sampled token becomes part of the prompt state before the
+        // stop checks, mirroring handle_last_sampled_token()
+        slot.prompt.tokens.push_back(tok);
+
+        completion_token_output result;
+        result.tok          = tok;
+        result.text_to_send = common_token_to_piece(host.ctx(), tok,
+                host.params().special ||
+                slot.task->params.sampling.preserved_tokens.count(tok) > 0);
+        result.prob         = 1.0f;
+
+        if (slot.task->params.sampling.n_probs > 0) {
+            host.populate_token_probs(slot, result, slot.task->params.post_sampling_probs,
+                                      host.params().special, off + len - 1);
+        }
+
+        bool keep_generating = host.process_token(result, slot);
+        if (!keep_generating) {
+            slot.print_timings();
+            host.send_final_response(slot);
         } else {
-            slot.state = SLOT_STATE_GENERATING;
+            slot.print_timings_tg();
         }
 
-        if (sample_now) {
-            // the last token of the sequence in this batch carries the logits
-            slot.i_batch = off + len - 1;
-            tok = common_sampler_sample(slot.smpl.get(), host.ctx(), slot.i_batch);
-            common_sampler_accept(slot.smpl.get(), tok, true);
-            slot.i_batch = -1;
-
-            slot.stats.n_gen += 1;
-            if (slot.stats.n_gen == 1) {
-                slot.stats.update_prompt_last();
-                slot.t_print_last = t_now;
-                slot.n_gen_last = 0;
-            }
-            slot.stats.update_gen_last();
-
-            // the sampled token becomes part of the prompt state before the
-            // stop checks, mirroring handle_last_sampled_token()
-            slot.prompt.tokens.push_back(tok);
-
-            completion_token_output result;
-            result.tok          = tok;
-            result.text_to_send = common_token_to_piece(host.ctx(), tok,
-                    host.params().special ||
-                    slot.task->params.sampling.preserved_tokens.count(tok) > 0);
-            result.prob         = 1.0f;
-
-            if (slot.task->params.sampling.n_probs > 0) {
-                host.populate_token_probs(slot, result, slot.task->params.post_sampling_probs,
-                                          host.params().special, off + len - 1);
-            }
-
-            keep_generating = host.process_token(result, slot);
-            if (!keep_generating) {
-                slot.print_timings();
-                host.send_final_response(slot);
-            } else {
-                slot.print_timings_tg();
-            }
-
+        if (slot.state == SLOT_STATE_DONE_PROMPT) {
             slot.state = SLOT_STATE_GENERATING;
+            if (slot.can_speculate() && host.spec_ctx() != nullptr) {
+                common_speculative_begin(host.spec_ctx(), slot.id, slot.prompt.tokens.get_text_tokens());
+            }
         }
 
-        sampled_tokens.push_back(tok);
-        stop_flags.push_back(keep_generating ? 0 : 1);
+        fb_tok.push_back(tok);
+        fb.push_back({ slot.id, &fb_tok.back(), 1, keep_generating ? 0 : 1 });
+
+        // n_cmpl > 1: fork the prefilled parent into its waiting children and
+        // sample each child's first token from this row's logits
+        if (final_prefill && keep_generating && slot.task->is_parent()) {
+            fork_children(slot, off + len - 1, fb_tok, fb);
+        }
     }
 
     for (const auto & slot : slots) {
@@ -364,7 +440,197 @@ void server_scheduler_paged::update() {
 
     host.metrics_queue_prompt(n_prompt_tokens);
 
-    llama_paged_scheduler_update(sched, &paged_batch, sampled_tokens.data(), stop_flags.data());
+    llama_paged_scheduler_update(sched, &paged_batch, fb.data(), (int32_t) fb.size());
+}
+
+void server_scheduler_paged::fork_children(server_slot & parent, int32_t tok_idx,
+                                            std::vector<llama_token> & fb_tok,
+                                            std::vector<llama_paged_feedback> & fb) {
+    for (auto & child : host.slot_pool()) {
+        if (child.state != SLOT_STATE_WAIT_OTHER || !child.task || !parent.task) {
+            continue;
+        }
+        if (child.task->id_parent != parent.task->id) {
+            continue;
+        }
+
+        if (!llama_paged_scheduler_fork_request(sched, parent.id, child.id)) {
+            host.send_error(child, "failed to fork the request in the paged scheduler", ERROR_TYPE_SERVER);
+            child.release();
+            continue;
+        }
+
+        // clone the prompt state from the parent (KV is shared by reference)
+        child.prompt.tokens = server_tokens(parent.prompt.tokens.get_text_tokens(), /* has_mtmd = */ false);
+        child.stats         = parent.stats;
+        child.state         = SLOT_STATE_GENERATING;
+
+        // the child samples its own first token from the parent's logits row
+        child.i_batch = tok_idx;
+        llama_token tok = common_sampler_sample(child.smpl.get(), host.ctx(), tok_idx);
+        common_sampler_accept(child.smpl.get(), tok, true);
+        child.i_batch = -1;
+
+        child.stats.n_gen += 1;
+        child.stats.update_gen_last();
+
+        completion_token_output result;
+        result.tok          = tok;
+        result.text_to_send = common_token_to_piece(host.ctx(), tok,
+                host.params().special ||
+                child.task->params.sampling.preserved_tokens.count(tok) > 0);
+        result.prob         = 1.0f;
+
+        if (child.task->params.sampling.n_probs > 0) {
+            host.populate_token_probs(child, result, child.task->params.post_sampling_probs,
+                                      host.params().special, tok_idx);
+        }
+
+        fb_tok.push_back(tok);
+        bool keep_generating = host.process_token(result, child);
+        if (!keep_generating) {
+            child.print_timings();
+            host.send_final_response(child);
+        }
+        fb.push_back({ child.id, &fb_tok.back(), 1, keep_generating ? 0 : 1 });
+    }
+}
+
+void server_scheduler_paged::prepare_drafts() {
+    bool any_drafting = false;
+
+    for (auto & slot : host.slot_pool()) {
+        if (!slot.can_speculate() || !slot.is_processing() || slot.state != SLOT_STATE_GENERATING) {
+            continue;
+        }
+        if (!slot.spec_draft.empty()) {
+            continue; // carried over from a partial round, reused as-is
+        }
+
+        const int n_draft_max = slot.get_n_draft_max();
+        if (n_draft_max <= 0) {
+            continue;
+        }
+
+        // roll the draft context back to the verified end; its KV beyond the
+        // prompt belongs to rejected drafts of the previous round
+        if (slot.ctx_dft) {
+            llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.id,
+                                (llama_pos) slot.prompt.tokens.size(), -1);
+        }
+
+        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+        common_speculative_get_draft_params(host.spec_ctx(), slot.id) = {
+            /* .drafting = */ true,
+            /* .n_max    = */ n_draft_max,
+            /* .pos0     = */ slot.prompt.tokens.pos_next(),
+            /* .id_last  = */ slot.sampled,
+            /* .prompt   = */ &slot.spec_prompt,
+            /* .result   = */ &slot.spec_draft,
+        };
+        any_drafting = true;
+    }
+
+    if (any_drafting) {
+        // draft on the main thread while a worker serves the task queue
+        host.yield([&]() { common_speculative_draft(host.spec_ctx()); });
+    }
+
+    for (auto & slot : host.slot_pool()) {
+        if (!slot.can_speculate() || slot.state != SLOT_STATE_GENERATING || slot.spec_draft.empty()) {
+            continue;
+        }
+        if (!llama_paged_scheduler_attach_draft(sched, slot.id, slot.spec_draft.data(),
+                                                (int32_t) slot.spec_draft.size())) {
+            // budget exhausted: decode without a draft this round
+            slot.spec_draft.clear();
+            continue;
+        }
+        // tentatively extend the prompt state, mirroring
+        // handle_last_sampled_token()
+        slot.prompt.tokens.push_back(slot.sampled);
+        slot.prompt.tokens.insert(slot.spec_draft);
+    }
+}
+
+bool server_scheduler_paged::verify_slot(server_slot & slot, int32_t off, int32_t len,
+                                          std::vector<llama_token> & fb_tok,
+                                          std::vector<llama_paged_feedback> & fb) {
+    const int32_t n_draft = (int32_t) slot.spec_draft.size();
+    std::vector<int32_t> idxs(n_draft + 1);
+    for (int32_t j = 0; j <= n_draft; ++j) {
+        idxs[j] = off + len - n_draft - 1 + j;
+    }
+
+    // verify: sample every row, keep the drafts the target agrees with plus
+    // the target's bonus token (identical to the default path)
+    llama_tokens accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), host.ctx(), idxs, slot.spec_draft);
+    slot.spec_draft.clear();
+
+    const int32_t k = (int32_t) accepted.size() - 1;   // accepted drafts
+    common_speculative_accept(host.spec_ctx(), slot.id, (uint16_t) k);
+
+    slot.stats.n_draft_accepted    += k;
+    slot.stats.n_draft_verif_steps += 1;
+    if (slot.n_accepted_per_pos.size() < (size_t) host.params().speculative.draft.n_max) {
+        slot.n_accepted_per_pos.resize(host.params().speculative.draft.n_max, 0);
+    }
+    for (int32_t j = 0; j < k && j < (int32_t) slot.n_accepted_per_pos.size(); ++j) {
+        slot.n_accepted_per_pos[j]++;
+    }
+
+    // prompt fixup: drop the tentative extension, keep the verified prefix;
+    // the bonus token becomes the new pending input
+    slot.prompt.tokens.keep_first(slot.prompt.tokens.size() - n_draft);
+    slot.prompt.tokens.insert({accepted.begin(), accepted.end() - 1});
+    slot.sampled = accepted.back();
+
+    if (k < n_draft) {
+        // rejected draft rows are still in the KV: roll back to the verified
+        // end, which is exactly the fixed-up prompt length
+        llama_paged_scheduler_truncate(sched, slot.id, (int32_t) slot.prompt.tokens.size());
+    }
+
+    // emit the accepted tokens through the regular stop/streaming pipeline
+    int32_t n_emitted = 0;
+    bool keep_generating = true;
+    for (int32_t j = 0; j <= k; ++j) {
+        const llama_token tok = accepted[j];
+        slot.stats.n_gen += 1;
+        if (slot.stats.n_gen == 1) {
+            slot.stats.update_prompt_last();
+            slot.t_print_last = ggml_time_us();
+            slot.n_gen_last = 0;
+        }
+        slot.stats.update_gen_last();
+
+        completion_token_output result;
+        result.tok          = tok;
+        result.text_to_send = common_token_to_piece(host.ctx(), tok,
+                host.params().special ||
+                slot.task->params.sampling.preserved_tokens.count(tok) > 0);
+        result.prob         = 1.0f;
+
+        if (slot.task->params.sampling.n_probs > 0) {
+            host.populate_token_probs(slot, result, slot.task->params.post_sampling_probs,
+                                      host.params().special, idxs[std::min(j + 1, n_draft)]);
+        }
+
+        keep_generating = host.process_token(result, slot);
+        n_emitted++;
+        if (!keep_generating) {
+            break;
+        }
+    }
+    slot.print_timings_tg();
+
+    fb_tok.insert(fb_tok.end(), accepted.begin(), accepted.begin() + n_emitted);
+    fb.push_back({ slot.id, fb_tok.data() + (fb_tok.size() - n_emitted), n_emitted, keep_generating ? 0 : 1 });
+    if (!keep_generating) {
+        slot.print_timings();
+        host.send_final_response(slot);
+    }
+    return keep_generating;
 }
 
 std::unique_ptr<server_scheduler_interface> server_scheduler_create(server_scheduler_host & host) {

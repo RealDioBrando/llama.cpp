@@ -183,7 +183,8 @@ static path_result run_paged(const std::string & model_path) {
 
         bool   stop      = llama_vocab_is_eog(vocab, next) || (int) result.tokens.size() >= N_PREDICT;
         int8_t stop_flag = stop ? 1 : 0;
-        llama_paged_scheduler_update(sched, &batch, &next, &stop_flag);
+        llama_paged_feedback fb = { batch.seq_id[info->batch_offsets[0]][0], &next, 1, stop_flag };
+        llama_paged_scheduler_update(sched, &batch, &fb, 1);
         if (stop) {
             break;
         }
@@ -336,7 +337,14 @@ static void run_cancel(const std::string & model_path) {
             tokens.push_back(t);
             stops.push_back(0);
         }
-        llama_paged_scheduler_update(sched, &batch, tokens.data(), stops.data());
+        std::vector<llama_paged_feedback> fb;
+        for (int i = 0; i < info->n_seq; ++i) {
+            if (tokens[i] != LLAMA_TOKEN_NULL) {
+                const int32_t off = info->batch_offsets[i];
+                fb.push_back({ batch.seq_id[off][0], &tokens[i], 1, stops[i] });
+            }
+        }
+        llama_paged_scheduler_update(sched, &batch, fb.data(), (int32_t) fb.size());
         steps++;
 
         if (steps == 1) {

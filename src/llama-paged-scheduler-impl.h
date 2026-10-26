@@ -26,9 +26,12 @@ class llama_paged_scheduler_impl {
 
     llama_scheduler_status step(llama_batch & batch);
     bool                   queue_request(llama_sequence_group group);
-    void update(const llama_batch & batch, const std::vector<llama_token> & new_tokens, const int8_t * stop_flags);
+    void update(const llama_batch * batch, const llama_paged_feedback * feedback, int32_t n_feedback);
     void set_on_finish(llama_paged_on_finish_cb cb, void * user_data);
     bool cancel(int32_t request_id);
+    bool fork_request(int32_t src_id, int32_t dst_id);
+    bool attach_draft(int32_t request_id, const llama_token * draft, int32_t n_draft);
+    bool truncate(int32_t request_id, int32_t n_past_new);
     int32_t max_request_id() const;
     llama_sequence_group *         get_group_from_id(int32_t request_id) const;
     const llama_paged_batch_info * get_curr_batch_info() const;
@@ -56,9 +59,9 @@ class llama_paged_scheduler_impl {
     // most recent arrival. Groups already added to this step's candidates are
     // eligible; the caller removes them from `candidates` before eviction.
     llama_sequence_group_ptr evict();
-    void process_running_list(llama_sequence_group_raw_list & candidates);
-    void process_swapped_list(llama_sequence_group_raw_list & candidates);
-    void process_waiting_list(llama_sequence_group_raw_list & candidates, int32_t remaining_token_bugdet);
+    void process_running_list(llama_sequence_group_raw_list & candidates, int32_t & row_budget);
+    void process_swapped_list(llama_sequence_group_raw_list & candidates, int32_t & row_budget);
+    void process_waiting_list(llama_sequence_group_raw_list & candidates, int32_t & row_budget);
 
     void swap_out_or_recompute(llama_sequence_group_ptr group_ptr);
 

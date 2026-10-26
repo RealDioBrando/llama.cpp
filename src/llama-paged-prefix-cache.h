@@ -53,6 +53,9 @@ class llama_paged_prefix_cache {
     // swap moved it between the GPU and CPU pools.
     void update_block_id(uint64_t hash, uint32_t new_block_id);
 
+    // Forget every entry pointing at this block (it is being released).
+    void drop_block(uint32_t block_id);
+
     // Cache-resident lifecycle: entries whose owning request finished keep
     // their block alive (ref stays 1) until evicted under pressure.
     void set_cached_state(uint64_t hash, bool cached);

@@ -33,6 +33,10 @@ struct llama_sequence_group {
     std::vector<llama_token> logical_seq;
     llama_block_ids          block_table;
     std::vector<uint64_t>    block_hashes;  // per completed block, prefix cache chain
+
+    // speculative decoding: draft tokens tentatively added to the next step.
+    // consumed (cleared) by populate_batch_from
+    std::vector<llama_token> pending_draft;
 };
 
 using llama_sequence_group_raw_list = std::vector<llama_sequence_group *>;

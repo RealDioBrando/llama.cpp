@@ -410,8 +410,13 @@ private:
             const bool has_spec_types = std::any_of(params_base.speculative.types.begin(),
                                                     params_base.speculative.types.end(),
                                                     [](common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
-            if (has_spec || has_spec_types || params_base.speculative.has_synth()) {
-                SRV_ERR("%s", "--kv-paged does not support speculative decoding yet\n");
+            if (has_spec || has_spec_types) {
+                // speculative decoding is supported on the paged path; the
+                // draft context always runs on classic memory
+                SRV_INF("%s", "speculative decoding enabled with the paged scheduler\n");
+            }
+            if (params_base.speculative.has_synth()) {
+                SRV_ERR("%s", "--kv-paged does not support synthetic acceptance yet\n");
                 return false;
             }
             if (has_mmproj) {
@@ -652,7 +657,12 @@ private:
 
         slots.clear();
 
-        ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+        // the probe decode of common_context_can_seq_rm asserts on a paged
+        // context (it has no routing metadata), so classify it directly:
+        // position-level seq_rm works, which is the PART behavior
+        ctx_tgt_seq_rm_type = params_base.kv_paged
+            ? COMMON_CONTEXT_SEQ_RM_TYPE_PART
+            : common_context_can_seq_rm(ctx_tgt);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }
@@ -3613,6 +3623,14 @@ private:
 
     server_metrics & srv_metrics() override {
         return metrics;
+    }
+
+    common_speculative * spec_ctx() override {
+        return spec.get();
+    }
+
+    void yield(std::function<void()> && work) override {
+        queue_tasks.yield_to_queue(std::move(work));
     }
 
     void post_next_response() override {
