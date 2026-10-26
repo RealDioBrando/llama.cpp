@@ -49,6 +49,7 @@ class llama_kv_cache_paged : public llama_memory_i {
 
     void     set_paged_batch_info(const llama_paged_batch_info * info);
     uint32_t get_num_gpu_blocks() const;
+    uint32_t get_n_seq_max() const { return n_seq_max; }
 
     //
     // llama_memory_i

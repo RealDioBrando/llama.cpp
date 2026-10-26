@@ -38,6 +38,8 @@ class llama_paged_prefix_cache {
     void set_ckpt_slots(int32_t base, uint32_t n);
     bool seq_reserved(int32_t seq_id) const;
     uint32_t n_ckpt_slots() const { return ckpt_slots.size(); }
+    // First reserved checkpoint seq id, or -1 when none are reserved.
+    int32_t ckpt_slot_base() const { return ckpt_seq_base; }
 
     // Returns nullptr when the hash is unknown or the cheap token
     // sanity check fails. Caller must verify the block is still

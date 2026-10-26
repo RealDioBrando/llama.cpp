@@ -1732,7 +1732,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.kv_paged = value;
         }
-    ).set_env("LLAMA_ARG_KV_PAGED").set_examples({LLAMA_EXAMPLE_PAGED}));
+    ).set_env("LLAMA_ARG_KV_PAGED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
         {"-ncpub", "--n-cpu-blocks"}, "N",
         "number of physical CPU blocks for paged KV cache (default: 1)",
@@ -1740,7 +1740,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_cpu_blocks = value;
             params.n_cpu_blocks_set = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_PAGED}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
         {"-ngpub", "--n-gpu-blocks"}, "N",
         "number of physical GPU blocks for paged KV cache (default: 1)",
@@ -1748,7 +1748,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_gpu_blocks = value;
             params.n_gpu_blocks_set = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_PAGED}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
         {"-kvbls", "--kv-block-size"}, "N",
         "fixed number of tokens for a given paged block (default: 16)",
@@ -1758,7 +1758,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.block_size = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_PAGED}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
         {"--kv-paged-watermark"}, "N",
         "fraction of blocks reserved before processing new requests (default: 0.05, range [0.0, 1.0))",
@@ -1769,7 +1769,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.kv_paged_watermark = potential_watermark;
         }
-    ).set_examples({LLAMA_EXAMPLE_PAGED}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
