@@ -139,6 +139,10 @@ static path_result run_paged(const std::string & model_path) {
     llama_paged_scheduler * sched = llama_paged_scheduler_init(ctx);
     EXPECT_TRUE(sched != nullptr);
 
+    // load the CANN kernels and prime the paged graph before the first real
+    // batch, mirroring the server's paged warmup
+    llama_paged_scheduler_warmup(sched, ctx);
+
     std::vector<llama_token> prompt_tokens = common_tokenize(ctx, TEST_PROMPT, true);
     EXPECT_TRUE(!prompt_tokens.empty());
 
@@ -286,6 +290,8 @@ static void run_cancel(const std::string & model_path) {
 
     llama_paged_scheduler * sched = llama_paged_scheduler_init(ctx);
     EXPECT_TRUE(sched != nullptr);
+
+    llama_paged_scheduler_warmup(sched, ctx);
 
     EXPECT_TRUE(llama_paged_scheduler_max_request_id(sched) >= 2);
 

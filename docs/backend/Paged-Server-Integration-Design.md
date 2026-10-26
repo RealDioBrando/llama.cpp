@@ -1,6 +1,6 @@
 # Paged Scheduler 对接 llama-server 集成设计
 
-状态:第一阶段已实现(未编译验证,见第 10 节实施记录)
+状态:第一阶段与第二阶段已实现;310P 功能验收已完成,见第 11 节
 
 日期:2026-10-25
 
@@ -32,19 +32,20 @@
 | `llama_paged_scheduler_warmup(sched, ctx)` | 一次小批 + 一次图尺寸的合成 prefill/decode,预热后端与 ATB 内核 |
 | `llama_paged_scheduler_add_request(sched, tokens, n, request_id)` | 入队一个请求;request_id 即 llama seq_id |
 | `llama_paged_scheduler_prepare_batch(sched, batch)` | 产出一个 `llama_batch`(调度器持有并复用);false 表示死锁/活锁,服务端对这类失败不做任何重试或自愈,直接把受影响的请求按错误路径收尾,而不是像默认调度路径那样尝试恢复 |
-| `llama_paged_scheduler_update(sched, batch, tokens, stop_flags)` | decode 后回填:每 seq 一个采样 token 与一个停止标志 |
+| `llama_paged_scheduler_update(sched, batch, feedback, n_feedback)` | decode 后回填:每 seq 一条 `llama_paged_feedback`(request_id/tokens/n_tokens/stop),批内推进加批外记账 |
 | `llama_paged_scheduler_get_seq_state(sched, id, out)` | 查询 `n_prompt/n_prompt_total/n_decoded/n_past/t_arrival_us/t_first_token_us` |
 | `llama_paged_scheduler_get_batch_info(sched)` | 当前批的路由元数据(`n_seq/batch_offsets/batch_lens/...`),下次 prepare 前有效 |
 | `llama_paged_scheduler_set_on_finish(sched, cb, ud)` | 请求被回收时回调(主线程,prepare_batch 内部触发) |
 
-调用契约(以 `examples/paged/paged.cpp:215-289` 为准):
+调用契约(以 `examples/paged/paged.cpp` 为准;`update` 签名已按第 12.0 节改为 feedback 数组):
 
-- 调用方自己采样,调度器不做任何采样;`update` 的 `tokens[i]` 在非采样步可为
-  `LLAMA_TOKEN_NULL`;
+- 调用方自己采样,调度器不做任何采样;每 seq 一条 `llama_paged_feedback`,批内 seq 先按批行数
+  推进 `n_past`,再以 feedback 的 token 列表为准推进,条目 token 数少于批行数即为隐式回滚,
+  批外条目仅做 token 记账(fork 子请求);
 - 仅在 decode 步(`batch_lens[i] == 1`)或 prefill 末块
   (`batch_lens[i] > 1 && state.n_past + batch_lens[i] == n_prompt_total`)产生 logits
   并采样,采样下标为 `batch_offsets[i] + batch_lens[i] - 1`;
-- `stop_flags[i] != 0` 或 `n_past >= n_ctx` 时请求标记 FINISHED,下一次
+- feedback 的 `stop` 字段非 0 或 `n_past >= n_ctx` 时请求标记 FINISHED,下一次
   `prepare_batch` 的 `step()` 内回收并触发 `on_finish`;
 - prefill 独占步:任一候选处于 prefill 时整批只保留该请求
   (`llama-paged-scheduler-impl.cpp:90-107`),prefill 与 decode 不混批;
@@ -261,7 +262,8 @@ launch(task):
 3. `llama_paged_scheduler_add_request(sched, task.tokens.data(), n, slot.id)`,
    失败(prompt 超长、id 冲突)立即回错误结果并释放槽。
 
-update() 主循环(对齐 `examples/paged/paged.cpp:215-289`):
+update() 主循环(对齐 `examples/paged/paged.cpp`;保留 phase-1 草案原貌,`update` 的签名已按
+第 12.0 节改为 feedback 数组形式):
 
 ```
 1. // 死锁/活锁检测在库内完成,结论经返回值暴露给调用方
@@ -524,34 +526,72 @@ server 层合计:新增约 975-1300 行(其中 S2 为 ~500 行纯移动,新逻�
 8. L4 无需改码:`fit_params` 默认开启,`common_init_from_params` 已对 kv_paged 自动适配块数。
 9. paged warmup 失败降级为告警(默认 warmup 失败同样非致命)。
 
-## 11. 调试记录:910B4 + CANN 9.0.0
+## 11. 调试与验收记录:310P + CANN 9.1.0
 
-编译环境为 openEuler 22.03 aarch64、CANN 9.0.0,含 ops 与 nnal 9.0.0,以及 GCC 10.3。在
-`-DGGML_CANN=on` 下 llama-server 与 test-paged-kv-e2e 构建通过。
+运行时功能验收只在 310P 上进行。910B 的 ATB PagedAttention 内核适配(NZ cache 维度解释
+不同)是独立的内核层工作,不在本特性范围内。
 
-| 问题 | 结论 |
-|---|---|
-| 服务器缺 aclnn 算子头文件 | 补装 `Ascend-cann-910b-ops_9.0.0`。nnal 原为 8.5.0,与 toolkit 9.0.0 版本错配,已换装 9.0.0 |
-| ggml-cann.cpp 910B 编译失败 | 上游 bug:`transform_kq` 定义在 `#ifdef ASCEND_310P` 内,而 `buffer_set_tensor` 的调用点未加保护。已按文件既有模式把 `if (is_kq)` 块包进 `ASCEND_310P`。910B 下 `kq_path` 恒为 `GGML_CANN_KQ_NONE`,该块运行时本就不可达,行为无变化 |
-| server_tokens 拷贝赋值 | `server_tokens` 有意禁止拷贝,源码留有 TODO;paged launch 改为 `get_text_tokens()` 构造后 move 赋值 |
+### 11.1 环境与构建
 
-运行时:非 paged 路径在 NPU 上正常出 token。paged 路径在 910B4 上被 ATB PagedAttention
-内核阻塞:`op->Setup` 返回 error 8,即 ERROR_INVALID_TENSOR_DIM,ATB 日志明确报
-`headSize of keyCache and query should be same`。原因:本仓库的 CANN paged-attn wrapper
-按 310P ATB 编写,KV 池以 FRACTAL_NZ 解释并走 `K_CACHE_V_CACHE_NZ` 写入路径,而 310P 的
-SelfAttention/PA 支持 NZ cache;910B 的 ATB 9.0.0 PagedAttention 对 NZ cache 的维度解释
-不同,直接复用会触发维度校验失败。另外 Qwen3-4B 的 head_dim 为 80,不是 2 的幂,是否满足
-310P 约束亦需复核。
+- Atlas 300I Pro(310P3)单卡(`ASCEND_RT_VISIBLE_DEVICES=1`),CANN 9.1.0,GCC 11.4,
+  aarch64 容器 `quay.io/ascend/vllm-ascend:v0.23.0-310p`;代码 `27e9d15e1`(phase 2);
+- `-DGGML_CANN=ON -DCMAKE_BUILD_TYPE=Release` 下 llama-server 与 test-paged-kv-e2e 构建
+  通过;server 侧功能测试复用 pytest 基础设施(`tools/server/tests`);
+- 模型 Qwen3-1.7B F16 GGUF(head_dim=128,满足 310P 约束),由本地 safetensors 经
+  `convert_hf_to_gguf.py` 转换;
+- 服务命令:`llama-server -m <model> --kv-paged --cache-ram 0 -b 2048 -ub 2048 -ngl 99
+  -c 4096 -np 4`。注意 `--cache-ram` 默认 8192M 会被门禁拒绝,须显式置 0。
 
-结论:paged attention 内核的 910B 适配是独立的内核层工作,评估方向为改喂 ND 布局 cache,
-或改用 910B 对应的 ATB/原生算子;该项不在本次调度器集成范围内。LLAMA_PAGED 前缀的调度器
-与 server 集成代码与设备无关,内核打通后即可复验。
+构建期修复(上游 bug):`ggml-cann.cpp` 的 `transform_kq` 定义在 `#ifdef ASCEND_310P` 内
+而调用点未加保护,已按文件既有模式把 `if (is_kq)` 块包进同一宏。
+
+### 11.2 验收结果(2026-10-26)
+
+| 组 | 项目 | 结果 |
+|---|---|---|
+| 阶段一 | /completion 非流式 + 流式 SSE、/v1/completions、stop 串、n_predict、EOG、采样参数、温度 0 确定性 | 全部通过 |
+| 阶段一 | 并发 8 请求 / 4 槽:超额排队与释放续跑 | 通过 |
+| 阶段一 | 块级前缀缓存:451 token 前缀二次请求 cache_n=448,prompt 时延 195.9ms -> 51.7ms | 通过 |
+| 阶段一 | 客户端断连取消:槽位与 KV 回收,后续请求正常 | 通过 |
+| 阶段一 | /metrics(需 `--metrics`)、/props、/tokenize、/slots | 通过 |
+| 阶段二 | /v1/chat/completions 非流式 + 流式(reasoning_content) | 通过 |
+| 阶段二 | 工具调用:get_weather({"city": "Paris"}),finish_reason=tool_calls | 通过 |
+| 阶段二 | n_cmpl>1:n=2 返回 2 choices | 通过 |
+| 阶段二 | json_schema 严格约束输出 | 通过 |
+| 阶段二 | 投机推理:启动放行,运行时输出错误 | 未通过,见 11.3 缺陷 2 |
+| 门禁 | -b != -ub 报错;--kv-paged + --kv-unified 告警关闭;双卡报错附修复建议;--embeddings / --reranking / --cache-ram 启动报错;--cache-reuse 告警关闭;/infill 请求期 501;embeddings / rerank 端点 501;图像输入明确报错 | 全部符合设计 |
+| 对比 | 同 prompt 贪婪 16 token,paged 与 default 逐字一致 | 通过 |
+
+### 11.3 缺陷与修复
+
+1. (已修复,server +1 行)`--kv-paged` + 投机推理启动崩溃:draft ctx 继承
+   `kv_paged=true`,load_model 对 ctx_dft 的探测式 `common_context_can_seq_rm` 在无路由
+   元数据的 paged ctx 上触发 `llama-kv-cache-paged.cpp:375` 断言(目标 ctx 在
+   server-context.cpp 已有同款特判,draft 漏了)。修复:`params_dft.kv_paged = false`,
+   对齐 12.3"draft 保持经典 KV"。
+2. (待修,阻塞 paged 投机验收)投机推理运行时输出错误:贪婪不再与无投机等价,长生成
+   退化为复读;`--spec-draft-n-max 1` 仍复现,排除多行验证批;default + 同款投机完全
+   正确,排除 CANN 内核。范围收敛在 paged 路径 attach_draft / 变长 feedback / truncate
+   三者之一。
+3. (已澄清)test-paged-kv-e2e 曾在 310P 失败:CANN paged 图必须先经
+   `llama_paged_scheduler_warmup` 预热,否则 decode 步采样到陈旧 logits(server 有预热
+   而 e2e 没有)。已在 e2e 补预热;残余 token 级漂移属在线/两遍 softmax 的 F16 数值差,
+   同 prompt 下 server paged 与 default 逐字一致,top-5 重合 5/5。
+
+观察:`t_max_predict_ms` 在 default 与 paged 路径均未按预期截断(fork 级问题,非 paged
+回归)。
+
+### 11.4 遗留项
+
+- 缺陷 2 定位与修复;
+- e2e 的 N_COMPARE=4 等价窗口是否按平台/模型放宽,由 owner 决定;
+- 910B 内核适配若立项,另开文档。
 
 ## 12. 第二阶段设计:四个明确支持的特性
 
 范围:a) 投机推理、b) 多模态、c) `n_cmpl > 1` 并行采样、d) `/v1/chat/completions`。
-共性前提:默认路径行为不变;所有扩展只作用于 `--kv-paged` 分支;由于 910B 内核问题
-尚未解决,见第 11 节,运行时验收仍以 CPU/310P 为准。
+共性前提:默认路径行为不变;所有扩展只作用于 `--kv-paged` 分支;运行时验收以 310P
+为准(见第 11 节)。
 
 ### 12.0 前置小修与统一反馈契约
 
@@ -917,6 +957,6 @@ c/a 落地。
    复制父尾块;`truncate` 释放块时调用新增的 `prefix_cache.drop_block` 撤销已释放块的
    前缀缓存登记,避免 LRU 驱逐命中陈旧块号。
 
-验证:CANN 9.0.0 aarch64 编译通过(llama-server + test-paged-kv-e2e);910B4 上默认
-调度回归通过(/completion、/v1/completions、/v1/chat/completions 含工具调用、n=2 并行)。
-paged 路径运行时验收依赖第 11 节的 910B 内核适配,当前以 CPU/310P 为准。
+验证:CANN aarch64 编译通过(llama-server + test-paged-kv-e2e)。默认调度回归通过
+(/completion、/v1/completions、/v1/chat/completions 含工具调用、n=2 并行)。paged 路径
+的运行时功能验收已在 310P 完成,见第 11 节。
