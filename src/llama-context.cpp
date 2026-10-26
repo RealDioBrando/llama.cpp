@@ -1408,18 +1408,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    static const bool graph_timing = std::getenv("LLAMA_GRAPH_TIMING") != nullptr;
-    static const bool graph_reuse_debug = std::getenv("LLAMA_GRAPH_REUSE_DEBUG") != nullptr;
-    bool graph_reused = false;
-    int64_t graph_build_us = 0;
-    int64_t graph_alloc_us = 0;
-
     bool can_reuse_graph = !graph_reuse_disable && res->can_reuse(gparams);
-    if (graph_reuse_debug && !can_reuse_graph) {
-        LLAMA_LOG_ERROR("[graph reuse] n_tokens=%d n_seq_tokens=%d n_seqs=%d n_seqs_unq=%d equal=%d outputs=%d\n",
-                        ubatch.n_tokens, ubatch.n_seq_tokens, ubatch.n_seqs, ubatch.n_seqs_unq,
-                        ubatch.equal_seqs(), n_outputs);
-    }
 
     if (can_reuse_graph) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1432,18 +1421,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
-        graph_reused = true;
     } else {
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        const auto t_start_us = graph_timing ? ggml_time_us() : 0;
-
         gf = model.build_graph(gparams);
-
-        graph_build_us = graph_timing ? ggml_time_us() - t_start_us : 0;
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -1451,41 +1435,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        const auto t_alloc_us = graph_timing ? ggml_time_us() : 0;
-
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
-        graph_alloc_us = graph_timing ? ggml_time_us() - t_alloc_us : 0;
     }
 
     // set the input data for the input tensors
     {
-        const auto t_start_us = graph_timing ? ggml_time_us() : 0;
-
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
-
-        if (graph_timing) {
-            LLAMA_LOG_ERROR("[graph timing] reuse=%d n_tokens=%d build=%.3fms alloc=%.3fms set_inputs=%.3fms\n",
-                           graph_reused ? 1 : 0, ubatch.n_tokens, graph_build_us / 1000.0,
-                           graph_alloc_us / 1000.0, (ggml_time_us() - t_start_us) / 1000.0);
-        }
     }
-
-    const auto compute_t0 = graph_timing ? ggml_time_us() : 0;
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, ubatch.n_seq_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
-    }
-    if (graph_timing) {
-        LLAMA_LOG_ERROR("[graph timing] compute n_tokens=%d total=%.3fms\n",
-                       ubatch.n_tokens, (ggml_time_us() - compute_t0) / 1000.0);
     }
 
     ret = GGML_STATUS_SUCCESS;

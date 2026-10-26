@@ -67,12 +67,6 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
-// debug helper: env LLAMA_DEBUG_REUSE=1 prints why graph reuse fails
-static bool llama_debug_reuse() {
-    static const bool enabled = getenv("LLAMA_DEBUG_REUSE") != nullptr;
-    return enabled;
-}
-
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
@@ -1099,23 +1093,12 @@ bool llm_graph_input_attn_kv_paged::can_reuse(const llm_graph_params & params) {
         mctx = next_mctx;
     }
     if (!next_mctx) {
-        static const bool reuse_debug = std::getenv("LLAMA_GRAPH_REUSE_DEBUG") != nullptr;
-        if (reuse_debug) {
-            LLAMA_LOG_ERROR("[paged reuse] no paged mctx\n");
-        }
         return false;
     }
 
     const bool can = paged_write_slots->ne[0] == next_mctx->get_n_tokens() &&
                      paged_block_table->ne[1] == next_mctx->get_batch_size() &&
                      paged_block_table->ne[0] == next_mctx->get_max_blocks();
-    static const bool reuse_debug = std::getenv("LLAMA_GRAPH_REUSE_DEBUG") != nullptr;
-    if (reuse_debug && !can) {
-        LLAMA_LOG_ERROR("[paged reuse] shape mismatch graph=[%ld,%ld,%ld] ctx=[%d,%d,%d]\n",
-                        (long) paged_write_slots->ne[0], (long) paged_block_table->ne[1],
-                        (long) paged_block_table->ne[0], next_mctx->get_n_tokens(),
-                        next_mctx->get_batch_size(), next_mctx->get_max_blocks());
-    }
     return can;
 }
 
@@ -1202,14 +1185,6 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
     res &= inp_rs->head == mctx->get_recr()->get_head();
 
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
-
-    if (!res && llama_debug_reuse()) {
-        fprintf(stderr, "[REUSE-FAIL] hybrid: k_idxs=%d mask=%d s_copy=%d head=%d->%d\n",
-            (int)(inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens),
-            (int)can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams),
-            (int)(inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs()),
-            (int)inp_rs->head, (int)mctx->get_recr()->get_head());
-    }
 
     return res;
 }
@@ -1484,30 +1459,8 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     if (!this->params.allow_reuse(params)) {
-        static const bool reuse_debug = std::getenv("LLAMA_GRAPH_REUSE_DEBUG") != nullptr;
-        if (reuse_debug) {
-            bool ubatch_match = true;
-            bool sampler_match = true;
-            for (uint32_t i = 0; i < this->params.ubatch.n_tokens; ++i) {
-                ubatch_match &= this->params.ubatch.output[i] == params.ubatch.output[i] &&
-                                this->params.ubatch.seq_id[i][0] == params.ubatch.seq_id[i][0];
-            }
-            sampler_match = this->params.samplers.size() == params.samplers.size();
-            LLAMA_LOG_ERROR(
-                "[graph reuse] params mismatch ubatch=%d outputs=%d/%d samplers=%zu/%zu "
-                "sampler_match=%d ubatch_match=%d data=%d/%d seqs=%u/%u unq=%u/%u\n",
-                ubatch_match, this->params.n_outputs, params.n_outputs,
-                this->params.samplers.size(), params.samplers.size(), sampler_match, ubatch_match,
-                (int) (bool) this->params.ubatch.data, (int) (bool) params.ubatch.data,
-                this->params.ubatch.n_seqs, params.ubatch.n_seqs,
-                this->params.ubatch.n_seqs_unq, params.ubatch.n_seqs_unq);
-        }
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
-        }
-        if (llama_debug_reuse()) {
-            fprintf(stderr, "[REUSE-FAIL] allow_reuse: n_tokens %d->%d\n",
-                (int)this->params.ubatch.n_tokens, (int)params.ubatch.n_tokens);
         }
         return false;
     }
@@ -1521,10 +1474,6 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     int inp_idx = 0;
     for (auto & input : inputs) {
         const bool cur = input->can_reuse(params);
-
-        if (!cur && llama_debug_reuse()) {
-            fprintf(stderr, "[REUSE-FAIL] input[%d] can_reuse=false\n", inp_idx);
-        }
 
         res = res && cur;
         inp_idx++;
