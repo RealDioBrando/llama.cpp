@@ -772,6 +772,25 @@ spec 加多模态的组合第一版禁用,默认路径支持,paged 侧两个特�
 `write_slots/block_table` 路由不兼容,所以不能复用其解码半段,只复用编码半段,即
 `mtmd_batch_*` 加 `mtmd_batch_get_output_embd`。
 
+**编码/解码两半段的准确含义**(命名易误导,`llama_decode` 的 decode 指"对 context 跑
+一次前向",与 `llama_encode` 相对,不是"解码生成 token"):
+
+- 编码半段:图像 -> "虚拟 token 的 embedding"。`mtmd_batch_encode` 对 mmproj 视觉模型
+  跑前向,输入图像像素,输出每个图块一行浮点向量,维度等于目标 LLM 的输入嵌入维度
+  `n_embd_in`(如图 -> 700 行 x 2048 维 float)。产出的不是 token,而是"图块作为词表外
+  虚拟 token 的 embedding"。与文本链路对比:文本是 token id 查 embedding 表得向量,
+  媒体是 vision encoder 直接产出向量(无 token id 可查),两条路在"输入向量"处汇合;
+- 解码半段:embedding -> 该位置的 K/V 入缓存,不生成任何 token。
+  `mtmd_helper_decode_image_chunk` 把编码向量行装批(`batch.token = NULL,
+  batch.embd = 向量行`)调 `llama_decode`:这些行像普通 token 一样流过 transformer
+  各层,每行在自己位置算出 K/V 写入 KV cache,`batch.logits` 全 0,不采样。目的只有
+  一个:让图像内容成为上下文记忆,后续文本 token 的 attention 从 KV 读到它。token
+  生成只发生在 prefill 末尾与 decode 循环,与两半段均无关。
+
+paged 侧要替换的正是解码半段(embd 行前向、K/V 落缓存改走调度器统一批入口:纯 embd
+切片 -> `write_slots` 路由 -> 块池);编码半段产出的只是内存里一段 float,与调度器
+正交,原样复用。
+
 **阶段对齐**:两条路径跑在同一个循环阶段。server_queue 主循环每轮迭代经 on_update_slots
 回调驱动一次推理:默认路径进入 `server_context_impl::update_slots`,子阶段为
 pre_decode 装批 -> decode -> post_decode 采样;paged 路径进入
@@ -878,13 +897,26 @@ queue 循环迭代 C -> on_update_slots -> update
   后续图片贪婪攒入一个 encoder 批;paged 的迭代尾部编码复用同一逻辑,同样可一次编完
   该请求全部 pending 媒体段,编码次数与耗时相同,与节拍延迟无关;
 - 并发场景:循环节拍由在跑 decode 的批决定,媒体请求的 TTFT 约延后一个节拍,即系统
-  当前 TPOT,典型 10-50ms 量级;n 张图片累积 n 个节拍,原因在解码侧而非编码侧:图片
-  之间隔着文本段时,受位置顺序约束,后面图片的 embd 行要等中间文本行写入 KV 才能
-  计算,非相邻 embd 段无法合并,每个 embd 段独占一步,即使编码已一次完成;相对编码
-  与 prefill 总耗时通常为个位数百分比;
+  当前 TPOT,典型 10-50ms 量级;相对编码与 prefill 总耗时通常为个位数百分比;
+- "n 张图累积 n 个节拍"仅指**单请求、n 张图被文本隔开**的场景(如
+  [text1][img1][text2][img2]...),不可一步写入的原因有两个:其一,因果链:img_k 的
+  attention 要读中间文本行的 K/V,而中间文本又要读 img_{k-1} 的 K/V,同一 seq 的
+  位置轴上前向依赖串行不可折叠,attention 无法读还不存在的 K/V(prefill 大批一次算完
+  靠的是 ubatch 内先行后算 + causal mask,但要求批内行同型);其二,批类型同质性:
+  llama_batch 的 token/embd 是批级开关,build_inp_embd 对整个 ubatch 二选一,text 行
+  与 embd 行无法同批。两个约束与调度器无关,是因果注意力与 batch 抽象的固有性质;
+- 默认路径并非并行:同一请求的媒体前向默认路径同样逐次串行调用(helper 的
+  mtmd_helper_decode_image_chunk 内部还按 n_batch 切片),n 张图同样是 n 次 LLM 前向,
+  GPU 计算量两边完全相同;默认路径省的是**调度节拍**而不是前向次数:媒体前向发生在
+  pre_decode 内部的私有 llama_decode,不占共享批、不产生 queue 迭代,对外表现为
+  "两轮迭代走完 prefill",媒体步被藏进文本步的迭代里;
+- 节拍账目按场景分:单请求 n 图被文本隔开 -> paged 2n+1 个调度步(默认 n+1 个共享
+  步,媒体步藏内,前向次数两边相同);单请求 n 图相邻 -> 连续同型,合并为一个 embd
+  段,paged 1 个节拍;n 个请求各 1 图 -> 跨 seq 无位置依赖,不存在因果约束,paged 的
+  embd 步只要求同型、不限请求,全部 pending embd 段可合入同一调度步,paged 1 个节拍;
 - 吞吐不受影响,并发多模态时甚至更优:默认路径的 helper 私有 decode 逐槽串行、永远
-  单请求;paged 的 embd 步只要求同型、不限请求,多个请求的 pending embd 段可合入
-  同一调度步。n 节拍惩罚只作用于单个请求自身的 TTFT,系统总计算量不变;
+  单请求,n 个请求的图片要 n 次私有 decode 顺序执行;paged 可跨请求合批。n 节拍惩罚
+  只作用于"单请求多图且非相邻"场景下该请求自身的 TTFT,系统总计算量不变;
 - 若需消除该步,后续可评估同一轮内连续两次 llama_decode(先 embd 后文本)或内核支持
   混合 ubatch,第一版不做。
 

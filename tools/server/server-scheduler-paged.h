@@ -20,6 +20,7 @@ class server_scheduler_paged final : public server_scheduler_interface {
 
   private:
     server_slot * pick_idle_slot();
+    bool launch_multimodal(server_task && task);
     void fail_all(const std::string & why);
     void on_finish(int32_t request_id);
     static void on_finish_thunk(int32_t request_id, const llama_token * tokens, int32_t n_tokens, void * user_data);

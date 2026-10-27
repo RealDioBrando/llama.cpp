@@ -420,8 +420,9 @@ private:
                 return false;
             }
             if (has_mmproj) {
-                SRV_ERR("%s", "--kv-paged does not support multimodal inputs yet\n");
-                return false;
+                // multimodal (12.4): media chunks are launched as pending
+                // segments and encoded on demand when the scheduler pauses
+                SRV_INF("%s", "multimodal inputs enabled with the paged scheduler\n");
             }
 
             // degradations: not supported by the paged memory, turn off
@@ -481,7 +482,10 @@ private:
         }
 
         // optionally get the memory usage of mmproj
-        if (has_mmproj && params_base.fit_params) {
+        // skipped on the paged path: the fit-time clip load/free hits a CANN
+        // buffer free error on 310P (ctx NULL); the paged fit uses the free
+        // device memory directly, so the mmproj size contribution is dropped
+        if (has_mmproj && params_base.fit_params && !params_base.kv_paged) {
             int64_t t_start = ggml_time_us();
             auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
             int64_t t_elapsed = ggml_time_us() - t_start;
@@ -3632,6 +3636,10 @@ private:
 
     common_speculative * spec_ctx() override {
         return spec.get();
+    }
+
+    mtmd_context * mmctx() override {
+        return mctx;
     }
 
     void yield(std::function<void()> && work) override {

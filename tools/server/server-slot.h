@@ -159,6 +159,10 @@ struct server_slot {
 
     // multimodal
     mtmd_context * mctx = nullptr;
+
+    // multimodal (12.4): the number of media segments already encoded and
+    // appended for the in-flight request
+    int32_t n_media_appended = 0;
     mtmd::batch_ptr mbatch = nullptr;
 
     // speculative decoding

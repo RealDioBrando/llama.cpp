@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "log.h"
+#include "mtmd.h"
 #include "sampling.h"
 
 #include <algorithm>
@@ -101,9 +102,9 @@ bool server_scheduler_paged::launch(server_task && task) {
     }
 
     if (task.tokens.has_mtmd) {
-        // P0: get_text_tokens() would silently drop the media chunks
-        host.send_error(task, "multimodal inputs are not supported with --kv-paged yet", ERROR_TYPE_NOT_SUPPORTED);
-        return true;
+        // multimodal (12.4): launch as ordered text/media segments; media
+        // segments are encoded on demand when the scheduler pauses on them
+        return launch_multimodal(std::move(task));
     }
 
     if (!paged_task_supported(task)) {
@@ -282,6 +283,113 @@ void server_scheduler_paged::update() {
         n_empty_steps = 0;
         host.metrics_flush_idle();
         return;
+    }
+
+    // multimodal (12.4): paused requests are waiting for a media segment's
+    // encoder output; encode it on demand and append to resume the request
+    for (auto & slot : slots) {
+        if (!slot.is_processing() || slot.mctx == nullptr) {
+            continue;
+        }
+        llama_paged_seq_state st;
+        if (!llama_paged_scheduler_get_seq_state(sched, slot.id, &st) || !st.paused) {
+            SLT_DBG(slot, "mm: slot not paused (paused=%d)\n", st.paused);
+            continue;
+        }
+        SLT_WRN(slot, "mm: encoding pending media chunk at row %d\n", st.n_past);
+
+        // the pending media chunk: the (n_media_appended+1)-th media chunk of
+        // the task, in order. NOTE: the boundary must NOT be derived from
+        // prompt.tokens.size() - server_tokens rows and scheduler rows use
+        // different scales (one sentinel row per media chunk vs
+        // n_tokens rows per chunk) and diverge after the first media segment
+        size_t search_from = 0;
+        const mtmd_input_chunk * target = nullptr;
+        size_t target_idx = 0;
+        for (int k = 0; k <= slot.n_media_appended; ++k) {
+            auto [c, i] = slot.task->tokens.find_next_media_chunk(search_from);
+            if (c == nullptr) {
+                break;
+            }
+            target        = c->get();
+            target_idx    = i;
+            search_from   = i + mtmd_input_chunk_get_n_tokens(c->get());
+        }
+        if (target == nullptr) {
+            SLT_ERR(slot, "%s", "paused but no pending media chunk found\n");
+            host.send_error(slot, "failed to encode media chunk", ERROR_TYPE_SERVER);
+            slot.release();
+            continue;
+        }
+        const auto & chunk = target;
+        const int32_t n_tok = (int32_t) mtmd_input_chunk_get_n_tokens(target);
+
+        // encode the chunk (encode half of process_mtmd_chunk); done inline on
+        // the update thread - no yield, the media decode must stay on the
+        // same thread as the scheduler step
+        float * embd = nullptr;
+        try {
+            slot.mbatch.reset(mtmd_batch_init(slot.mctx));
+            if (mtmd_batch_add_chunk(slot.mbatch.get(), chunk) != 0) {
+                SLT_ERR(slot, "failed to add media chunk to the encoder batch, idx = %zu\n", target_idx);
+                host.send_error(slot, "failed to encode media chunk", ERROR_TYPE_SERVER);
+                slot.release();
+                continue;
+            }
+            if (mtmd_batch_encode(slot.mbatch.get()) != 0) {
+                SLT_ERR(slot, "failed to encode media chunk, idx = %zu\n", target_idx);
+                host.send_error(slot, "failed to encode media chunk", ERROR_TYPE_SERVER);
+                slot.release();
+                continue;
+            }
+            embd = mtmd_batch_get_output_embd(slot.mbatch.get(), chunk);
+        } catch (const std::exception & e) {
+            SLT_ERR(slot, "mm encode exception: %s\n", e.what());
+            host.send_error(slot, "failed to encode media chunk", ERROR_TYPE_SERVER);
+            slot.release();
+            continue;
+        }
+        if (embd == nullptr) {
+            SLT_ERR(slot, "failed to encode media chunk, idx = %zu\n", target_idx);
+            host.send_error(slot, "failed to encode media chunk", ERROR_TYPE_SERVER);
+            slot.release();
+            continue;
+        }
+
+        // mrope positions from the image tokens at the paused boundary
+        std::vector<llama_pos> pos;
+        const int32_t n_ppe = llama_model_n_pos_per_embd(llama_get_model(host.ctx()));
+        if (n_ppe > 1) {
+            const auto * image_tokens = mtmd_input_chunk_get_tokens_image(chunk);
+            pos.reserve((size_t) n_tok * n_ppe);
+            for (int32_t r = 0; r < n_tok; ++r) {
+                const mtmd_decoder_pos p = mtmd_image_tokens_get_decoder_pos(image_tokens, (llama_pos) st.n_past, r);
+                pos.push_back(p.t);
+                pos.push_back(p.y);
+                pos.push_back(p.x);
+                pos.push_back(p.z);
+            }
+        }
+
+        llama_paged_segment seg = {};
+        seg.tokens      = nullptr;
+        seg.embd        = embd;
+        seg.n_tokens    = n_tok;
+        seg.embd_stride = llama_model_n_embd_inp(llama_get_model(host.ctx()));
+        seg.pos         = pos.empty() ? nullptr : pos.data();
+        bool app_ok = llama_paged_scheduler_append_segment(sched, slot.id, &seg);
+        SLT_WRN(slot, "mm: append done ok=%d n_tok=%d stride=%d pos_n=%zu\n", (int) app_ok, n_tok, seg.embd_stride, pos.size());
+        if (!app_ok) {
+            host.send_error(slot, "failed to append the media segment", ERROR_TYPE_SERVER);
+            slot.release();
+            continue;
+        }
+
+        // accounting: the chunk's rows are prompt rows (placeholders)
+        slot.prompt.tokens.push_back_placeholder(target);
+        slot.n_media_appended++;
+        slot.stats.n_prompt_processed += (uint64_t) n_tok;
+        slot.stats.update_prompt_last();
     }
 
     // speculative decoding: draft for the generating slots and attach the
@@ -505,11 +613,75 @@ void server_scheduler_paged::fork_children(server_slot & parent, int32_t tok_idx
     }
 }
 
+bool server_scheduler_paged::launch_multimodal(server_task && task) {
+    server_slot * slot = pick_idle_slot();
+    if (slot == nullptr) {
+        return false;  // defer until a slot frees up
+    }
+
+    if (!host.launch_slot_with_task(*slot, std::move(task))) {
+        // rejected, error already sent
+        return true;
+    }
+
+    server_slot & s = *slot;
+    s.stats.update_prompt_start();
+    s.mctx = host.mmctx();
+    if (s.mctx == nullptr) {
+        host.send_error(s, "multimodal request but the server has no mmproj loaded", ERROR_TYPE_SERVER);
+        s.release();
+        return true;
+    }
+
+    // row-aligned token view: media rows are LLAMA_TOKEN_NULL placeholders
+    llama_tokens rows;
+    rows.reserve(s.task->tokens.size());
+    for (size_t r = 0; r < s.task->tokens.size(); ++r) {
+        rows.push_back(s.task->tokens[r]);
+    }
+    s.prompt.tokens = server_tokens(rows, /* has_mtmd = */ true);
+    s.n_media_appended = 0;
+
+    // ordered text/media segments; media segments stay pending (embd NULL)
+    // until the scheduler pauses on them and the server appends the encoder
+    // output
+    std::vector<llama_paged_segment> segs;
+    size_t i = 0;
+    while (i < rows.size()) {
+        if (rows[i] == LLAMA_TOKEN_NULL) {
+            const auto & chunk = s.task->tokens.find_chunk(i);
+            llama_paged_segment seg = {};
+            seg.embd     = nullptr;
+            seg.n_tokens = (int32_t) mtmd_input_chunk_get_n_tokens(chunk.get());
+            segs.push_back(seg);
+            i += seg.n_tokens;
+            continue;
+        }
+        llama_paged_segment seg = {};
+        seg.tokens   = rows.data() + i;
+        seg.n_tokens = 0;
+        while (i < rows.size() && rows[i] != LLAMA_TOKEN_NULL) {
+            seg.n_tokens++;
+            i++;
+        }
+        segs.push_back(seg);
+    }
+
+    if (!llama_paged_scheduler_add_request_segs(sched, segs.data(), (int32_t) segs.size(), s.id)) {
+        host.send_error(s, "failed to queue the multimodal request in the paged scheduler", ERROR_TYPE_SERVER);
+        s.release();
+        return true;
+    }
+    return true;
+}
+
 void server_scheduler_paged::prepare_drafts() {
     bool any_drafting = false;
 
     for (auto & slot : host.slot_pool()) {
-        if (!slot.can_speculate() || !slot.is_processing() || slot.state != SLOT_STATE_GENERATING) {
+        // media rows cannot be drafted: the draft context mirrors text only
+        if (!slot.can_speculate() || !slot.is_processing() || slot.state != SLOT_STATE_GENERATING ||
+            slot.task->tokens.has_mtmd) {
             continue;
         }
         if (!slot.spec_draft.empty()) {
