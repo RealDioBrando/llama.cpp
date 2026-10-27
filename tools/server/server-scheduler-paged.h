@@ -53,4 +53,9 @@ class server_scheduler_paged final : public server_scheduler_interface {
     // busy-poll safeguard: in-flight requests but the scheduler keeps
     // producing empty batches
     int n_empty_steps = 0;
+
+    // draft rollbacks deferred to after llama_paged_scheduler_update, which
+    // is what advances the scheduler n_past over the verify batch; truncating
+    // earlier would be rejected as n_past_new > n_past
+    std::vector<std::pair<int32_t, int32_t>> spec_pending_truncates;
 };

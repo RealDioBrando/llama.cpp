@@ -1023,7 +1023,11 @@ bool llama_paged_scheduler_impl::truncate(int32_t request_id, int32_t n_past_new
         return true;
     }
 
-    const uint32_t n_keep_blocks = (uint32_t) n_past_new / block_size;
+    // keep the partial block holding n_past_new as well: releasing it would
+    // drop the KV of all positions below n_past_new on the next block-table
+    // rotation (the block cache block is not zeroed, but the table may be
+    // repopulated with different block ids)
+    const uint32_t n_keep_blocks = (uint32_t) ((n_past_new + block_size - 1) / block_size);
     if (n_keep_blocks < group->block_table.size()) {
         for (uint32_t bid : llama_block_ids(group->block_table.begin() + n_keep_blocks, group->block_table.end())) {
             prefix_cache.drop_block(bid);

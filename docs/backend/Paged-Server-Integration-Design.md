@@ -569,10 +569,13 @@ server 层合计:新增约 975-1300 行(其中 S2 为 ~500 行纯移动,新逻�
    元数据的 paged ctx 上触发 `llama-kv-cache-paged.cpp:375` 断言(目标 ctx 在
    server-context.cpp 已有同款特判,draft 漏了)。修复:`params_dft.kv_paged = false`,
    对齐 12.3"draft 保持经典 KV"。
-2. (待修,阻塞 paged 投机验收)投机推理运行时输出错误:贪婪不再与无投机等价,长生成
-   退化为复读;`--spec-draft-n-max 1` 仍复现,排除多行验证批;default + 同款投机完全
-   正确,排除 CANN 内核。范围收敛在 paged 路径 attach_draft / 变长 feedback / truncate
-   三者之一。
+2. (已修复 4 处)投机推理在 paged 路径的账本缺陷:update post 循环的 verify 门位于
+   sample_now 判断之后,verify 批(len = 1 + n_draft)被当作 prefill 中途块跳过,
+   verify_slot 不可达;attach 重复推入 pending token(plain 路径已推);truncate 在
+   调度器 update 之前执行,被 "cannot truncate" 静默拒绝;truncate 的 n_keep_blocks
+   向下取整,把承载有效 KV 的部分块整个释放,块表轮换后旧位置全部读空。修复后
+   paged+spec 全深度贪婪等价:n_max 2/3/4/6/8 的 128 token 输出与无投机基线逐 token
+   一致(2026-10-28 复测);此前深度 >= 3 观察到的毒化系上述缺陷所致,见 11.4。
 3. (已澄清)test-paged-kv-e2e 曾在 310P 失败:CANN paged 图必须先经
    `llama_paged_scheduler_warmup` 预热,否则 decode 步采样到陈旧 logits(server 有预热
    而 e2e 没有)。已在 e2e 补预热;残余 token 级漂移属在线/两遍 softmax 的 F16 数值差,
@@ -583,7 +586,12 @@ server 层合计:新增约 975-1300 行(其中 S2 为 ~500 行纯移动,新逻�
 
 ### 11.4 遗留项
 
-- 缺陷 2 定位与修复;
+- ATB SF op(CALC_TYPE_SPEC)排查记录:深度 >= 3 的毒化曾疑其多行写路径问题,排查已
+  排除调度器/服务端账本、ReshapeCache 跨块写入、ACL graph;独立探针(atb_probe.cpp)
+  在共享多租户设备上算子静默无效;vllm-ascend 310P 投机(torch_npu
+  rejection_sampler.py + attention_v1.py)掩码/布局语义逐项比对一致。缺陷 2 修复后
+  毒化消失,该怀疑解除;若更换内核或驱动后再现,循 server 进程内探针 + 向华为获取
+  CALC_TYPE_SPEC 张量契约重查;
 - e2e 的 N_COMPARE=4 等价窗口是否按平台/模型放宽,由 owner 决定;
 - 910B 内核适配若立项,另开文档。
 
