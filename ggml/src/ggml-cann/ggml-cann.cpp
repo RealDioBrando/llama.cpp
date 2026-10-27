@@ -1016,6 +1016,7 @@ struct ggml_backend_cann_buffer_context {
 #ifdef ASCEND_310P
     ggml_cann_tied_output_weight_cache tied_output_weight_cache;
 #endif
+    std::unordered_set<aclTensor *> w8a8_tensors; ///< Resident transformed W8A8 descriptors
 
     /**
      * @brief Constructor to initialize the CANN buffer context.
@@ -1028,7 +1029,12 @@ struct ggml_backend_cann_buffer_context {
     /**
      * @brief Destructor to free the device memory allocated for the buffer.
      */
-    ~ggml_backend_cann_buffer_context() { ACL_CHECK(aclrtFree(dev_ptr)); }
+    ~ggml_backend_cann_buffer_context() {
+        for (aclTensor * tensor : w8a8_tensors) {
+            aclDestroyTensor(tensor);
+        }
+        ACL_CHECK(aclrtFree(dev_ptr));
+    }
 
     /**
      * @brief Get or create a tracker for the given tensor.
@@ -1294,6 +1300,41 @@ static void ggml_backend_cann_transform_back_q8_0(const ggml_tensor * tensor, co
     }
 }
 
+
+static void ggml_backend_cann_transform_w8a8(ggml_tensor * tensor, const void * src, void * dst) {
+    int64_t n_elems     = ggml_nelements(tensor);
+    int64_t groups      = n_elems / QK_W8A8;
+    size_t  quant_bytes = n_elems * sizeof(uint8_t);
+
+    uint8_t *  quant_offset = (uint8_t *) dst;
+    uint16_t * scale_offset = (uint16_t *) ((char *) dst + quant_bytes);
+
+    for (int64_t i = 0; i < groups; i++) {
+        const block_w8a8 * group = (const block_w8a8 *) ((const char *) src + i * sizeof(block_w8a8));
+        *scale_offset            = group->d;
+        scale_offset++;
+        memcpy(quant_offset, group->qs, QK_W8A8);
+        quant_offset += QK_W8A8;
+    }
+}
+
+static void ggml_backend_cann_transform_back_w8a8(const ggml_tensor * tensor, void * src, void * dst) {
+    int64_t n_elems     = ggml_nelements(tensor);
+    int64_t groups      = n_elems / QK_W8A8;
+    size_t  quant_bytes = n_elems * sizeof(uint8_t);
+
+    const uint8_t *  quant_offset = (const uint8_t *) src;
+    const uint16_t * scale_offset = (const uint16_t *) ((char *) src + quant_bytes);
+
+    for (int64_t i = 0; i < groups; i++) {
+        block_w8a8 * group = (block_w8a8 *) ((char *) dst + i * sizeof(block_w8a8));
+        group->d           = *scale_offset;
+        scale_offset++;
+        memcpy(group->qs, quant_offset, QK_W8A8);
+        quant_offset += QK_W8A8;
+    }
+}
+
 /**
  * @brief Transform tensor data based on its type for CANN processing.
  *
@@ -1313,6 +1354,9 @@ static void ggml_backend_cann_transform(ggml_tensor * tensor, const void * src, 
             break;
         case GGML_TYPE_Q8_0:
             ggml_backend_cann_transform_q8_0(tensor, src, dst);
+            break;
+        case GGML_TYPE_W8A8:
+            ggml_backend_cann_transform_w8a8(tensor, src, dst);
             break;
         default:
             break;
@@ -1588,6 +1632,9 @@ static void ggml_backend_cann_transform_back(const ggml_tensor * tensor, void * 
         case GGML_TYPE_Q8_0:
             ggml_backend_cann_transform_back_q8_0(tensor, src, dst);
             break;
+        case GGML_TYPE_W8A8:
+            ggml_backend_cann_transform_back_w8a8(tensor, src, dst);
+            break;
         default:
             break;
     }
@@ -1606,6 +1653,7 @@ static bool need_transform(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_W8A8:
             return true;
         default:
             return false;
@@ -1721,6 +1769,115 @@ static void weight_format_to_nz(ggml_tensor * tensor, int device) {
     ggml_cann_weight_format_to_nz(tensor, device);
 }
 
+static void ggml_backend_cann_w8a8_upload_a8(ggml_tensor * tensor, const void * src,
+                                               ggml_backend_cann_buffer_context * ctx) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_W8A8);
+    GGML_ASSERT(tensor->ne[0] % 32 == 0);
+    GGML_ASSERT(tensor->ne[2] == 1 && tensor->ne[3] == 1);
+
+    const int64_t k              = tensor->ne[0];
+    const int64_t n              = tensor->ne[1];
+    const int64_t blocks_per_row = k / QK_W8A8;
+    const size_t  hp_elements    = ggml_cann_w8a8_hp_elements(tensor);
+    const size_t  scale_offset   = ggml_cann_w8a8_scale_offset(tensor);
+
+    std::vector<int8_t> hp(hp_elements, 0);
+    std::vector<float>  scales(static_cast<size_t>(n));
+
+    for (int64_t row = 0; row < n; ++row) {
+        const block_w8a8 * blocks =
+            (const block_w8a8 *) ((const char *) src + row * blocks_per_row * sizeof(block_w8a8));
+        scales[static_cast<size_t>(row)] = ggml_fp16_to_fp32(blocks[0].d);
+        for (int64_t block = 0; block < blocks_per_row; ++block) {
+            GGML_ASSERT(blocks[block].d == blocks[0].d);
+            for (int64_t j = 0; j < QK_W8A8; ++j) {
+                hp[static_cast<size_t>(row * k + block * QK_W8A8 + j)] = blocks[block].qs[j];
+            }
+        }
+    }
+
+    ACL_CHECK(aclrtMemcpy(tensor->data, hp.size(), hp.data(), hp.size(), ACL_MEMCPY_HOST_TO_DEVICE));
+    ACL_CHECK(aclrtMemcpy((char *) tensor->data + scale_offset, scales.size() * sizeof(float), scales.data(),
+                          scales.size() * sizeof(float), ACL_MEMCPY_HOST_TO_DEVICE));
+
+    int64_t weight_ne[] = { k, n };
+    size_t  weight_nb[] = { 1, static_cast<size_t>(k) };
+    acl_tensor_ptr weight = ggml_cann_create_tensor(tensor->data, ACL_INT8, (size_t) 1, weight_ne, weight_nb, 2,
+                                                    ACL_FORMAT_ND, 0);
+
+    if (tensor->extra != nullptr) {
+        aclTensor * old = (aclTensor *) tensor->extra;
+        ctx->w8a8_tensors.erase(old);
+        ACL_CHECK(aclDestroyTensor(old));
+        tensor->extra = nullptr;
+    }
+
+    uint64_t       workspace_size = 0;
+    aclOpExecutor *executor       = nullptr;
+    ACL_CHECK(aclnnTransMatmulWeightGetWorkspaceSize(weight.get(), &workspace_size, &executor));
+    const int32_t device = g_current_cann_device;
+    const auto    transform_start = std::chrono::steady_clock::now();
+    aclrtStream stream = nullptr;
+    ACL_CHECK(aclrtCreateStream(&stream));
+    {
+        std::lock_guard<std::mutex> lock(g_nz_workspaces[device].mtx);
+        g_nz_workspaces[device].realloc(workspace_size);
+        ACL_CHECK(aclnnTransMatmulWeight(g_nz_workspaces[device].get(), workspace_size, executor, stream));
+    }
+    ACL_CHECK(aclrtSynchronizeStream(stream));
+    ACL_CHECK(aclrtDestroyStream(stream));
+
+    static const bool log_transform =
+        parse_bool(get_env_as_lowercase("GGML_CANN_W8A8_LOG_TRANSFORM").value_or("off"));
+    if (log_transform) {
+        const auto transform_end = std::chrono::steady_clock::now();
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::microseconds>(transform_end - transform_start).count() /
+            1000.0;
+        GGML_LOG_INFO("%s: W8A8 transform N=%lld K=%lld took %.3f ms\n", __func__,
+                      (long long) n, (long long) k, elapsed_ms);
+    }
+
+    // aclnnTransMatmulWeight refreshes this aclTensor with private layout metadata.
+    // QuantMatmulV5 must consume this exact descriptor, so cache it on the GGML tensor.
+    tensor->extra = weight.release();
+    ctx->w8a8_tensors.insert((aclTensor *) tensor->extra);
+}
+
+static void ggml_backend_cann_w8a8_get_tensor(const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_W8A8);
+    const int64_t k            = tensor->ne[0];
+    const int64_t n            = tensor->ne[1];
+    const size_t  hp_elements  = ggml_cann_w8a8_hp_elements(tensor);
+    const size_t  scale_offset = ggml_cann_w8a8_scale_offset(tensor);
+    const int64_t n1           = (n + 15) / 16;
+
+    std::vector<int8_t> hp(hp_elements);
+    std::vector<float>  scales(static_cast<size_t>(n));
+    ACL_CHECK(aclrtMemcpy(hp.data(), hp.size(), tensor->data, hp.size(), ACL_MEMCPY_DEVICE_TO_HOST));
+    ACL_CHECK(aclrtMemcpy(scales.data(), scales.size() * sizeof(float), (const char *) tensor->data + scale_offset,
+                          scales.size() * sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST));
+
+    std::vector<uint8_t> public_data(ggml_nbytes(tensor));
+    const int64_t blocks_per_row = k / QK_W8A8;
+    for (int64_t row = 0; row < n; ++row) {
+        block_w8a8 * blocks =
+            (block_w8a8 *) (public_data.data() + row * blocks_per_row * sizeof(block_w8a8));
+        const ggml_fp16_t scale = ggml_fp32_to_fp16(scales[static_cast<size_t>(row)]);
+        for (int64_t block = 0; block < blocks_per_row; ++block) {
+            blocks[block].d = scale;
+            for (int64_t j = 0; j < QK_W8A8; ++j) {
+                const int64_t column = block * QK_W8A8 + j;
+                const size_t physical_index =
+                    static_cast<size_t>(((column / 32) * n1 + row / 16) * 16 + row % 16) * 32 + column % 32;
+                blocks[block].qs[j] = hp[physical_index];
+            }
+        }
+    }
+
+    memcpy(data, public_data.data() + offset, size);
+}
+
 // TODO: need handle tensor which has paddings.
 /**
  * @brief Set tensor data in a CANN buffer.
@@ -1751,6 +1908,35 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
 
     // Only check env once.
     static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
+    const bool is_w8a8_a8 = tensor->type == GGML_TYPE_W8A8 && ggml_cann_w8a8_a8_enabled();
+
+    if (tensor->type == GGML_TYPE_W8A8 && !is_w8a8_a8 && tensor->extra != nullptr) {
+        aclTensor * old = (aclTensor *) tensor->extra;
+        ctx->w8a8_tensors.erase(old);
+        ACL_CHECK(aclDestroyTensor(old));
+        tensor->extra = nullptr;
+    }
+
+    if (is_w8a8_a8) {
+        if (offset == 0 && size == ggml_nbytes(tensor)) {
+            ggml_backend_cann_w8a8_upload_a8(tensor, data, ctx);
+            return;
+        }
+
+        TensorSetTracker * tracker = ctx->get_or_create_tracker(tensor);
+        std::unique_lock<std::mutex> lock(tracker->mtx);
+        if (tracker->host_buffer.empty()) {
+            tracker->host_buffer.resize(tracker->total_bytes);
+        }
+        memcpy(tracker->host_buffer.data() + offset, data, size);
+        tracker->bytes_written += size;
+        if (tracker->bytes_written >= tracker->total_bytes) {
+            ggml_backend_cann_w8a8_upload_a8(tensor, tracker->host_buffer.data(), ctx);
+            lock.unlock();
+            ctx->remove_tracker(tensor);
+        }
+        return;
+    }
 
     bool is_quantized = need_transform(tensor->type);
 #ifdef ASCEND_310P
@@ -1910,6 +2096,10 @@ static void ggml_backend_cann_buffer_get_tensor(ggml_backend_buffer_t buffer,
 
     ggml_cann_set_device(ctx->device);
 
+    if (tensor->type == GGML_TYPE_W8A8 && ggml_cann_w8a8_a8_enabled()) {
+        ggml_backend_cann_w8a8_get_tensor(tensor, data, offset, size);
+        return;
+    }
 #ifdef ASCEND_310P
     if (ggml_cann_kq_matmul_path(tensor) != GGML_CANN_KQ_NONE) {
         // Re-quantization is lossy: the original GGUF bytes cannot be recovered.
@@ -1950,6 +2140,10 @@ static bool ggml_backend_cann_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
     if (ggml_backend_buft_is_cann(src->buffer->buft)) {
         ggml_backend_cann_buffer_context * src_ctx = (ggml_backend_cann_buffer_context *) src->buffer->context;
         ggml_backend_cann_buffer_context * dst_ctx = (ggml_backend_cann_buffer_context *) buffer->context;
+
+        if (src->type == GGML_TYPE_W8A8 && ggml_cann_w8a8_a8_enabled()) {
+            return false;
+        }
 
         size_t memcpy_size = ggml_nbytes(src);
         // Same device.
@@ -2116,6 +2310,12 @@ static size_t ggml_backend_cann_buffer_type_get_alloc_size(ggml_backend_buffer_t
     // int64_t line_size = ne0 * ggml_element_size(tensor);
     // int64_t line_size_align_32 = (line_size + 31) & ~31;
     // size += (line_size_align_32 - line_size);
+    if (tensor->type == GGML_TYPE_W8A8 && ggml_cann_w8a8_a8_enabled()) {
+        const size_t private_size =
+            ggml_cann_w8a8_scale_offset(tensor) + tensor->ne[1] * sizeof(float);
+        return std::max(size, private_size);
+    }
+
     if (ggml_is_quantized(tensor->type)) {
         if (ne0 % MATRIX_ROW_PADDING != 0) {
             size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
@@ -3342,7 +3542,21 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                         return false;
 #endif
                         // only support contiguous for quantized types.
-                        return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+                        return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                               ggml_is_contiguous(op);
+
+#ifdef ASCEND_310P
+                    case GGML_TYPE_W8A8:
+                        return op->src[0]->ne[0] % 32 == 0 &&
+                               op->src[0]->ne[0] <= 65535 &&
+                               op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+                               op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                               (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
+                               (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
+                               ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                               ggml_is_contiguous(op);
+#endif
+
                     case GGML_TYPE_Q4_0:
 #ifdef ASCEND_310P
                     // K-quants: NPU path via W8A8/W4A8 (transform at load, see
@@ -3384,7 +3598,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     return false;
 #endif
                     // only support contiguous for quantized types.
-                    return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+                    return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op);
                 default:
                     return false;
             }

@@ -398,6 +398,7 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
+            case GGML_TYPE_W8A8:    return_type = GGML_TYPE_F16;   break;
             default:
                 if (qk_k <= 32) {
                     // the target is already a 32-block type, so there is no smaller block to demote to
@@ -427,6 +428,12 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
 // internal standard logic for selecting the target tensor type based on tensor category, ftype, and model arch
 static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type new_type, const ggml_tensor * tensor, llama_ftype ftype, tensor_category category) {
     const std::string name = ggml_get_name(tensor);
+
+    // W8A8 currently supports dense MUL_MAT only. Keep token embeddings in F16
+    // because GET_ROWS does not have a W8A8 CANN implementation.
+    if (new_type == GGML_TYPE_W8A8 && category == tensor_category::TOKEN_EMBD) {
+        return GGML_TYPE_F16;
+    }
 
     // TODO: avoid hardcoded tensor names - use the TN_* constants
     const llm_arch arch = qs.model.arch;
@@ -856,6 +863,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_ALL_F32:     return GGML_TYPE_F32;
         case LLAMA_FTYPE_MOSTLY_Q1_0: return GGML_TYPE_Q1_0;
         case LLAMA_FTYPE_MOSTLY_Q2_0: return GGML_TYPE_Q2_0;
+        case LLAMA_FTYPE_MOSTLY_W8A8: return GGML_TYPE_W8A8;
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
 
