@@ -303,6 +303,11 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // free the clip buffers before anything resets the CANN device,
+        // otherwise aclrtFree runs with no device bound and aborts
+        mtmd_free(mctx);
+        mctx = nullptr;
+
         // the scheduler holds raw pointers into the context, free it first
         scheduler.reset();
 
@@ -316,9 +321,6 @@ private:
 
         ctx_tgt = nullptr;
         model_tgt = nullptr;
-
-        mtmd_free(mctx);
-        mctx = nullptr;
     }
 
     void handle_sleeping_state(bool new_state) {
