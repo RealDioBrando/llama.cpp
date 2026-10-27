@@ -9799,6 +9799,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F32, 8, 2, true, 32, 4, 32));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F16, 8, 2, true, 32, 4, 32));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F32, 16, 4, true, 64, 8, 64));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F32, 32, 2, true, 64, 4, 64));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F16, 32, 2, true, 64, 4, 64));
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 16,  3,  32,   {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 128, 1,  64,   {1, 1}, {1, 1}));

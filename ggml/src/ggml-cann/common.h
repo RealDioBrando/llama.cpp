@@ -144,6 +144,14 @@ static inline bool ggml_cann_w8a8_a8_enabled() {
     return enabled;
 }
 
+/** @brief Whether the experimental grouped MoE A8 path is explicitly selected. */
+static inline bool ggml_cann_w8a8_moe_a8_enabled() {
+    static const bool enabled =
+        parse_bool(get_env_as_lowercase("GGML_CANN_MOE_W8A8_A8").value_or("off")) &&
+        ggml_cann_w8a8_a8_enabled();
+    return enabled;
+}
+
 /**
  * @brief Abstract base class for memory pools used by CANN.
  */

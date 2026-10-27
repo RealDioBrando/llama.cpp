@@ -1819,6 +1819,7 @@ static void ggml_backend_cann_w8a8_upload_a8(ggml_tensor * tensor, const void * 
             ACL_CHECK(aclrtMemset((char *) tensor->data + weights.size(), padding_size, 0, padding_size));
         }
         const bool transform_expert_weight =
+            ggml_cann_w8a8_moe_a8_enabled() &&
             parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("off"));
         if (transform_expert_weight) {
         int64_t expert_weight_ne[3] = { expert_count, expert_n, expert_k };
@@ -2790,7 +2791,7 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
             break;
         case GGML_OP_MUL_MAT_ID:
             if ((parse_bool(get_env_as_lowercase("GGML_CANN_MOE_GROUPED").value_or("off")) ||
-                 (dst->src[0]->type == GGML_TYPE_W8A8 && ggml_cann_w8a8_a8_enabled())) &&
+                 (dst->src[0]->type == GGML_TYPE_W8A8 && ggml_cann_w8a8_moe_a8_enabled())) &&
                 ggml_cann_mul_mat_id_grouped_supported(dst)) {
                 ggml_cann_mul_mat_id_grouped(ctx, dst);
             } else {
@@ -3710,16 +3711,18 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 case GGML_TYPE_F32:
                     return true;
 #ifdef ASCEND_310P
-                case GGML_TYPE_W8A8:
+                case GGML_TYPE_W8A8: {
+                    const bool moe_a8 = ggml_cann_w8a8_moe_a8_enabled();
                     return ggml_cann_w8a8_is_expert(op->src[0]) &&
-                           op->src[0]->ne[0] % (ggml_cann_w8a8_a8_enabled() ? 16 : 32) == 0 &&
-                           (!ggml_cann_w8a8_a8_enabled() || op->src[0]->ne[1] % 16 == 0) &&
+                           op->src[0]->ne[0] % (moe_a8 ? 16 : 32) == 0 &&
+                           (!moe_a8 || op->src[0]->ne[1] % 16 == 0) &&
                            op->src[0]->ne[3] == 1 &&
                            (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
                            (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
                            op->src[2]->type == GGML_TYPE_I32 && op->src[2]->nb[0] == sizeof(int32_t) &&
                            ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                            ggml_is_contiguous(op);
+                }
 #endif
                 case GGML_TYPE_Q8_0:
                 case GGML_TYPE_Q4_0:
