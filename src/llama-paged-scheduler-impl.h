@@ -19,13 +19,16 @@ class llama_paged_scheduler_impl {
     llama_paged_scheduler_impl(
             uint32_t n_ctx,
             uint32_t block_sz,
-            int32_t n_batch,
+            int32_t  n_batch,
+            int32_t  n_pos_per_embd,
             llama_kv_cache_paged * kv_manager,
             llama_memory_hybrid_paged * hybrid_memory = nullptr,
             bool priority_enabled = false);
 
     llama_scheduler_status step(llama_batch & batch);
     bool                   queue_request(llama_sequence_group group);
+    bool                   add_request_segs(const llama_paged_segment * segs, int32_t n_segs, int32_t request_id);
+    bool                   append_segment(int32_t request_id, const llama_paged_segment & seg);
     void update(const llama_batch * batch, const llama_paged_feedback * feedback, int32_t n_feedback);
     void set_on_finish(llama_paged_on_finish_cb cb, void * user_data);
     bool cancel(int32_t request_id);
@@ -34,6 +37,7 @@ class llama_paged_scheduler_impl {
     bool truncate(int32_t request_id, int32_t n_past_new);
     int32_t max_request_id() const;
     llama_sequence_group *         get_group_from_id(int32_t request_id) const;
+    int32_t                        get_n_pos_per_embd() const { return n_pos_per_embd; }
     const llama_paged_batch_info * get_curr_batch_info() const;
     bool set_prefix_cache_enabled(bool enabled);
 
@@ -97,6 +101,7 @@ class llama_paged_scheduler_impl {
     const uint32_t         n_seq_max_ctx;
     const uint32_t         block_size;
     const int32_t          n_batch;
+    const int32_t          n_pos_per_embd;  // 1, or 4 for mrope models (12.4)
     llama_kv_cache_paged * kv_cache_manager = nullptr;
     llama_memory_hybrid_paged * hybrid_memory_manager = nullptr;
     llama_paged_batch_info curr_info = {};
@@ -104,6 +109,14 @@ class llama_paged_scheduler_impl {
     llama_paged_prefix_cache prefix_cache;
     bool                     prefix_cache_enabled = true;
     uint32_t                 n_ckpt_requested     = 4;
+
+    // mrope models take a sectioned position array ([t][y][x][z]); owned by
+    // populate_batch_from for the lifetime of the built batch
+    std::vector<llama_pos> populate_pos;
+
+    // embd batches: the init-allocated token array of the built batch
+    // (null-detached so llama_batch_free skips it); freed in clear_batch
+    llama_token * populate_token_buf = nullptr;
 
     uint32_t n_livelock_steps   = 0;
     uint32_t prev_n_swapped     = 0;

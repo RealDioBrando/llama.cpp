@@ -9,11 +9,11 @@
 struct llama_paged_scheduler {
     llama_paged_scheduler_impl impl;
 
-    llama_paged_scheduler(uint32_t n_ctx, uint32_t block_sz, uint32_t n_batch,
+    llama_paged_scheduler(uint32_t n_ctx, uint32_t block_sz, uint32_t n_batch, int32_t n_pos_per_embd,
                           llama_kv_cache_paged * kv_manager,
                           llama_memory_hybrid_paged * hybrid_memory,
                           bool priority_enabled) :
-        impl(n_ctx, block_sz, n_batch, kv_manager, hybrid_memory, priority_enabled) {}
+        impl(n_ctx, block_sz, n_batch, n_pos_per_embd, kv_manager, hybrid_memory, priority_enabled) {}
 };
 
 LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama_context * ctx) {
@@ -43,9 +43,10 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
     if (!hybrid_memory) {
         GGML_ASSERT(n_batch == ctx->n_ubatch() && "kv_paged requires n_batch == n_ubatch.");
     }
+    const int32_t n_pos_per_embd = llama_model_n_pos_per_embd(llama_get_model(ctx));
 
     try {
-        return new llama_paged_scheduler(n_ctx, block_sz, n_batch, paged_kv, hybrid_memory,
+        return new llama_paged_scheduler(n_ctx, block_sz, n_batch, n_pos_per_embd, paged_kv, hybrid_memory,
                                          ctx->paged_priority());
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("%s: Error when creating llama_paged_scheduler: %s\n", __func__, e.what());
@@ -170,6 +171,92 @@ LLAMA_API bool llama_paged_scheduler_add_request(struct llama_paged_scheduler * 
     return sched->impl.queue_request(group);
 }
 
+LLAMA_API bool llama_paged_scheduler_add_request_segs(struct llama_paged_scheduler *      sched,
+                                                      const struct llama_paged_segment * segs,
+                                                      int32_t                             n_segs,
+                                                      int32_t                             request_id) {
+    if (!sched || !segs || n_segs <= 0) {
+        return false;
+    }
+
+    llama_sequence_group group;
+    group.request_id     = request_id;
+    group.n_prompt       = 0;
+    group.n_decoded      = 0;
+    group.n_past         = 0;
+    group.t_arrival_time = ggml_time_us();
+
+    bool has_media = false;
+    for (int32_t i = 0; i < n_segs; ++i) {
+        const llama_paged_segment & s = segs[i];
+        if (s.n_tokens <= 0) {
+            LLAMA_LOG_ERROR("%s: request %d has an empty segment (index %d).\n", __func__, request_id, i);
+            return false;
+        }
+
+        llama_seq_segment seg;
+        seg.start_row = (uint32_t) group.logical_seq.size();
+        seg.n_tokens  = (uint32_t) s.n_tokens;
+        seg.is_media  = (s.tokens == nullptr);
+        if (seg.is_media) {
+            has_media = true;
+            seg.embd        = s.embd;
+            seg.embd_stride = s.embd_stride;
+            if (s.pos) {
+                seg.pos.assign(s.pos, s.pos + (size_t) s.n_tokens * sched->impl.get_n_pos_per_embd());
+            }
+            group.logical_seq.insert(group.logical_seq.end(), s.n_tokens, LLAMA_TOKEN_NULL);
+        } else {
+            group.logical_seq.insert(group.logical_seq.end(), s.tokens, s.tokens + s.n_tokens);
+        }
+        group.segments.push_back(std::move(seg));
+    }
+    group.has_media      = has_media;
+    group.n_prompt       = (uint32_t) group.logical_seq.size();
+    group.n_prompt_total = (uint32_t) group.logical_seq.size();
+
+    return sched->impl.queue_request(std::move(group));
+}
+
+LLAMA_API bool llama_paged_scheduler_append_segment(struct llama_paged_scheduler *      sched,
+                                                    int32_t                             request_id,
+                                                    const struct llama_paged_segment * seg) {
+    if (!sched || !seg) {
+        return false;
+    }
+
+    llama_sequence_group * group = sched->impl.get_group_from_id(request_id);
+    if (group == nullptr) {
+        LLAMA_LOG_ERROR("%s: request_id=%d does not exist.\n", __func__, request_id);
+        return false;
+    }
+    LLAMA_LOG_ERROR("%s: request %d append at n_past=%d, n_segments=%zu\n", __func__, request_id, group->n_past,
+                   group->segments.size());
+
+    for (auto & s : group->segments) {
+        if (s.is_media && s.embd == nullptr && s.start_row == group->n_past) {
+            if (seg->embd == nullptr || seg->embd_stride <= 0) {
+                LLAMA_LOG_ERROR("%s: request %d appended segment has no embeddings.\n", __func__, request_id);
+                return false;
+            }
+            s.embd        = seg->embd;
+            s.embd_stride = seg->embd_stride;
+            if (seg->pos && seg->n_tokens) {
+                s.pos.assign(seg->pos, seg->pos + (size_t) seg->n_tokens * sched->impl.get_n_pos_per_embd());
+            }
+            group->paused_external = false;
+            if (group->status == llama_sequence_group_status::PAUSED_EXTERNAL) {
+                group->status = llama_sequence_group_status::RUNNING;
+            }
+            LLAMA_LOG_INFO("%s: request %d segment at row %d appended (%d rows)\n", __func__, request_id,
+                           (int) s.start_row, s.n_tokens);
+            return true;
+        }
+    }
+    LLAMA_LOG_ERROR("%s: request %d has no pending media segment at row %d.\n", __func__, request_id, group->n_past);
+    return false;
+}
+
 LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler *      sched,
                                             struct llama_batch *               batch,
                                             const struct llama_paged_feedback * feedback,
@@ -241,6 +328,7 @@ LLAMA_API bool llama_paged_scheduler_get_seq_state(struct llama_paged_scheduler 
     out_state->n_prompt_total   = group->n_prompt_total;
     out_state->n_decoded        = group->n_decoded;
     out_state->n_past           = group->n_past;
+    out_state->paused           = group->paused_external ? 1 : 0;
     out_state->t_arrival_us     = group->t_arrival_time;
     out_state->t_first_token_us = group->t_first_token_us;
     out_state->priority         = group->priority;

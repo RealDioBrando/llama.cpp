@@ -11,6 +11,8 @@
 
 #include "llama.h"
 
+struct mtmd_context;
+
 #include <functional>
 #include <memory>
 
@@ -54,6 +56,9 @@ struct server_scheduler_host {
 
     // speculative decoding context, nullptr when disabled
     virtual common_speculative * spec_ctx() = 0;
+
+    // multimodal context for encoding media segments, nullptr when disabled
+    virtual mtmd_context * mmctx() = 0;
 
     // run work on the main thread while a worker serves the task queue,
     // keeping /metrics responsive (see server_queue::yield_to_queue)

@@ -9,6 +9,7 @@
 llama_paged_scheduler_impl::llama_paged_scheduler_impl(uint32_t               n_ctx,
                                                        uint32_t               block_sz,
                                                        int32_t                n_batch,
+                                                       int32_t                n_pos_per_embd,
                                                        llama_kv_cache_paged * kv_manager,
                                                        llama_memory_hybrid_paged * hybrid_memory,
                                                        bool                   priority_enabled) :
@@ -18,6 +19,7 @@ llama_paged_scheduler_impl::llama_paged_scheduler_impl(uint32_t               n_
     n_seq_max_ctx(n_ctx),
     block_size(block_sz),
     n_batch(n_batch),
+    n_pos_per_embd(n_pos_per_embd),
     kv_cache_manager(kv_manager),
     hybrid_memory_manager(hybrid_memory) {
     if (const char * env = getenv("LLAMA_PAGED_PREFIX_CACHE")) {
@@ -118,6 +120,21 @@ llama_scheduler_status llama_paged_scheduler_impl::step(llama_batch & batch) {
         candidates.push_back(best_prefill);
     }
 
+    // multimodal (12.4): an embd step (a media segment's rows fed as
+    // batch.embd) runs exclusively - text and embd rows cannot share a batch
+    auto media_it = std::find_if(candidates.begin(), candidates.end(), [](const llama_sequence_group * group) {
+        if (!group) {
+            return false;
+        }
+        const llama_seq_segment * seg = group->segment_at(group->n_past);
+        return seg && seg->is_media;
+    });
+    if (media_it != candidates.end()) {
+        llama_sequence_group * media = *media_it;
+        candidates.clear();
+        candidates.push_back(media);
+    }
+
     const uint32_t n_running    = running.size();
     const uint32_t n_swapped    = swapped->size();
     const uint32_t n_waiting    = waiting->size();
@@ -185,6 +202,83 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group) {
     return true;
 }
 
+bool llama_paged_scheduler_impl::add_request_segs(const llama_paged_segment * segs, int32_t n_segs,
+                                                  int32_t request_id) {
+    if (n_segs <= 0 || segs == nullptr) {
+        LLAMA_LOG_ERROR("%s: request %d has no segments.\n", __func__, request_id);
+        return false;
+    }
+
+    llama_sequence_group group;
+    group.request_id     = request_id;
+    group.t_arrival_time = ggml_time_us();
+
+    bool has_media = false;
+    for (int32_t i = 0; i < n_segs; ++i) {
+        const llama_paged_segment & s = segs[i];
+        if (s.n_tokens <= 0) {
+            LLAMA_LOG_ERROR("%s: request %d has an empty segment (index %d).\n", __func__, request_id, i);
+            return false;
+        }
+
+        llama_seq_segment seg;
+        seg.start_row = (uint32_t) group.logical_seq.size();
+        seg.n_tokens  = (uint32_t) s.n_tokens;
+        seg.is_media  = (s.tokens == nullptr);
+        if (seg.is_media) {
+            has_media = true;
+            if (s.embd != nullptr && s.embd_stride <= 0) {
+                LLAMA_LOG_ERROR("%s: request %d media segment %d has no embd stride.\n", __func__, request_id, i);
+                return false;
+            }
+            seg.embd        = s.embd;
+            seg.embd_stride = s.embd_stride;
+            if (s.pos) {
+                seg.pos.assign(s.pos, s.pos + (size_t) s.n_tokens * n_pos_per_embd);
+            }
+            group.logical_seq.insert(group.logical_seq.end(), s.n_tokens, LLAMA_TOKEN_NULL);
+        } else {
+            group.logical_seq.insert(group.logical_seq.end(), s.tokens, s.tokens + s.n_tokens);
+        }
+        group.segments.push_back(std::move(seg));
+    }
+    group.has_media = has_media;
+
+    return queue_request(std::move(group));
+}
+
+bool llama_paged_scheduler_impl::append_segment(int32_t request_id, const llama_paged_segment & seg) {
+    auto it = id_to_group.find(request_id);
+    if (it == id_to_group.end()) {
+        LLAMA_LOG_ERROR("%s: request %d not found.\n", __func__, request_id);
+        return false;
+    }
+    llama_sequence_group * group = it->second;
+
+    for (auto & s : group->segments) {
+        if (s.is_media && s.embd == nullptr && s.start_row == group->n_past) {
+            if (seg.embd == nullptr || seg.embd_stride <= 0) {
+                LLAMA_LOG_ERROR("%s: request %d appended segment has no embeddings.\n", __func__, request_id);
+                return false;
+            }
+            s.embd        = seg.embd;
+            s.embd_stride = seg.embd_stride;
+            if (seg.pos && seg.n_tokens) {
+                s.pos.assign(seg.pos, seg.pos + (size_t) seg.n_tokens * n_pos_per_embd);
+            }
+            group->paused_external = false;
+            if (group->status == llama_sequence_group_status::PAUSED_EXTERNAL) {
+                group->status = llama_sequence_group_status::RUNNING;
+            }
+            LLAMA_LOG_DEBUG("%s: request %d media segment appended at row %d (%d rows)\n", __func__, request_id,
+                            (int) s.start_row, s.n_tokens);
+            return true;
+        }
+    }
+    LLAMA_LOG_ERROR("%s: request %d has no pending media segment at row %d.\n", __func__, request_id, group->n_past);
+    return false;
+}
+
 uint64_t llama_paged_scheduler_impl::hash_block(uint64_t prev, const std::vector<llama_token> & tokens,
                                                 uint32_t block_idx, uint32_t block_size) {
     uint64_t h = 1469598103934665603ULL ^ prev;
@@ -199,6 +293,11 @@ uint64_t llama_paged_scheduler_impl::hash_block(uint64_t prev, const std::vector
 }
 
 void llama_paged_scheduler_impl::try_apply_prefix_cache(llama_sequence_group & group) {
+    // media rows carry no token ids: blocks containing them can neither be
+    // hashed nor safely reused
+    if (group.has_media) {
+        return;
+    }
     if (!prefix_cache_enabled || group.n_past > 0 || !group.block_table.empty()) {
         return;
     }
@@ -264,6 +363,10 @@ void llama_paged_scheduler_impl::try_apply_prefix_cache(llama_sequence_group & g
 }
 
 void llama_paged_scheduler_impl::register_completed_blocks(llama_sequence_group & group) {
+    // media rows carry no token ids: their blocks cannot be hashed
+    if (group.has_media) {
+        return;
+    }
     const uint32_t full_blocks = group.n_past / block_size;
     for (uint32_t b = group.block_hashes.size(); b < full_blocks; ++b) {
         if ((uint64_t)(b + 1) * block_size > group.logical_seq.size() || b >= group.block_table.size()) {
@@ -398,6 +501,16 @@ void llama_paged_scheduler_impl::swap_out_or_recompute(llama_sequence_group_ptr 
     }
 
     // There was not enough CPU memory to swap the request (recomputation)
+    // media rows cannot be recomputed: their KV comes from the vision
+    // encoder, re-feeding the logical sequence would feed placeholders
+    if (group_ptr->has_media) {
+        LLAMA_LOG_ERROR("%s: request %d holds media rows and cannot be recomputed; failing it\n", __func__, rid);
+        kv_cache_manager->free_blocks(*group_ptr, {});
+        id_to_group.erase(rid);
+        finish(*group_ptr);
+        return;
+    }
+
     llama_block_ids      keep;
     std::vector<uint64_t> keep_hashes;
     for (size_t i = 0; i < group_ptr->block_hashes.size() && i < group_ptr->block_table.size(); ++i) {
@@ -472,9 +585,25 @@ void llama_paged_scheduler_impl::process_running_list(llama_sequence_group_raw_l
             continue;
         }
 
+        // multimodal (12.4): a group waiting for the server to append a media
+        // segment's encoder output pauses here; excluded from candidates and
+        // from the capacity accounting until append_segment resumes it
+        if (group->paused_external || group->pending_media_at(group->n_past)) {
+            group->paused_external  = true;
+            group->status           = llama_sequence_group_status::PAUSED_EXTERNAL;
+            LLAMA_LOG_DEBUG("%s: (paused_external) request_id=%d waits for a media segment\n", __func__,
+                            group->request_id);
+            ++it;
+            continue;
+        }
+
         // rows this request contributes to the next step (verify steps carry
-        // one row per draft token)
-        const uint32_t rows = group->pending_draft.empty() ? 1u : 1u + (uint32_t) group->pending_draft.size();
+        // one row per draft token; media steps carry their segment's rows)
+        uint32_t rows = group->pending_draft.empty() ? 1u : 1u + (uint32_t) group->pending_draft.size();
+        const llama_seq_segment * seg = group->segment_at(group->n_past);
+        if (seg && seg->is_media) {
+            rows = seg->start_row + seg->n_tokens - group->n_past;
+        }
         if (rows > (uint32_t) row_budget) {
             // token budget exhausted; this request decodes on a later step
             break;
@@ -645,6 +774,19 @@ void llama_paged_scheduler_impl::clear_batch(llama_batch & batch) {
     delete[] curr_info.batch_lens;
     curr_info = {};  // reset to defaults
 
+    // detach pointers llama_batch_free must not free: media batches point
+    // embd into the server-owned encoder output, and mrope batches point pos
+    // into populate_pos; the init-allocated token buffer of an embd batch is
+    // stashed in populate_token_buf and freed here manually
+    if (populate_token_buf) {
+        free(populate_token_buf);
+        populate_token_buf = nullptr;
+    }
+    batch.embd = nullptr;
+    if (n_pos_per_embd > 1) {
+        batch.pos = nullptr;
+    }
+
     if (batch.n_tokens == 0) {
         return;
     }
@@ -666,13 +808,28 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
 
     LLAMA_LOG_DEBUG("%s: Creating batch from candidates (%d requests). n_batch=%d\n", __func__, batch_size, n_batch);
 
-    // Calculating required sizes
+    // Calculating required sizes. a group whose head segment is a media
+    // segment contributes its remaining media rows as a pure-embd slice
+    // (12.4: text and embd rows cannot share a batch)
     for (const auto & group : candidates) {
         GGML_ASSERT(group && "candidate request is nullptr.");
-        const bool is_prefill = group->n_decoded == 0 && group->n_prompt > 0;
+        const bool     is_prefill   = group->n_decoded == 0 && group->n_prompt > 0;
         const uint32_t n_draft_rows = group->pending_draft.size();
-        total_tokens += is_prefill ? std::min<int32_t>((int32_t) group->n_prompt, n_batch)
-                                   : (int32_t)(1 + n_draft_rows);
+        const llama_seq_segment * seg = group->segment_at(group->n_past);
+        int32_t rows;
+        if (seg && seg->is_media) {
+            // pure-embd slice: capped by the token budget
+            rows = std::min<int32_t>((int32_t)(seg->start_row + seg->n_tokens - group->n_past), n_batch);
+        } else if (is_prefill) {
+            rows = std::min<int32_t>((int32_t)(group->n_prompt_total - group->n_past), n_batch);
+            // text rows stop at the next media segment boundary (12.4)
+            if (seg && !seg->is_media) {
+                rows = std::min<int32_t>(rows, (int32_t)(seg->start_row + seg->n_tokens - group->n_past));
+            }
+        } else {
+            rows = 1 + (int32_t) n_draft_rows;
+        }
+        total_tokens += rows;
         max_blocks = std::max(max_blocks, (int32_t) group->block_table.size());
     }
 
@@ -681,6 +838,14 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
     // Initialize the batch (assumed it was cleared before)
     batch = llama_batch_init(total_tokens, 0, 1);
     GGML_ASSERT(batch.token != nullptr && "llama_batch_init failed to allocate tokens.");
+
+    // mrope models take a sectioned position array ([t][y][x][z] per
+    // section); the init-allocated buffer only holds one position per row, so
+    // replace it with our own for the lifetime of this batch
+    if (n_pos_per_embd > 1) {
+        populate_pos.assign((size_t) total_tokens * n_pos_per_embd, 0);
+        batch.pos = populate_pos.data();
+    }
 
     batch.n_tokens = total_tokens;
 
@@ -709,10 +874,33 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
 
         const bool     is_prefill   = group->n_decoded == 0 && group->n_prompt > 0;
         const uint32_t n_draft_rows = group->pending_draft.size();
-        const int32_t  new_tokens   = is_prefill ? std::min<int32_t>((int32_t) group->n_prompt, n_batch)
-                                                 : (int32_t)(1 + n_draft_rows);
+        const llama_seq_segment * seg = group->segment_at(group->n_past);
+        const bool     media_step    = seg && seg->is_media;
+        int32_t  new_tokens;
+        if (media_step) {
+            new_tokens = std::min<int32_t>((int32_t)(seg->start_row + seg->n_tokens - group->n_past), n_batch);
+        } else if (is_prefill) {
+            new_tokens = std::min<int32_t>((int32_t)(group->n_prompt_total - group->n_past), n_batch);
+            // text rows stop at the next media segment boundary (12.4)
+            if (seg && !seg->is_media) {
+                new_tokens = std::min<int32_t>(new_tokens,
+                        (int32_t)(seg->start_row + seg->n_tokens - group->n_past));
+            }
+        } else {
+            new_tokens = 1 + (int32_t) n_draft_rows;
+        }
 
-        if (is_prefill) {
+        if (media_step) {
+            // pure-embd slice: rows come from the server-owned encoder
+            // output; no token ids (12.4). null out the token array so the
+            // batch allocr validation skips the placeholder ids (-1); the
+            // init-allocated buffer is freed in clear_batch
+            GGML_ASSERT(seg->embd != nullptr && "media step without encoder output");
+            batch.embd           = const_cast<float *>(seg->embd) +
+                        (size_t)(group->n_past - seg->start_row) * (size_t) seg->embd_stride;
+            populate_token_buf   = batch.token;
+            batch.token          = nullptr;
+        } else if (is_prefill) {
             GGML_ASSERT(group->logical_seq.size() >= (size_t)(group->n_past + new_tokens) &&
                         "logical_seq too small for prefill");
         } else {
@@ -722,13 +910,16 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
         for (int token_idx = 0; token_idx < new_tokens; ++token_idx) {
             int32_t batch_start_id = token_offset + token_idx;
 
-            if (is_prefill) {
-                batch.token[batch_start_id] = group->logical_seq[group->n_past + token_idx];
-            } else if (token_idx == 0) {
-                batch.token[batch_start_id] = group->logical_seq.back();
-            } else {
-                batch.token[batch_start_id] = group->pending_draft[token_idx - 1];
+            if (!media_step) {
+                if (is_prefill) {
+                    batch.token[batch_start_id] = group->logical_seq[group->n_past + token_idx];
+                } else if (token_idx == 0) {
+                    batch.token[batch_start_id] = group->logical_seq.back();
+                } else {
+                    batch.token[batch_start_id] = group->pending_draft[token_idx - 1];
+                }
             }
+
             batch.pos[batch_start_id]   = group->n_past + token_idx;  // n_past starts at 0
 
             batch.n_seq_id[batch_start_id]  = 1;
@@ -742,6 +933,21 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
             curr_info.write_slots[batch_start_id] = calculate_global_slot_index(token_pos, group->block_table);
             LLAMA_LOG_DEBUG("%s: llama_batch seq_id: %d (req_id %d) token %d: pos: %d, global_slot_idx=%d\n", __func__,
                             seq_id, group->request_id, token_idx, token_pos, curr_info.write_slots[batch_start_id]);
+        }
+
+        // mrope models take the sectioned position array; media rows carry
+        // their per-row positions from the segment
+        if (n_pos_per_embd > 1) {
+            for (int s = 0; s < n_pos_per_embd; ++s) {
+                for (int token_idx = 0; token_idx < new_tokens; ++token_idx) {
+                    if (media_step) {
+                        const int32_t rel = group->n_past - (int32_t) seg->start_row + token_idx;
+                        populate_pos[(size_t) s * new_tokens + token_idx] = seg->pos[(size_t) rel * n_pos_per_embd + s];
+                    } else {
+                        populate_pos[(size_t) s * new_tokens + token_idx] = group->n_past + token_idx;
+                    }
+                }
+            }
         }
 
         group->pending_draft.clear();  // consumed by this step

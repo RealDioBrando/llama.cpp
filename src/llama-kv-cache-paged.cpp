@@ -381,6 +381,8 @@ llama_memory_context_ptr llama_kv_cache_paged::init_batch(llama_batch_allocr & b
 
         // Failed to find a suitable split
         if (balloc.get_n_used() < balloc.get_n_tokens()) {
+            LLAMA_LOG_ERROR("%s: split did not consume the batch: used=%d of %d tokens\n", __func__,
+                            (int) balloc.get_n_used(), (int) balloc.get_n_tokens());
             break;
         }
 
