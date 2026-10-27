@@ -580,6 +580,13 @@ server 层合计:新增约 975-1300 行(其中 S2 为 ~500 行纯移动,新逻�
    `llama_paged_scheduler_warmup` 预热,否则 decode 步采样到陈旧 logits(server 有预热
    而 e2e 没有)。已在 e2e 补预热;残余 token 级漂移属在线/两遍 softmax 的 F16 数值差,
    同 prompt 下 server paged 与 default 逐字一致,top-5 重合 5/5。
+4. (已修复,server +5/-3 行)`--mmproj` 进程退出时 CANN abort(`rtFree invalid
+   value` + `ctx is NULL`):`destroy()` 先 `llama_init.reset()` 释放主 backend
+   并 `aclrtResetDevice` 销毁设备上下文,其后的 `mtmd_free` 在上下文销毁后释放
+   clip 的 CANN 缓冲。310P 实测修复前 paged+mmproj 8/8 次退出 abort(default 路径
+   同序但 8/8 干净),启动阶段两路径 8/8 均正常,即问题仅在进程退出阶段出现。修复将
+   `mtmd_free` 前移至 `destroy()` 开头(设备上下文存活时释放);修复后 paged 与
+   default 各 8/8 启停无 abort,mm 请求 sanity 与 13 用例回归(--noconftest 串行)通过。
 
 观察:`t_max_predict_ms` 在 default 与 paged 路径均未按预期截断(fork 级问题,非 paged
 回归)。
