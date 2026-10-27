@@ -3152,8 +3152,9 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     if (use_cann_graph && !cann_ctx->piecewise_mode) {
         // LRU cache operations (skip when piecewise mode is on)
         // If no matching graph is found, the graph needs to be recaptured.
-            // Debug switch: force re-capture every step.
-            static const bool no_lru = []() {
+            // Debug switch: force re-capture every step. Read per call so
+            // scoped toggles (paged warmup) take effect.
+            const bool no_lru = []() {
                 const char * e = getenv("GGML_CANN_NO_LRU");
                 return e && e[0] == '1';
             }();

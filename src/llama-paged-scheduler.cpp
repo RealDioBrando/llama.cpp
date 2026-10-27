@@ -4,6 +4,7 @@
 #include "llama-paged-scheduler-impl.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <vector>
 
 struct llama_paged_scheduler {
@@ -109,10 +110,17 @@ LLAMA_API bool llama_paged_scheduler_warmup(struct llama_paged_scheduler * sched
     // multi-ubatch async race on 310P.
     const uint32_t tiny_tokens = std::min<uint32_t>(n_tokens, 2);
     const uint32_t graph_tokens = std::min<uint32_t>(n_tokens, llama_n_ubatch(ctx));
+    // Warmup decodes must capture fresh graphs instead of replaying. On
+    // 310P, back-to-back large eager prefill passes crash unless a graph
+    // capture+execute cycle runs between them; a bare replay does not help
+    // (see the 4K TTFT hang). NO_LRU gives every warmup decode a fresh
+    // capture, and real decode steps go back to the normal LRU replay path.
+    setenv("GGML_CANN_NO_LRU", "1", 1);
     bool ok = run_pass(tiny_tokens);
     if (ok && graph_tokens > tiny_tokens) {
         ok = run_pass(graph_tokens);
     }
+    unsetenv("GGML_CANN_NO_LRU");
 
     sched->impl.set_prefix_cache_enabled(prefix_cache_was_enabled);
     if (ok) {
