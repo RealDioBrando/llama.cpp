@@ -421,7 +421,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     res->t_embd = cur;
 
     // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur, model.output_s, GGML_TYPE_F32);
 
     if (hparams.f_final_logit_softcapping) {
         cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);
@@ -492,7 +492,10 @@ ggml_tensor * llama_model_gemma4::graph::project_per_layer_inputs(ggml_tensor * 
     inp_per_layer = ggml_scale(ctx0, inp_per_layer, per_layer_input_scale);
     cb(inp_per_layer, "inp_per_layer", -1);
 
-    // permute to shape: [n_embd_per_layer, n_tokens, n_layer]
-    inp_per_layer = ggml_cont(ctx0, ggml_permute(ctx0, inp_per_layer, 0, 2, 1, 3));
+    // permute to shape: [n_embd_per_layer, n_tokens, n_layer], in the activation type
+    inp_per_layer = ggml_permute(ctx0, inp_per_layer, 0, 2, 1, 3);
+    inp_per_layer = inp_per_layer->type == cparams.act_type
+        ? ggml_cont(ctx0, inp_per_layer)
+        : ggml_cast(ctx0, inp_per_layer, cparams.act_type);
     return inp_per_layer;
 }

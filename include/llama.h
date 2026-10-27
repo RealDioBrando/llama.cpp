@@ -404,8 +404,9 @@ extern "C" {
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
-        enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
-        enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        enum ggml_type type_k;   // data type for K cache [EXPERIMENTAL]
+        enum ggml_type type_v;   // data type for V cache [EXPERIMENTAL]
+        enum ggml_type type_act; // data type of the compute graph activations: F32 or F16 [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
