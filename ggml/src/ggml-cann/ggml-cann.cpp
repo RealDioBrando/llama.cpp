@@ -3244,16 +3244,14 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
                             int64_t cn[1] = { n_el };
                         size_t  cb[1] = { one_elem_size };
                             acl_tensor_ptr t1 = ggml_cann_warm_cache_acl_tensor(*cann_ctx,
-                                &cann_ctx->rms_norm_one_tensor_cache.cache,
-                                cann_ctx->rms_norm_one_tensor_cache.size,
+                                cann_ctx->rms_norm_one_tensor_cache,
                             cn, cb, one_type, 1, 1.0f);
                         }
                         if (cann_ctx->rms_norm_zero_tensor_cache.size < n_el) {
                             int64_t cn[1] = { n_el };
                             size_t  cb[1] = { sizeof(float) };
                             acl_tensor_ptr t0 = ggml_cann_warm_cache_acl_tensor(*cann_ctx,
-                                &cann_ctx->rms_norm_zero_tensor_cache.cache,
-                                cann_ctx->rms_norm_zero_tensor_cache.size,
+                                cann_ctx->rms_norm_zero_tensor_cache,
                                 cn, cb, GGML_TYPE_F32, 1, 0.0f);
                         }
                         break;  // one RMS norm node is enough to size the caches

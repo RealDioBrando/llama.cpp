@@ -570,6 +570,7 @@ static bool llama_arch_supports_act_f16(llm_arch arch) {
         case LLM_ARCH_QWEN2VL:
         case LLM_ARCH_QWEN3:
         case LLM_ARCH_QWEN3VL:
+        case LLM_ARCH_QWEN35:
         case LLM_ARCH_PHI3:
         case LLM_ARCH_GEMMA3:
         case LLM_ARCH_GEMMA3N:

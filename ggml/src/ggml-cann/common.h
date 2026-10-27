@@ -723,6 +723,7 @@ struct ggml_cann_tensor_cache {
 
     void *  cache = nullptr;
     int64_t size  = 0;
+    ggml_type dtype = GGML_TYPE_COUNT;
 };
 
 /**
