@@ -104,7 +104,7 @@ bool ggml_cann_weight_layout_enabled() {
 }
 
 bool ggml_cann_is_weight_layout_candidate(const ggml_tensor * tensor) {
-    if (!ggml_cann_weight_layout_enabled() || tensor->type == GGML_TYPE_BF16 ||
+    if (!ggml_cann_weight_layout_enabled() || tensor->type != GGML_TYPE_F16 ||
         !ggml_is_contiguous(tensor)) {
         return false;
     }

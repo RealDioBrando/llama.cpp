@@ -8,13 +8,29 @@
 #include <aclnnop/aclnn_cast.h>
 #include <aclnnop/aclnn_moe_init_routing_v2.h>
 #include <aclnnop/aclnn_moe_token_unpermute.h>
+#include <aclnnop/aclnn_quant_grouped_matmul_dequant.h>
+#include <aclnnop/aclnn_quant_grouped_matmul_dequant_weight_nz.h>
 
 #include <vector>
 #include <cstring>
-
 static bool is_down_expert_weight(const ggml_tensor * weight) {
     const char * name = ggml_get_name(weight);
     return name != nullptr && strstr(name, "ffn_down_exps.weight") != nullptr;
+}
+
+static acl_tensor_ptr make_direct_tensor(void * data,
+                                         const int64_t * shape,
+                                         const int64_t * strides,
+                                         int64_t dims,
+                                         aclDataType data_type,
+                                         aclFormat format = ACL_FORMAT_ND) {
+    int64_t storage_shape = 1;
+    for (int64_t i = 0; i < dims; ++i) {
+        storage_shape *= shape[i];
+    }
+    aclTensor * tensor = aclCreateTensor(shape, static_cast<uint64_t>(dims), data_type, strides, 0, format,
+                                         &storage_shape, 1, data);
+    return acl_tensor_ptr(tensor);
 }
 
 bool ggml_cann_mul_mat_id_grouped_supported(const ggml_tensor * dst) {
@@ -22,6 +38,19 @@ bool ggml_cann_mul_mat_id_grouped_supported(const ggml_tensor * dst) {
     const ggml_tensor * input  = dst->src[1];
     const ggml_tensor * ids    = dst->src[2];
     const bool down_expert = is_down_expert_weight(weight);
+
+    if (weight->type == GGML_TYPE_W8A8) {
+        return ggml_cann_w8a8_a8_enabled() &&
+               ggml_cann_w8a8_is_expert(weight) &&
+               weight->ne[0] % 16 == 0 && weight->ne[1] % 16 == 0 &&
+               weight->ne[3] == 1 &&
+               (input->type == GGML_TYPE_F16 || input->type == GGML_TYPE_F32) &&
+               input->ne[3] == 1 && ids->type == GGML_TYPE_I32 &&
+               ((input->ne[1] == 1 && input->ne[2] == ids->ne[1]) ||
+                (down_expert && input->ne[1] == ids->ne[0] && input->ne[2] == ids->ne[1])) &&
+               ggml_is_contiguous(weight) && ggml_is_contiguous(input) &&
+               ids->nb[0] == sizeof(int32_t);
+    }
 
     return weight->type == GGML_TYPE_F16 && weight->ne[3] == 1 &&
            input->type == GGML_TYPE_F32 && input->ne[3] == 1 &&
@@ -50,14 +79,17 @@ void ggml_cann_mul_mat_id_grouped(ggml_backend_cann_context & ctx, ggml_tensor *
 
     GGML_ASSERT(ggml_cann_mul_mat_id_grouped_supported(dst));
 
-    ggml_cann_pool_alloc input_f16_alloc(ctx.pool(), n_embd * x_rows * sizeof(uint16_t));
-    {
+    ggml_cann_pool_alloc input_f16_alloc;
+    void * input_f16_data = input->data;
+    if (input->type != GGML_TYPE_F16) {
+        input_f16_alloc.alloc(ctx.pool(), static_cast<size_t>(n_embd * x_rows) * sizeof(uint16_t));
+        input_f16_data = input_f16_alloc.get();
         int64_t x_ne[2]     = { n_embd, x_rows };
         size_t  x_f32_nb[2] = { sizeof(float), n_embd * sizeof(float) };
         size_t  x_f16_nb[2] = { sizeof(uint16_t), n_embd * sizeof(uint16_t) };
         acl_tensor_ptr acl_src = ggml_cann_create_tensor(input->data, ACL_FLOAT, sizeof(float),
                                                          x_ne, x_f32_nb, 2);
-        acl_tensor_ptr acl_dst = ggml_cann_create_tensor(input_f16_alloc.get(), ACL_FLOAT16,
+        acl_tensor_ptr acl_dst = ggml_cann_create_tensor(input_f16_data, ACL_FLOAT16,
                                                          sizeof(uint16_t), x_ne, x_f16_nb, 2);
         GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_src.get(), ACL_FLOAT16, acl_dst.get());
     }
@@ -77,7 +109,7 @@ void ggml_cann_mul_mat_id_grouped(ggml_backend_cann_context & ctx, ggml_tensor *
 
     int64_t x_ne[2]     = { n_embd, x_rows };
     size_t  x_f16_nb[2] = { sizeof(uint16_t), n_embd * sizeof(uint16_t) };
-    acl_tensor_ptr acl_x = ggml_cann_create_tensor(input_f16_alloc.get(), ACL_FLOAT16,
+    acl_tensor_ptr acl_x = ggml_cann_create_tensor(input_f16_data, ACL_FLOAT16,
                                                    sizeof(uint16_t), x_ne, x_f16_nb, 2);
     acl_tensor_ptr acl_routing_ids;
     ggml_cann_pool_alloc ids_cont_alloc;
@@ -167,15 +199,42 @@ void ggml_cann_mul_mat_id_grouped(ggml_backend_cann_context & ctx, ggml_tensor *
                                                             weight_format);
     acl_tensor_ptr acl_gmm_out = ggml_cann_create_tensor(gmm_out_alloc.get(), ACL_FLOAT16,
                                                          sizeof(uint16_t), gmm_out_ne, gmm_out_nb, 2);
+    if (weight->type == GGML_TYPE_W8A8) {
+        const bool use_nz =
+            parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("off"));
+        int64_t direct_scale_ne[2] = { n_exp, n_ff };
+        int64_t direct_scale_nb[2] = { n_ff, 1 };
+        acl_tensor_ptr acl_weight_scale = make_direct_tensor(
+            (char *) weight->data + ggml_cann_w8a8_expert_scale_offset(weight),
+            direct_scale_ne, direct_scale_nb, 2, ACL_FLOAT);
+        char quant_mode[] = "pertoken";
+        if (use_nz) {
+            GGML_ASSERT(weight->extra != nullptr);
+            aclTensor * transformed_weight = (aclTensor *) weight->extra;
+            GGML_CANN_CALL_ACLNN_OP(ctx, QuantGroupedMatmulDequantWeightNZ,
+                                    acl_gmm_in.get(), transformed_weight, acl_weight_scale.get(),
+                                    acl_cumsum_i64.get(), nullptr, nullptr, nullptr, nullptr,
+                                    quant_mode, true, acl_gmm_out.get());
+        } else {
+            int64_t direct_weight_ne[3] = { n_exp, n_ff, n_embd };
+            int64_t direct_weight_nb[3] = { n_ff * n_embd, n_embd, 1 };
+            acl_tensor_ptr acl_quant_weight =
+                make_direct_tensor(weight->data, direct_weight_ne, direct_weight_nb, 3, ACL_INT8);
+            GGML_CANN_CALL_ACLNN_OP(ctx, QuantGroupedMatmulDequant,
+                                    acl_gmm_in.get(), acl_quant_weight.get(), acl_weight_scale.get(),
+                                    acl_cumsum_i64.get(), nullptr, nullptr, nullptr, nullptr,
+                                    quant_mode, true, acl_gmm_out.get());
+        }
+    } else {
+        acl_tensor_list_ptr acl_x_list = ggml_cann_create_tensor_list(std::move(acl_gmm_in));
+        acl_tensor_list_ptr acl_w_list = ggml_cann_create_tensor_list(std::move(acl_gmm_weight));
+        acl_tensor_list_ptr acl_out_list = ggml_cann_create_tensor_list(std::move(acl_gmm_out));
 
-    acl_tensor_list_ptr acl_x_list = ggml_cann_create_tensor_list(std::move(acl_gmm_in));
-    acl_tensor_list_ptr acl_w_list = ggml_cann_create_tensor_list(std::move(acl_gmm_weight));
-    acl_tensor_list_ptr acl_out_list = ggml_cann_create_tensor_list(std::move(acl_gmm_out));
-
-    GGML_CANN_CALL_ACLNN_OP(ctx, GroupedMatmulV4, acl_x_list.get(), acl_w_list.get(), nullptr,
-                            nullptr, nullptr, nullptr, nullptr, nullptr, acl_cumsum_i64.get(),
-                            nullptr, nullptr, nullptr, 2, 0, 0, 0, acl_out_list.get(),
-                            nullptr, nullptr);
+        GGML_CANN_CALL_ACLNN_OP(ctx, GroupedMatmulV4, acl_x_list.get(), acl_w_list.get(), nullptr,
+                                nullptr, nullptr, nullptr, nullptr, nullptr, acl_cumsum_i64.get(),
+                                nullptr, nullptr, nullptr, 2, 0, 0, 0, acl_out_list.get(),
+                                nullptr, nullptr);
+    }
 
     ggml_cann_pool_alloc out_f16_alloc(ctx.pool(), ggml_nelements(dst) * sizeof(uint16_t));
     int64_t out2d_ne[2] = { n_ff, n_rows };

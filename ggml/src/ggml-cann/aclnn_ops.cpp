@@ -4248,8 +4248,8 @@ static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context & ctx, ggml_ten
     // Calculate element size for quantized weights
     const float weight_elem_size =
         (type == GGML_TYPE_Q4_0) ? 0.5f :
-        (type == GGML_TYPE_Q8_0) ? 1.0f :
-                                   (GGML_ABORT("MUL_MAT_ID only supports Q4_0 and Q8_0"), 0.0f);
+        (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_W8A8) ? 1.0f :
+                                   (GGML_ABORT("MUL_MAT_ID only supports Q4_0, Q8_0, and W8A8"), 0.0f);
 
     // Calculate scale offset in memory
     const size_t weight_size     = src0->ne[0] * src0->ne[1] * src0->ne[2] * weight_elem_size;
@@ -4368,9 +4368,22 @@ static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context & ctx, ggml_ten
                 ggml_cann_create_tensor(selected_weight_buffer, ggml_cann_type_mapping(type), weight_elem_size,
                                         weight_view_ne, weight_view_nb, 2, ACL_FORMAT_ND, weight_view_offset);
 
-            // Create scale view for current expert: [D, M, K] -> [M, D]
-            int64_t      scale_view_ne[2]  = { weight_m, scale_d };
-            size_t       scale_view_nb[2]  = { selected_scale_nb[1], selected_scale_nb[0] };
+            // Create scale view for current expert.
+            // W8A8 uses one row-constant scale per output channel, so select the first
+            // repeated scale along the block dimension and run V2 in per-channel mode.
+            int64_t      scale_view_ne[2];
+            size_t       scale_view_nb[2];
+            if (type == GGML_TYPE_W8A8) {
+                scale_view_ne[0] = weight_m;
+                scale_view_ne[1] = 1;
+                scale_view_nb[0] = scale_elem_size;
+                scale_view_nb[1] = static_cast<size_t>(scale_d) * scale_elem_size;
+            } else {
+                scale_view_ne[0] = weight_m;
+                scale_view_ne[1] = scale_d;
+                scale_view_nb[0] = selected_scale_nb[1];
+                scale_view_nb[1] = selected_scale_nb[0];
+            }
             const size_t scale_view_offset = expert_idx * selected_scale_nb[2];
 
             acl_tensor_ptr scale_view =
@@ -4392,8 +4405,9 @@ static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context & ctx, ggml_ten
                                                                    output_nb, 2, ACL_FORMAT_ND, output_offset);
 
             // Perform quantized matrix multiplication
+            const int64_t antiquant_group_size = (type == GGML_TYPE_W8A8) ? 0 : group_size;
             GGML_CANN_CALL_ACLNN_OP(ctx, WeightQuantBatchMatmulV2, input_tensor.get(), weight_view.get(),
-                                    scale_view.get(), nullptr, nullptr, nullptr, nullptr, group_size,
+                                    scale_view.get(), nullptr, nullptr, nullptr, nullptr, antiquant_group_size,
                                     output_tensor.get());
         }
     }
@@ -4426,6 +4440,7 @@ void ggml_cann_mul_mat_id(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
             break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_W8A8:
             ggml_cann_mul_mat_id_quant(ctx, dst);
             break;
         default:

@@ -120,11 +120,23 @@ static inline size_t ggml_cann_w8a8_hp_elements(const ggml_tensor * tensor) {
     return static_cast<size_t>(k1) * static_cast<size_t>(n1) * 16 * 32;
 }
 
+size_t ggml_cann_w8a8_expert_transformed_size(const ggml_tensor * tensor);
+
 /** @brief Byte offset of the resident FP32 per-channel scale array. */
 static inline size_t ggml_cann_w8a8_scale_offset(const ggml_tensor * tensor) {
     return GGML_PAD(ggml_cann_w8a8_hp_elements(tensor), 128);
 }
 
+/** @brief Byte offset of the resident FP32 per-expert/per-channel scale plane. */
+static inline size_t ggml_cann_w8a8_expert_scale_offset(const ggml_tensor * tensor) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_W8A8);
+    return GGML_PAD(ggml_cann_w8a8_expert_transformed_size(tensor), 128);
+}
+
+/** @brief Whether the tensor is a 3D W8A8 expert weight. */
+static inline bool ggml_cann_w8a8_is_expert(const ggml_tensor * tensor) {
+    return tensor->type == GGML_TYPE_W8A8 && tensor->ne[2] > 1 && tensor->ne[3] == 1;
+}
 /** @brief Whether the DynamicQuant + QuantMatmulV5 A8 path is selected. */
 static inline bool ggml_cann_w8a8_a8_enabled() {
     static const bool enabled =
