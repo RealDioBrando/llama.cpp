@@ -67,12 +67,6 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
-// debug helper: env LLAMA_DEBUG_REUSE=1 prints why graph reuse fails
-static bool llama_debug_reuse() {
-    static const bool enabled = getenv("LLAMA_DEBUG_REUSE") != nullptr;
-    return enabled;
-}
-
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
@@ -347,14 +341,6 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->s_copy(i);
-        }
-
-        if (getenv("GGML_DEBUG_RS")) {
-            fprintf(stderr, "[RSDBG] n_rs=%d head=%u s_copy=[", (int) n_rs, mctx->get_head());
-            for (uint32_t i = 0; i < n_rs && i < 64; ++i) {
-                fprintf(stderr, "%d%s", data[i], (i + 1 < n_rs && i + 1 < 64) ? "," : "");
-            }
-            fprintf(stderr, "%s]\n", n_rs > 64 ? ",..." : "");
         }
     }
 }
@@ -1211,14 +1197,6 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
 
-    if (!res && llama_debug_reuse()) {
-        fprintf(stderr, "[REUSE-FAIL] hybrid: k_idxs=%d mask=%d s_copy=%d head=%d->%d\n",
-            (int)(inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens),
-            (int)can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams),
-            (int)(inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs()),
-            (int)inp_rs->head, (int)mctx->get_recr()->get_head());
-    }
-
     return res;
 }
 
@@ -1513,10 +1491,6 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
         }
-        if (llama_debug_reuse()) {
-            fprintf(stderr, "[REUSE-FAIL] allow_reuse: n_tokens %d->%d\n",
-                (int)this->params.ubatch.n_tokens, (int)params.ubatch.n_tokens);
-        }
         return false;
     }
 
@@ -1526,16 +1500,9 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
 
-    int inp_idx = 0;
     for (auto & input : inputs) {
         const bool cur = input->can_reuse(params);
-
-        if (!cur && llama_debug_reuse()) {
-            fprintf(stderr, "[REUSE-FAIL] input[%d] can_reuse=false\n", inp_idx);
-        }
-
         res = res && cur;
-        inp_idx++;
     }
 
     if (debug > 0) {

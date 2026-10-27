@@ -3236,7 +3236,6 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
                 ggml_tensor * node = cgraph->nodes[i];
                 if (node->op == GGML_OP_GATED_DELTA_NET) {
                     ggml_cann_gdn_cache_preload(*cann_ctx, node);
-                    break;
                 }
             }
 
@@ -3560,10 +3559,10 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             return true;
         case GGML_OP_GATED_DELTA_NET:
             {
-                // fused path via the custom V310 kernels: decode is a single
+                // fused path via the standard 310P APIs: decode is a single
                 // recurrent call, prefill is a single chunk call (8-token block
                 // loop as fallback)
-                if (!ggml_cann_gdn_v310_available()) {
+                if (!ggml_cann_gdn_available()) {
                     return false;
                 }
                 const ggml_tensor * q = op->src[0];

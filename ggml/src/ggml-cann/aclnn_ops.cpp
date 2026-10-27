@@ -108,6 +108,7 @@
 #define GGML_COMMON_DECL_C
 
 #include "../ggml-common.h"
+#include "gdn_route.h"
 
 void bcast_shape(ggml_tensor *    src0,
                  ggml_tensor *    src1,
@@ -5340,11 +5341,8 @@ void ggml_cann_gated_linear_attn(ggml_backend_cann_context & ctx, ggml_tensor * 
 
 namespace {
 
-// aclnnRecurrentGatedDeltaRuleV310 / aclnnChunkGatedDeltaRuleV310 ship in the
-// custom op package (libcust_opapi.so) instead of the toolkit's libopapi.so,
-// so resolve them at runtime. The dlopen handle leaks on purpose: the resolved
-// symbols must stay valid for the process lifetime.
-struct gdn_v310_api {
+// Resolve GDN from the custom package. Keep the accepted handle for the process lifetime.
+struct gdn_api {
     using get_workspace_size_t = aclnnStatus (*)(const aclTensor *, const aclTensor *, const aclTensor *,
                                                  const aclTensor *, aclTensor *, const aclTensor *,
                                                  const aclTensor *, const aclTensor *, const aclTensor *,
@@ -5355,29 +5353,29 @@ struct gdn_v310_api {
                                                        const aclTensor *, const aclTensor *, const aclTensor *,
                                                        const aclTensor *, float, const aclTensor *,
                                                        const aclTensor *, uint64_t *, aclOpExecutor **);
-
     get_workspace_size_t       get_workspace_size       = nullptr;
     run_t                      run                      = nullptr;
     chunk_get_workspace_size_t chunk_get_workspace_size = nullptr;
-    // The chunk executor must run through the chunk entry point. Both run
-    // functions forward to CommonOpExecutorRun today, but the binding must
-    // not rely on that - op-specific logic in either run would silently
-    // break the other path (wrong DFX attribution at minimum).
+    // Run each executor through its matching operator entry point.
     run_t                      chunk_run                = nullptr;
+    // Library accepted for all GDN bindings.
+    std::string                 lib_path;
+    bool                        standard_odd_heads = false;
 };
 
-const gdn_v310_api & gdn_v310_symbols() {
-    static gdn_v310_api api = [] {
-        gdn_v310_api            result;
+const gdn_api & gdn_symbols() {
+    static gdn_api api = [] {
+        gdn_api result;
+#ifdef ASCEND_310P
         std::vector<std::string> candidates;
         if (const char * opp_path = getenv("ASCEND_CUSTOM_OPP_PATH")) {
             const std::string paths(opp_path);
-            size_t            pos = 0;
+            size_t pos = 0;
             while (pos < paths.size()) {
-                size_t         end  = paths.find(':', pos);
-                const size_t   last = (end == std::string::npos) ? paths.size() : end;
+                const size_t end = paths.find(':', pos);
+                const size_t last = end == std::string::npos ? paths.size() : end;
                 const std::string entry = paths.substr(pos, last - pos);
-                if (!entry.empty()) {
+                if (!entry.empty() && entry[0] == '/') {
                     candidates.push_back(entry + "/op_api/lib/libcust_opapi.so");
                 }
                 if (end == std::string::npos) {
@@ -5386,33 +5384,66 @@ const gdn_v310_api & gdn_v310_symbols() {
                 pos = end + 1;
             }
         }
-        candidates.push_back("libcust_opapi.so");
         for (const auto & lib : candidates) {
             void * handle = dlopen(lib.c_str(), RTLD_NOW | RTLD_LOCAL);
             if (handle == nullptr) {
                 continue;
             }
-            auto get_ws = (gdn_v310_api::get_workspace_size_t) dlsym(
-                handle, "aclnnRecurrentGatedDeltaRuleV310GetWorkspaceSize");
-            auto run    = (gdn_v310_api::run_t) dlsym(handle, "aclnnRecurrentGatedDeltaRuleV310");
-            if (get_ws != nullptr && run != nullptr) {
-                result.get_workspace_size = get_ws;
-                result.run                = run;
-                result.chunk_get_workspace_size = (gdn_v310_api::chunk_get_workspace_size_t) dlsym(
-                    handle, "aclnnChunkGatedDeltaRuleV310GetWorkspaceSize");
-                // Resolve the chunk run whenever the chunk GetWS exists; the
-                // chunk branch requires BOTH symbols.
-                if (result.chunk_get_workspace_size != nullptr) {
-                    result.chunk_run = (gdn_v310_api::run_t) dlsym(
-                        handle, "aclnnChunkGatedDeltaRuleV310");
+            // dlsym can find dependency exports. Accept only this file's own symbols.
+            auto resolve = [&](const char * name) -> void * {
+                void * symbol = dlsym(handle, name);
+                Dl_info info = {};
+                if (symbol == nullptr || dladdr(symbol, &info) == 0 || info.dli_fname == nullptr) {
+                    return nullptr;
                 }
-                break;
+                char * expected = realpath(lib.c_str(), nullptr);
+                char * owner = realpath(info.dli_fname, nullptr);
+                const bool matches = expected && owner && strcmp(expected, owner) == 0;
+                free(expected);
+                free(owner);
+                return matches ? symbol : nullptr;
+            };
+            auto get_ws = (gdn_api::get_workspace_size_t) resolve("aclnnRecurrentGatedDeltaRuleGetWorkspaceSize");
+            auto run = (gdn_api::run_t) resolve("aclnnRecurrentGatedDeltaRule");
+            auto chunk_get_ws = (gdn_api::chunk_get_workspace_size_t) resolve("aclnnChunkGatedDeltaRuleGetWorkspaceSize");
+            auto chunk_run = (gdn_api::run_t) resolve("aclnnChunkGatedDeltaRule");
+            if (!get_ws || !run || !chunk_get_ws || !chunk_run) {
+                const bool partial = get_ws || run || chunk_get_ws || chunk_run;
+                dlclose(handle);
+                if (partial) {
+                    GGML_LOG_WARN("ggml_cann: incomplete standard GDN symbol pairs in %s; rejecting package\n", lib.c_str());
+                    return result;
+                }
+                continue;
             }
+            result.get_workspace_size = get_ws;
+            result.run = run;
+            result.chunk_get_workspace_size = chunk_get_ws;
+            result.chunk_run = chunk_run;
+            result.lib_path = lib;
+            // Older standard packages reject odd heads; opt-in asserts package support.
+            result.standard_odd_heads =
+                parse_bool(get_env_as_lowercase("GGML_CANN_GDN_STANDARD_ODD_HEADS").value_or("0"));
+            if (result.standard_odd_heads) {
+                GGML_LOG_INFO("ggml_cann: GDN standard odd-head capability explicitly enabled lib=%s\n", lib.c_str());
+            }
+            if (parse_bool(get_env_as_lowercase("GGML_CANN_GDN_PROBE").value_or("0"))) {
+                for (const char * name : { "aclnnRecurrentGatedDeltaRuleGetWorkspaceSize", "aclnnRecurrentGatedDeltaRule",
+                                          "aclnnChunkGatedDeltaRuleGetWorkspaceSize", "aclnnChunkGatedDeltaRule" }) {
+                    Dl_info info = {};
+                    void * symbol = resolve(name);
+                    if (symbol && dladdr(symbol, &info)) {
+                        GGML_LOG_INFO("ggml_cann: GDN binding kind=standard symbol=%s owner=%s\n", name, info.dli_fname);
+                    }
+                }
+            }
+            break;
         }
         if (result.get_workspace_size == nullptr) {
-            GGML_LOG_WARN("ggml_cann: RecurrentGatedDeltaRuleV310 not found in libcust_opapi.so, "
+            GGML_LOG_WARN("ggml_cann: standard 310P GDN package not found in ASCEND_CUSTOM_OPP_PATH, "
                           "gated delta net falls back to CPU\n");
         }
+#endif
         return result;
     }();
     return api;
@@ -5454,12 +5485,8 @@ void gdn_cast_strided_f16(ggml_backend_cann_context & ctx, ggml_tensor * src, vo
 
 } // namespace
 
-bool ggml_cann_gdn_v310_available() {
-    return gdn_v310_symbols().get_workspace_size != nullptr;
-}
-
-bool ggml_cann_gdn_chunk_v310_available() {
-    return gdn_v310_symbols().chunk_get_workspace_size != nullptr;
+bool ggml_cann_gdn_available() {
+    return gdn_symbols().get_workspace_size != nullptr;
 }
 
 void ggml_cann_gdn_cache_preload(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
@@ -5483,15 +5510,10 @@ static bool gdn_prefill_use_chunk() {
     return use_chunk;
 }
 
-// Shape-eligibility mirror of the chunk host contract
-// (chunk_gated_delta_rule_v310_tiling.cpp CheckDerivedDimConstraints):
-// the backend accepts up to 256 heads but the chunk op only declares 64;
-// out-of-contract shapes must fall back to the recurrent loop, not fail the
-// graph at GetWorkspaceSize.
-static bool gdn_chunk_eligible(int64_t nk, int64_t nv, int64_t dk, int64_t dv) {
-    return nk > 0 && nv > 0 && nk <= 64 && nv <= 64 &&
-           dk > 0 && dv > 0 && dk <= 128 && dv <= 128 &&
-           dk % 16 == 0 && dv % 16 == 0 && nv % nk == 0;
+// Disabled by default. llama-bench also needs --verbose to show probe logs.
+static bool gdn_probe_enabled() {
+    static bool enabled = parse_bool(get_env_as_lowercase("GGML_CANN_GDN_PROBE").value_or("0"));
+    return enabled;
 }
 
 void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
@@ -5513,7 +5535,7 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
     const int64_t v_elems     = T * B * nv * dv;
     const int64_t state_elems = B * nv * dv * dk;
 
-    const gdn_v310_api & api = gdn_v310_symbols();
+    const gdn_api & api = gdn_symbols();
     GGML_ASSERT(api.get_workspace_size != nullptr);
 
     // fp16 staging buffers, cast back to f32 into the packed dst
@@ -5567,6 +5589,10 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
                        aclTensor * seq_t, aclTensor * idx_t, aclTensor * g_t, aclTensor * out_t) {
         uint64_t        workspace_size = 0;
         aclOpExecutor * executor       = nullptr;
+        if (gdn_probe_enabled()) {
+            GGML_LOG_INFO("ggml_cann: GDN invoke=%s lib=%s\n",
+                          "aclnnRecurrentGatedDeltaRule", api.lib_path.c_str());
+        }
         ACL_CHECK(api.get_workspace_size(q_t, k_t, v_t, beta_t, state_t, seq_t, idx_t, g_t, nullptr, nullptr, scale,
                                          out_t, &workspace_size, &executor));
         void * workspace_addr = nullptr;
@@ -5592,6 +5618,16 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
     // updates state16 in place, the chunk op writes a separate output)
     void * state_final = state16_alloc.get();
 
+    // Select a supported path before submission; ACLNN errors remain fatal.
+    const bool gdn_chunk_syms = api.chunk_get_workspace_size != nullptr && api.chunk_run != nullptr;
+    const gdn_route::PrefillRoute gdn_route_res = gdn_route::prefill_route(
+        T, B, nk, nv, dk, dv, gdn_prefill_use_chunk(), gdn_chunk_syms, api.standard_odd_heads);
+    if (gdn_probe_enabled()) {
+        GGML_LOG_INFO("ggml_cann: GDN prefill route=%s T=%lld B=%lld NK=%lld NV=%lld DK=%lld DV=%lld\n",
+                      gdn_route::route_name(gdn_route_res), (long long) T, (long long) B,
+                      (long long) nk, (long long) nv, (long long) dk, (long long) dv);
+    }
+
     if (T == 1) {
         // decode: all B sequences (one token each) in a single call
         acl_tensor_ptr acl_q16     = ggml_cann_create_tensor(q16_alloc.get(), ACL_FLOAT16, sizeof(uint16_t), ne_qk, nb_qk, 3);
@@ -5611,17 +5647,13 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
 
         call_op(acl_q16.get(), acl_k16.get(), acl_v16.get(), acl_beta16.get(), acl_state16.get(), acl_seq_lens.get(),
                 acl_state_indices.get(), acl_g.get(), acl_out16.get());
-    } else if (api.chunk_get_workspace_size != nullptr && api.chunk_run != nullptr && gdn_prefill_use_chunk() &&
-               gdn_chunk_eligible(nk, nv, dk, dv)) {
+    } else if (gdn_route_res == gdn_route::PrefillRoute::kChunkStandard) {
         // prefill via the chunk kernel: one call for the whole batch. The kernel
         // splits the T*B staged tokens by seq_lens ([T]*B, batch-major order),
         // threads the state across its internal chunk groups and writes the
         // final state to a separate output tensor.
-        // The branch requires BOTH chunk symbols (GetWS + run) and the shape
-        // eligibility mirror of the chunk host contract (NK/NV<=64, DK/DV<=128
-        // multiples of 16, NV%NK==0) - out-of-contract shapes (65..256 heads
-        // pass the backend check but would fail inside the op) fall through to
-        // the recurrent loop below instead of hard-failing the graph.
+        // The route checks the backend's supported shapes and package capabilities.
+        // Other backend-supported shapes use the recurrent loop below.
         acl_tensor_ptr acl_q16       = ggml_cann_create_tensor(q16_alloc.get(), ACL_FLOAT16, sizeof(uint16_t), ne_qk, nb_qk, 3);
         acl_tensor_ptr acl_k16       = ggml_cann_create_tensor(k16_alloc.get(), ACL_FLOAT16, sizeof(uint16_t), ne_qk, nb_qk, 3);
         acl_tensor_ptr acl_v16       = ggml_cann_create_tensor(v16_alloc.get(), ACL_FLOAT16, sizeof(uint16_t), ne_v, nb_v, 3);
@@ -5646,6 +5678,10 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
 
         uint64_t        workspace_size = 0;
         aclOpExecutor * executor       = nullptr;
+        if (gdn_probe_enabled()) {
+            GGML_LOG_INFO("ggml_cann: GDN invoke=%s lib=%s\n",
+                          "aclnnChunkGatedDeltaRule", api.lib_path.c_str());
+        }
         ACL_CHECK(api.chunk_get_workspace_size(acl_q16.get(), acl_k16.get(), acl_v16.get(), acl_beta16.get(),
                                                acl_state16.get(), acl_seq_lens.get(), acl_g.get(), scale,
                                                acl_out16.get(), acl_state_out16.get(), &workspace_size, &executor));

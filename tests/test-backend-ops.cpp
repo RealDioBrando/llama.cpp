@@ -10887,6 +10887,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // 16h/D128 production shape (Qwen3.5-2B GDN layers). The harness
     // l2-normalizes q/k like the production domain. GQA (v_repeat=2) stays on
     // the CPU reference by the backend head-mapping check.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 128, 1));  // aligned prefill
+    // 142: equal odd heads, non-chunk-aligned length, and multi-sequence.
+    // Keep the existing CPU reference, state comparison and tolerances.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 3, 64, 65, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 63, 128, 2, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 3, 128, 65, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1, 1));    // 16h TG (decode)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64, 1));   // 16h PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1));  // 16h PP-512
