@@ -365,15 +365,17 @@ void server_scheduler_paged::update() {
             slot.state = SLOT_STATE_GENERATING;
         }
 
-        if (!sample_now) {
-            // mid-prefill chunk: no logits, no feedback
+        // speculative verify: the batch holds 1 + n_draft rows for this seq,
+        // all with logits; sample_and_accept_n walks them. checked before the
+        // sample_now skip, because a verify batch has len = 1 + n_draft > 1
+        // and would be mistaken for a mid-prefill chunk otherwise
+        if (slot.can_speculate() && !slot.spec_draft.empty()) {
+            verify_slot(slot, off, len, fb_tok, fb);
             continue;
         }
 
-        // speculative verify: the batch holds 1 + n_draft rows for this seq,
-        // all with logits; sample_and_accept_n walks them
-        if (slot.can_speculate() && !slot.spec_draft.empty()) {
-            verify_slot(slot, off, len, fb_tok, fb);
+        if (!sample_now) {
+            // mid-prefill chunk: no logits, no feedback
             continue;
         }
 
@@ -441,6 +443,13 @@ void server_scheduler_paged::update() {
     host.metrics_queue_prompt(n_prompt_tokens);
 
     llama_paged_scheduler_update(sched, &paged_batch, fb.data(), (int32_t) fb.size());
+
+    // draft rollbacks run after update(), which is what advanced the
+    // scheduler n_past over the verify batch rows
+    for (const auto & t : spec_pending_truncates) {
+        llama_paged_scheduler_truncate(sched, t.first, t.second);
+    }
+    spec_pending_truncates.clear();
 }
 
 void server_scheduler_paged::fork_children(server_slot & parent, int32_t tok_idx,
@@ -546,9 +555,9 @@ void server_scheduler_paged::prepare_drafts() {
             slot.spec_draft.clear();
             continue;
         }
-        // tentatively extend the prompt state, mirroring
-        // handle_last_sampled_token()
-        slot.prompt.tokens.push_back(slot.sampled);
+        // tentatively extend the prompt state with the draft tokens; the
+        // pending sampled token is already the last entry of prompt.tokens
+        // (pushed by the plain path or by verify_slot)
         slot.prompt.tokens.insert(slot.spec_draft);
     }
 }
@@ -583,12 +592,15 @@ bool server_scheduler_paged::verify_slot(server_slot & slot, int32_t off, int32_
     // the bonus token becomes the new pending input
     slot.prompt.tokens.keep_first(slot.prompt.tokens.size() - n_draft);
     slot.prompt.tokens.insert({accepted.begin(), accepted.end() - 1});
+    slot.prompt.tokens.push_back(accepted.back());
     slot.sampled = accepted.back();
 
     if (k < n_draft) {
         // rejected draft rows are still in the KV: roll back to the verified
-        // end, which is exactly the fixed-up prompt length
-        llama_paged_scheduler_truncate(sched, slot.id, (int32_t) slot.prompt.tokens.size());
+        // end; the trailing bonus is pending, not yet written to the KV.
+        // deferred: the scheduler n_past advances over this verify batch only
+        // in the update call below, so the rollback cannot run yet
+        spec_pending_truncates.emplace_back(slot.id, (int32_t) slot.prompt.tokens.size() - 1);
     }
 
     // emit the accepted tokens through the regular stop/streaming pipeline
