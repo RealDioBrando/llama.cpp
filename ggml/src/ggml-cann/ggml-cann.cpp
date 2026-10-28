@@ -2635,6 +2635,61 @@ ggml_backend_buffer_type_t ggml_backend_cann_host_buffer_type() {
  * stored.
  * @return true if the computation was successful; false otherwise.
  */
+static void ggml_cann_mul_mat_id_compare(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+    static const std::string compare_layer =
+        get_env_as_lowercase("GGML_CANN_MOE_COMPARE_LAYER").value_or("");
+    if (!compare_layer.empty()) {
+        const std::string prefix = "blk." + compare_layer + ".";
+        const char * weight_name = ggml_get_name(dst->src[0]);
+        if (weight_name == nullptr || strstr(weight_name, prefix.c_str()) == nullptr) {
+            ggml_cann_mul_mat_id(ctx, dst);
+            return;
+        }
+    }
+
+    const size_t bytes = ggml_nbytes(dst);
+    std::vector<uint8_t> reference(bytes);
+    std::vector<uint8_t> actual(bytes);
+
+    ggml_cann_mul_mat_id(ctx, dst);
+    ACL_CHECK(aclrtMemcpy(reference.data(), bytes, dst->data, bytes, ACL_MEMCPY_DEVICE_TO_HOST));
+    ggml_cann_mul_mat_id_grouped(ctx, dst);
+    ACL_CHECK(aclrtMemcpy(actual.data(), bytes, dst->data, bytes, ACL_MEMCPY_DEVICE_TO_HOST));
+
+    if (dst->type == GGML_TYPE_F32) {
+        const size_t count = bytes / sizeof(float);
+        const float * ref = reinterpret_cast<const float *>(reference.data());
+        const float * out = reinterpret_cast<const float *>(actual.data());
+        float max_abs = 0.0f;
+        float max_rel = 0.0f;
+        size_t failures = 0;
+        size_t first_diff = SIZE_MAX;
+        for (size_t i = 0; i < count; ++i) {
+            const float abs_err = std::fabs(ref[i] - out[i]);
+            const float rel_err = abs_err / std::max(std::fabs(ref[i]), 1.0f);
+            max_abs = std::max(max_abs, abs_err);
+            max_rel = std::max(max_rel, rel_err);
+            if (abs_err > 1.0e-4f || rel_err > 1.0e-3f) {
+                ++failures;
+                if (first_diff == SIZE_MAX) first_diff = i;
+            }
+        }
+        fprintf(stderr,
+                "cann moe compare: dst=%s weight=%s ne=[%lld,%lld,%lld,%lld] elements=%zu "
+                "max_abs=%.6e max_rel=%.6e failures=%zu first_diff=%zu\n",
+                ggml_get_name(dst), ggml_get_name(dst->src[0]),
+                (long long) dst->ne[0], (long long) dst->ne[1],
+                (long long) dst->ne[2], (long long) dst->ne[3],
+                count, max_abs, max_rel, failures,
+                first_diff == SIZE_MAX ? 0 : first_diff);
+    } else {
+        fprintf(stderr, "cann moe compare: unsupported dst type=%s for numeric compare\n",
+                ggml_type_name(dst->type));
+    }
+
+    ACL_CHECK(aclrtMemcpy(dst->data, bytes, reference.data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE));
+}
+
 static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct ggml_tensor * dst) {
     static const bool op_debug = getenv("GGML_CANN_OP_DEBUG") != nullptr;
     static const bool op_timing = getenv("GGML_CANN_OP_TIMING") != nullptr;
@@ -2790,10 +2845,18 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
             ggml_cann_mul_mat(ctx, dst);
             break;
         case GGML_OP_MUL_MAT_ID:
+            if (std::getenv("GGML_CANN_MOE_DEBUG") != nullptr) {
+                fprintf(stderr, "MoE dispatch: dst=%s weight=%s type=%s\n", ggml_get_name(dst),
+                        ggml_get_name(dst->src[0]), ggml_type_name(dst->src[0]->type));
+            }
             if ((parse_bool(get_env_as_lowercase("GGML_CANN_MOE_GROUPED").value_or("off")) ||
                  (dst->src[0]->type == GGML_TYPE_W8A8 && ggml_cann_w8a8_moe_a8_enabled())) &&
                 ggml_cann_mul_mat_id_grouped_supported(dst)) {
-                ggml_cann_mul_mat_id_grouped(ctx, dst);
+                if (parse_bool(get_env_as_lowercase("GGML_CANN_MOE_COMPARE").value_or("off"))) {
+                    ggml_cann_mul_mat_id_compare(ctx, dst);
+                } else {
+                    ggml_cann_mul_mat_id_grouped(ctx, dst);
+                }
             } else {
                 ggml_cann_mul_mat_id(ctx, dst);
             }

@@ -51,7 +51,7 @@ bool ggml_cann_mul_mat_id_grouped_supported(const ggml_tensor * dst) {
     const bool down_expert = is_down_expert_weight(weight);
 
     if (weight->type == GGML_TYPE_W8A8) {
-        return ggml_cann_w8a8_moe_a8_enabled() &&
+        const bool supported = ggml_cann_w8a8_moe_a8_enabled() &&
                ggml_cann_w8a8_is_expert(weight) &&
                weight->ne[0] % 16 == 0 && weight->ne[1] % 16 == 0 &&
                weight->ne[3] == 1 &&
@@ -61,6 +61,20 @@ bool ggml_cann_mul_mat_id_grouped_supported(const ggml_tensor * dst) {
                 (down_expert && input->ne[1] == ids->ne[0] && input->ne[2] == ids->ne[1])) &&
                ggml_is_contiguous(weight) && ggml_is_contiguous(input) &&
                ids->nb[0] == sizeof(int32_t);
+        if (std::getenv("GGML_CANN_MOE_DEBUG") != nullptr) {
+            fprintf(stderr,
+                    "MoE support: dst=%s weight=%s a8=%d expert=%d w=[%lld,%lld,%lld,%lld] "
+                    "input=[%lld,%lld,%lld,%lld] type=%s ids=[%lld,%lld] ids_type=%s nb0=%zu "
+                    "weight_contig=%d input_contig=%d supported=%d\n",
+                    ggml_get_name(dst), ggml_get_name(weight), ggml_cann_w8a8_moe_a8_enabled(),
+                    ggml_cann_w8a8_is_expert(weight), (long long) weight->ne[0], (long long) weight->ne[1],
+                    (long long) weight->ne[2], (long long) weight->ne[3], (long long) input->ne[0],
+                    (long long) input->ne[1], (long long) input->ne[2], (long long) input->ne[3],
+                    ggml_type_name(input->type), (long long) ids->ne[0], (long long) ids->ne[1],
+                    ggml_type_name(ids->type), ids->nb[0], ggml_is_contiguous(weight),
+                    ggml_is_contiguous(input), supported);
+        }
+        return supported;
     }
 
     return weight->type == GGML_TYPE_F16 && weight->ne[3] == 1 &&
