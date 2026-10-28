@@ -781,10 +781,6 @@ std::unique_ptr<ggml_cann_pool> ggml_backend_cann_context::new_pool_for_device(i
     return std::unique_ptr<ggml_cann_pool>(new ggml_cann_pool_buf(device));
 }
 
-std::unique_ptr<ggml_cann_pool> ggml_backend_cann_context::new_matmul_input_pool_for_device(int device) {
-    return std::unique_ptr<ggml_cann_pool>(new ggml_cann_pool_buf_prio(device));
-}
-
 // cann buffer
 
 /**
@@ -2973,7 +2969,6 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                                             ggml_cgraph *               cgraph,
                                             bool                        use_cann_graph,
                                             bool                        cann_graph_capture_required) {
-    cann_ctx->graph_capture_active = use_cann_graph && cann_graph_capture_required;
 #ifdef USE_ACL_GRAPH
     if (use_cann_graph && cann_ctx->piecewise_mode) {
         evaluate_and_capture_cann_graph_piecewise(cann_ctx, cgraph);
@@ -3073,7 +3068,6 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 
     }
 #endif  // USE_ACL_GRAPH
-    cann_ctx->graph_capture_active = false;
 }
 
 /**
@@ -3129,8 +3123,6 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     // graph fingerprint compares addresses, so this was causing re-capture
     // every step (see MATCH-FAIL diagnostics 8/27). The workspace is freed
     // on program exit instead (g_nz_workspaces is static).
-    cann_ctx->matmul_input_cache.begin_graph();
-
     // calculate rope cache for fist layer in current device.
     cann_ctx->rope_cache.cached = false;
 

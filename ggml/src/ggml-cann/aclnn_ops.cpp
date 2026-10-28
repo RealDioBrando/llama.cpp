@@ -2242,16 +2242,6 @@ static void aclnn_repeat_interleave(ggml_backend_cann_context & ctx,
  * @param dst The destination tensor where the result of the matrix
  * multiplication will be stored.
  */
-static acl_tensor_ptr ggml_cann_create_matmul_nz_weight(void * data, int64_t ne[2], size_t nb[2]) {
-    // aclnnMatmulWeightNz requires a 4D storage shape for the FRACTAL_NZ
-    // weight. The logical shape stays 2D [N, K] in ACL order.
-    int64_t shape[2]   = { ne[1], ne[0] };
-    int64_t stride[2]  = { (int64_t)(nb[1] / sizeof(uint16_t)), (int64_t)(nb[0] / sizeof(uint16_t)) };
-    int64_t storage[4] = { (ne[1] + 15) / 16, (ne[0] + 15) / 16, 16, 16 };
-    return acl_tensor_ptr(
-        aclCreateTensor(shape, 2, ACL_FLOAT16, stride, 0, ACL_FORMAT_FRACTAL_NZ, storage, 4, data));
-}
-
 static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * weight = dst->src[0];  // weight
     ggml_tensor * input  = dst->src[1];  // input
@@ -2269,19 +2259,9 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
         }
     }
 
-    static bool use_acl_matmul = parse_bool(get_env_as_lowercase("GGML_CANN_ACL_MATMUL").value_or("on"));
-    static bool cache_f16_input = parse_bool(get_env_as_lowercase("GGML_CANN_F16_INPUT_CACHE").value_or("on"));
     static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
-    static bool use_matmul_weight_nz_api =
-        parse_bool(get_env_as_lowercase("GGML_CANN_MATMUL_WEIGHT_NZ_ND").value_or("on"));
-
-    // aclnnMatmul can consume F16 ND activation and F16 NZ weight directly.
-    bool use_matmul_api = use_acl_matmul && n_dims == 2 && weight->type == GGML_TYPE_F16 &&
-                          (input->type == GGML_TYPE_F32 || input->type == GGML_TYPE_F16) &&
-                          (dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
 
     bool used_tied_copy = false;
-    bool weight_is_nz   = false;
 #ifdef ASCEND_310P
     // The tied lm head (token_embd.weight) keeps its ND data for GET_ROWS;
     // mul_mat reads a separate FRACTAL_NZ copy prepared once at weight-load
@@ -2291,140 +2271,11 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
         auto it = tied_cache->entries.find(weight);
         if (it != tied_cache->entries.end()) {
             used_tied_copy = true;
-            weight_is_nz   = true;
         }
     }
 #endif
-    if (!used_tied_copy && weight_to_nz && weight->type != GGML_TYPE_BF16 &&
-        ggml_cann_is_weight_layout_candidate(weight)) {
-        weight_is_nz = true;
-    }
 
-    // aclnnMatmulWeightNz consumes a FRACTAL_NZ weight and writes the result
-    // in ND directly. The generic aclnnMatmul keeps the output in NZ for NZ
-    // weights, which costs an extra TransData NZ->ND plus a Cast per matmul.
-    const bool use_matmul_weight_nz = use_matmul_weight_nz_api && use_matmul_api && weight_is_nz &&
-                                      (input->type == GGML_TYPE_F16 || cache_f16_input);
-
-    ggml_cann_pool_alloc input_f16_alloc(ctx.matmul_cache_pool());
-    auto create_input_tensor = [&]() {
-        if (use_matmul_weight_nz && input->type == GGML_TYPE_F32) {
-            // eager mode: reuse the F16 activation cache when possible
-            if (!ctx.graph_capture_active && cache_f16_input) {
-                auto & cache = ctx.matmul_input_cache.entries;
-                auto   it    = cache.find(input);
-                if (it == cache.end() ||
-                    (it->second.dims == n_dims &&
-                     std::equal(it->second.ne, it->second.ne + n_dims, bcast_input_ne))) {
-                    if (it != cache.end() && it->second.epoch != ctx.matmul_input_cache.epoch) {
-                        acl_tensor_ptr acl_src = ggml_cann_create_tensor(input, bcast_input_ne, bcast_input_nb, n_dims);
-                        acl_tensor_ptr acl_f16 = ggml_cann_create_tensor(it->second.buffer->get(), ACL_FLOAT16,
-                                                                         sizeof(uint16_t), it->second.ne,
-                                                                         it->second.nb, it->second.dims);
-                        aclnn_cast(ctx, acl_src.get(), acl_f16.get(), ACL_FLOAT16);
-                        it->second.epoch = ctx.matmul_input_cache.epoch;
-                    }
-                    if (it == cache.end()) {
-                        size_t elements = 1;
-                        for (int64_t i = 0; i < n_dims; ++i) {
-                            elements *= static_cast<size_t>(bcast_input_ne[i]);
-                        }
-
-                        ggml_cann_matmul_input_cache::entry entry;
-                        entry.dims  = n_dims;
-                        entry.epoch = ctx.matmul_input_cache.epoch;
-                        memcpy(entry.ne, bcast_input_ne, n_dims * sizeof(int64_t));
-                        entry.nb[0] = sizeof(uint16_t);
-                        for (int64_t i = 1; i < n_dims; ++i) {
-                            entry.nb[i] = entry.nb[i - 1] * static_cast<size_t>(entry.ne[i - 1]);
-                        }
-                        entry.buffer = std::make_unique<ggml_cann_pool_alloc>(ctx.matmul_cache_pool(),
-                                                                              elements * sizeof(uint16_t));
-
-                        acl_tensor_ptr acl_src = ggml_cann_create_tensor(input, bcast_input_ne, bcast_input_nb, n_dims);
-                        acl_tensor_ptr acl_f16 = ggml_cann_create_tensor(entry.buffer->get(), ACL_FLOAT16,
-                                                                         sizeof(uint16_t), entry.ne, entry.nb, n_dims);
-                        aclnn_cast(ctx, acl_src.get(), acl_f16.get(), ACL_FLOAT16);
-                        it = cache.emplace(input, std::move(entry)).first;
-                    }
-                    return ggml_cann_create_tensor(it->second.buffer->get(), ACL_FLOAT16, sizeof(uint16_t),
-                                                   it->second.ne, it->second.nb, it->second.dims);
-                }
-            }
-
-            // Graph capture or disabled cache: one transient F16 copy per
-            // matmul. The copy is enqueued before the matmul on the same
-            // stream, so freeing the buffer here is safe.
-            if (input_f16_alloc.get() == nullptr) {
-                size_t elements = 1;
-                for (int64_t i = 0; i < n_dims; ++i) {
-                    elements *= static_cast<size_t>(bcast_input_ne[i]);
-                }
-                input_f16_alloc.alloc(elements * sizeof(uint16_t));
-            }
-            int64_t f16_ne[GGML_MAX_DIMS];
-            size_t  f16_nb[GGML_MAX_DIMS];
-            memcpy(f16_ne, bcast_input_ne, n_dims * sizeof(int64_t));
-            f16_nb[0] = sizeof(uint16_t);
-            for (int64_t i = 1; i < n_dims; ++i) {
-                f16_nb[i] = f16_nb[i - 1] * static_cast<size_t>(f16_ne[i - 1]);
-            }
-            acl_tensor_ptr acl_src = ggml_cann_create_tensor(input, bcast_input_ne, bcast_input_nb, n_dims);
-            acl_tensor_ptr acl_f16 = ggml_cann_create_tensor(input_f16_alloc.get(), ACL_FLOAT16, sizeof(uint16_t),
-                                                             f16_ne, f16_nb, n_dims);
-            aclnn_cast(ctx, acl_src.get(), acl_f16.get(), ACL_FLOAT16);
-            return acl_f16;
-        }
-
-        if (!use_matmul_api || !cache_f16_input || ctx.graph_capture_active || input->type != GGML_TYPE_F32) {
-            return ggml_cann_create_tensor(input, bcast_input_ne, bcast_input_nb, n_dims);
-        }
-
-        auto & cache = ctx.matmul_input_cache.entries;
-        auto   it    = cache.find(input);
-        if (it != cache.end() && (it->second.dims != n_dims ||
-                                  !std::equal(it->second.ne, it->second.ne + n_dims, bcast_input_ne))) {
-            // Do not recycle a live cache entry; fall back to the original tensor.
-            return ggml_cann_create_tensor(input, bcast_input_ne, bcast_input_nb, n_dims);
-        }
-
-        if (it != cache.end() && it->second.epoch != ctx.matmul_input_cache.epoch) {
-            acl_tensor_ptr acl_src = ggml_cann_create_tensor(input, bcast_input_ne, bcast_input_nb, n_dims);
-            acl_tensor_ptr acl_f16 = ggml_cann_create_tensor(it->second.buffer->get(), ACL_FLOAT16, sizeof(uint16_t),
-                                                             it->second.ne, it->second.nb, it->second.dims);
-            aclnn_cast(ctx, acl_src.get(), acl_f16.get(), ACL_FLOAT16);
-            it->second.epoch = ctx.matmul_input_cache.epoch;
-        }
-
-        if (it == cache.end()) {
-            size_t elements = 1;
-            for (int64_t i = 0; i < n_dims; ++i) {
-                elements *= static_cast<size_t>(bcast_input_ne[i]);
-            }
-
-            ggml_cann_matmul_input_cache::entry entry;
-            entry.dims = n_dims;
-            entry.epoch = ctx.matmul_input_cache.epoch;
-            memcpy(entry.ne, bcast_input_ne, n_dims * sizeof(int64_t));
-            entry.nb[0] = sizeof(uint16_t);
-            for (int64_t i = 1; i < n_dims; ++i) {
-                entry.nb[i] = entry.nb[i - 1] * static_cast<size_t>(entry.ne[i - 1]);
-            }
-            entry.buffer = std::make_unique<ggml_cann_pool_alloc>(ctx.matmul_cache_pool(),
-                                                                  elements * sizeof(uint16_t));
-
-            acl_tensor_ptr acl_src = ggml_cann_create_tensor(input, bcast_input_ne, bcast_input_nb, n_dims);
-            acl_tensor_ptr acl_f16 = ggml_cann_create_tensor(entry.buffer->get(), ACL_FLOAT16, sizeof(uint16_t),
-                                                             entry.ne, entry.nb, n_dims);
-            aclnn_cast(ctx, acl_src.get(), acl_f16.get(), ACL_FLOAT16);
-            it = cache.emplace(input, std::move(entry)).first;
-        }
-
-        return ggml_cann_create_tensor(it->second.buffer->get(), ACL_FLOAT16, sizeof(uint16_t), it->second.ne,
-                                       it->second.nb, it->second.dims);
-    };
-
-    acl_tensor_ptr acl_input_tensor = create_input_tensor();
+    acl_tensor_ptr acl_input_tensor = ggml_cann_create_tensor(input, bcast_input_ne, bcast_input_nb, n_dims);
     int64_t        transpose_ne[]   = { bcast_weight_ne[1], bcast_weight_ne[0], bcast_weight_ne[2],
                                         bcast_weight_ne[3], bcast_weight_ne[4], bcast_weight_ne[5] };
     size_t         transpose_nb[]   = { bcast_weight_nb[1], bcast_weight_nb[0], bcast_weight_nb[2],
@@ -2433,28 +2284,15 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
 
 #ifdef ASCEND_310P
     if (used_tied_copy) {
-        if (use_matmul_weight_nz) {
-            int64_t tied_ne[2] = { bcast_weight_ne[1], bcast_weight_ne[0] };
-            size_t  tied_nb[2] = { bcast_weight_nb[1], bcast_weight_nb[0] };
-            acl_weight_tensor  = ggml_cann_create_matmul_nz_weight(tied_cache->entries.at(weight)->buffer,
-                                                                   tied_ne, tied_nb);
-        } else {
-            acl_weight_tensor = ggml_cann_create_tensor(tied_cache->entries.at(weight)->buffer, ACL_FLOAT16,
-                                                        sizeof(uint16_t), transpose_ne, transpose_nb, n_dims,
-                                                        ACL_FORMAT_FRACTAL_NZ);
-        }
+        acl_weight_tensor = ggml_cann_create_tensor(tied_cache->entries.at(weight)->buffer, ACL_FLOAT16,
+                                                    sizeof(uint16_t), transpose_ne, transpose_nb, n_dims,
+                                                    ACL_FORMAT_FRACTAL_NZ);
     } else
 #endif
     if (!used_tied_copy && weight_to_nz && weight->type != GGML_TYPE_BF16 &&
         ggml_cann_is_weight_layout_candidate(weight)) {
-        if (use_matmul_weight_nz) {
-            int64_t nz_ne[2] = { bcast_weight_ne[1], bcast_weight_ne[0] };
-            size_t  nz_nb[2] = { bcast_weight_nb[1], bcast_weight_nb[0] };
-            acl_weight_tensor = ggml_cann_create_matmul_nz_weight(weight->data, nz_ne, nz_nb);
-        } else {
-            acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims,
-                                                        ACL_FORMAT_FRACTAL_NZ);
-        }
+        acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims,
+                                                    ACL_FORMAT_FRACTAL_NZ);
     } else {
         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_ND);
     }
@@ -2462,39 +2300,7 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
 
     switch (n_dims) {
         case 2:
-            if (use_matmul_weight_nz) {
-                // The input is always F16 on this path (F32 is cast first).
-                int8_t cube_math_type = 0;
-                if (dst->type == GGML_TYPE_F16) {
-                    GGML_CANN_CALL_ACLNN_OP(ctx, MatmulWeightNz, acl_input_tensor.get(), acl_weight_tensor.get(),
-                                            acl_dst.get(), cube_math_type);
-                } else {
-                    size_t out_elems = 1;
-                    for (int64_t i = 0; i < n_dims; ++i) {
-                        out_elems *= static_cast<size_t>(bcast_dst_ne[i]);
-                    }
-                    ggml_cann_pool_alloc out_f16_alloc(ctx.matmul_cache_pool(), out_elems * sizeof(uint16_t));
-                    int64_t out_ne[GGML_MAX_DIMS];
-                    size_t  out_nb[GGML_MAX_DIMS];
-                    memcpy(out_ne, bcast_dst_ne, n_dims * sizeof(int64_t));
-                    out_nb[0] = sizeof(uint16_t);
-                    for (int64_t i = 1; i < n_dims; ++i) {
-                        out_nb[i] = out_nb[i - 1] * static_cast<size_t>(out_ne[i - 1]);
-                    }
-                    acl_tensor_ptr acl_out_f16 =
-                        ggml_cann_create_tensor(out_f16_alloc.get(), ACL_FLOAT16, sizeof(uint16_t),
-                                                out_ne, out_nb, n_dims);
-                    GGML_CANN_CALL_ACLNN_OP(ctx, MatmulWeightNz, acl_input_tensor.get(), acl_weight_tensor.get(),
-                                            acl_out_f16.get(), cube_math_type);
-                    aclnn_cast(ctx, acl_out_f16.get(), acl_dst.get(), ggml_cann_type_mapping(dst->type));
-                }
-            } else if (use_matmul_api) {
-                int8_t cube_math_type = input->type == GGML_TYPE_F32 ? 1 : 0;
-                GGML_CANN_CALL_ACLNN_OP(ctx, Matmul, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(),
-                                        cube_math_type);
-            } else {
-                GGML_CANN_CALL_ACLNN_OP(ctx, Mm, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(), 2);
-            }
+            GGML_CANN_CALL_ACLNN_OP(ctx, Mm, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(), 2);
             break;
         case 3:
             GGML_CANN_CALL_ACLNN_OP(ctx, BatchMatMul, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(),

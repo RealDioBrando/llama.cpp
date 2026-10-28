@@ -389,6 +389,73 @@ TEST(test_scheduler_rejects_oversized_prompt) {
     EXPECT_TRUE(queued);
 }
 
+TEST(test_scheduler_single_request_decode) {
+    auto fixture = make_fixture(/*n_ctx=*/128, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/8, /*n_cpu_blocks=*/2);
+    fixture.sched->set_prefix_cache_enabled(false);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+
+    llama_batch            batch  = {};
+    llama_scheduler_status status = fixture.sched->step(batch);
+    EXPECT_TRUE(status == llama_scheduler_status::OK);
+    EXPECT_EQ(batch.n_tokens, 32);
+
+    const auto * info = fixture.sched->get_curr_batch_info();
+    EXPECT_TRUE(info != nullptr);
+    EXPECT_EQ(info->n_seq, 1);
+    EXPECT_EQ(info->batch_lens[0], 32);
+    EXPECT_EQ(info->context_lens[0], 32);
+
+    std::vector<llama_token> sampled(1, 42);
+    std::vector<int8_t>      stop(1, 0);
+    fixture.sched->update(batch, sampled, stop.data());
+
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_EQ(batch.n_tokens, 1);
+
+    info = fixture.sched->get_curr_batch_info();
+    EXPECT_EQ(info->n_seq, 1);
+    EXPECT_EQ(info->batch_lens[0], 1);
+    EXPECT_EQ(info->context_lens[0], 33);
+}
+
+TEST(test_scheduler_multi_request_decode) {
+    auto fixture = make_fixture(/*n_ctx=*/128, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/8, /*n_cpu_blocks=*/2);
+    fixture.sched->set_prefix_cache_enabled(false);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/1, /*n_prompt=*/32)));
+
+    llama_batch batch = {};
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_EQ(batch.n_tokens, 32);
+
+    std::vector<llama_token> sampled0(1, 42);
+    std::vector<int8_t>      stop0(1, 0);
+    fixture.sched->update(batch, sampled0, stop0.data());
+
+    // The scheduler drains prefills one request at a time before decoding.
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_EQ(batch.n_tokens, 32);
+
+    std::vector<llama_token> sampled1(1, 43);
+    std::vector<int8_t>      stop1(1, 0);
+    fixture.sched->update(batch, sampled1, stop1.data());
+
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_EQ(batch.n_tokens, 2);
+
+    const auto * info = fixture.sched->get_curr_batch_info();
+    EXPECT_TRUE(info != nullptr);
+    EXPECT_EQ(info->n_seq, 2);
+    EXPECT_EQ(info->batch_lens[0], 1);
+    EXPECT_EQ(info->batch_lens[1], 1);
+    EXPECT_EQ(info->context_lens[0], 33);
+    EXPECT_EQ(info->context_lens[1], 33);
+}
+
 // Testing prefix cache
 
 TEST(test_block_manager_add_ref) {
@@ -572,6 +639,8 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_scheduler_no_deadlock_on_empty);
     RUN(test_scheduler_deadlock_oversize_waiting_request);
     RUN(test_scheduler_rejects_oversized_prompt);
+    RUN(test_scheduler_single_request_decode);
+    RUN(test_scheduler_multi_request_decode);
 
     fprintf(stderr, "test-paged-kv: prefix cache\n");
     RUN(test_block_manager_add_ref);
