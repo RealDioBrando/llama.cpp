@@ -1011,7 +1011,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         batch_inject = llama_batch_init(llama_n_ubatch(ctx_dft), n_embd_enc, n_seq);
 
         // embd batches on an M-RoPE draft need 4 position rows per token
-        is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
+        const auto rope_type = llama_model_rope_type(model_dft);
+        is_mrope = rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE;
         if (is_mrope) {
             free(batch_inject.pos);
             batch_inject.pos = (llama_pos *) malloc(sizeof(llama_pos) * 4 * llama_n_batch(ctx_dft));
@@ -1130,10 +1131,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
-            // an M-RoPE image pins all its rows to one position, so a windowed draft
-            // cache cannot free cells for it - skip it, the draft can jump over the gap
+            // A sliding window cannot evict image rows that share a temporal position.
             const bool pos_pinned = batch_in.pos[i_batch_beg[seq_id]] == batch_in.pos[i_batch_end[seq_id]];
-            if (has_embeddings && n_rows > 1 && pos_pinned) {
+            if (has_embeddings && n_rows > 1 && pos_pinned && llama_model_n_swa(llama_get_model(ctx_dft)) > 0) {
                 continue;
             }
 
@@ -1159,8 +1159,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
                     batch_inject.pos[i] = p;
                     if (is_mrope) {
-                        batch_inject.pos[1 * n_chunk + i] = p;
-                        batch_inject.pos[2 * n_chunk + i] = p;
+                        const auto target_rope = llama_model_rope_type(llama_get_model(ctx_tgt));
+                        const bool spatial = has_embeddings && (target_rope == LLAMA_ROPE_TYPE_MROPE || target_rope == LLAMA_ROPE_TYPE_IMROPE);
+                        // Image batches carry separate T/H/W rows; text broadcasts one position.
+                        const int32_t src = i_batch_beg[seq_id] + offset + i;
+                        batch_inject.pos[1 * n_chunk + i] = spatial ? batch_in.pos[n_tokens + src] : p;
+                        batch_inject.pos[2 * n_chunk + i] = spatial ? batch_in.pos[2 * n_tokens + src] : p;
                         batch_inject.pos[3 * n_chunk + i] = 0;
                     }
                     batch_inject.n_seq_id[i]  = 1;
