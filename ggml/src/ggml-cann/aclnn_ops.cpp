@@ -4248,20 +4248,26 @@ static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context & ctx, ggml_ten
     // Calculate element size for quantized weights
     const float weight_elem_size =
         (type == GGML_TYPE_Q4_0) ? 0.5f :
-        (type == GGML_TYPE_Q8_0) ? 1.0f :
-                                   (GGML_ABORT("MUL_MAT_ID only supports Q4_0 and Q8_0"), 0.0f);
+        (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_W8A8) ? 1.0f :
+                                   (GGML_ABORT("MUL_MAT_ID only supports Q4_0, Q8_0, and W8A8"), 0.0f);
 
-    // Calculate scale offset in memory
-    const size_t weight_size     = src0->ne[0] * src0->ne[1] * src0->ne[2] * weight_elem_size;
-    const size_t scale_elem_size = sizeof(uint16_t);
-    char *       scale_data      = (char *) src0->data + weight_size;
+    // W8A8 expert tensors use a private FP32 scale plane when uploaded for A8.
+    const bool   private_w8a8_scales = type == GGML_TYPE_W8A8 && ggml_cann_w8a8_a8_enabled() &&
+                                     ggml_cann_w8a8_is_expert(src0);
+    const size_t weight_size         = src0->ne[0] * src0->ne[1] * src0->ne[2] * weight_elem_size;
+    const size_t scale_elem_size     = private_w8a8_scales ? sizeof(float) : sizeof(uint16_t);
+    char *       scale_data          = private_w8a8_scales
+                                           ? (char *) src0->data + ggml_cann_w8a8_expert_scale_offset(src0)
+                                           : (char *) src0->data + weight_size;
+    const int64_t scale_d            = private_w8a8_scales ? 1 : src0->ne[0] / group_size;
+    const aclDataType scale_acl_type = private_w8a8_scales ? ACL_FLOAT : ACL_FLOAT16;
 
     // Allocate buffers for selected expert weights and scales
     const size_t         selected_weight_size = src0->ne[0] * src0->ne[1] * n_select_experts * weight_elem_size;
     ggml_cann_pool_alloc selected_weight_alloc(ctx.pool(), selected_weight_size);
     void *               selected_weight_buffer = selected_weight_alloc.get();
 
-    const size_t selected_scale_size = (src0->ne[0] / group_size) * src0->ne[1] * n_select_experts * scale_elem_size;
+    const size_t selected_scale_size = scale_d * src0->ne[1] * n_select_experts * scale_elem_size;
     ggml_cann_pool_alloc selected_scale_alloc(ctx.pool(), selected_scale_size);
     void *               selected_scale_buffer = selected_scale_alloc.get();
 
@@ -4334,21 +4340,58 @@ static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context & ctx, ggml_ten
         GGML_CANN_CALL_ACLNN_OP(ctx, IndexSelect, all_weights.get(), 0, batch_indices.get(), selected_weights.get());
 
         // Select scales using the same expert indices
-        const int64_t scale_d     = src0->ne[0] / group_size;
-        int64_t       scale_ne[3] = { scale_d, weight_m, weight_n_experts };
-        size_t scale_nb[3] = { scale_elem_size, scale_d * scale_elem_size, scale_d * weight_m * scale_elem_size };
+        int64_t scale_ne[3] = { scale_d, weight_m, weight_n_experts };
+        size_t scale_nb[3];
+        if (private_w8a8_scales) {
+            scale_nb[0] = scale_elem_size;
+            scale_nb[1] = scale_elem_size;
+            scale_nb[2] = weight_m * scale_elem_size;
+        } else {
+            scale_nb[0] = scale_elem_size;
+            scale_nb[1] = scale_d * scale_elem_size;
+            scale_nb[2] = scale_d * weight_m * scale_elem_size;
+        }
 
         acl_tensor_ptr all_scales =
-            ggml_cann_create_tensor(scale_data, ACL_FLOAT16, scale_elem_size, scale_ne, scale_nb, 3);
+            ggml_cann_create_tensor(scale_data, scale_acl_type, scale_elem_size, scale_ne, scale_nb, 3);
 
         int64_t selected_scale_ne[3] = { scale_d, weight_m, n_select_experts };
-        size_t  selected_scale_nb[3] = { scale_elem_size, scale_d * scale_elem_size,
-                                         scale_d * weight_m * scale_elem_size };
+        size_t selected_scale_nb[3];
+        if (private_w8a8_scales) {
+            selected_scale_nb[0] = scale_elem_size;
+            selected_scale_nb[1] = scale_elem_size;
+            selected_scale_nb[2] = weight_m * scale_elem_size;
+        } else {
+            selected_scale_nb[0] = scale_elem_size;
+            selected_scale_nb[1] = scale_d * scale_elem_size;
+            selected_scale_nb[2] = scale_d * weight_m * scale_elem_size;
+        }
 
-        acl_tensor_ptr selected_scales = ggml_cann_create_tensor(selected_scale_buffer, ACL_FLOAT16, scale_elem_size,
-                                                                 selected_scale_ne, selected_scale_nb, 3);
+        acl_tensor_ptr selected_scales = ggml_cann_create_tensor(selected_scale_buffer, scale_acl_type,
+                                                                 scale_elem_size, selected_scale_ne,
+                                                                 selected_scale_nb, 3);
 
         GGML_CANN_CALL_ACLNN_OP(ctx, IndexSelect, all_scales.get(), 0, batch_indices.get(), selected_scales.get());
+
+        void *   matmul_scale_buffer = selected_scale_buffer;
+        size_t   matmul_scale_stride = selected_scale_nb[2];
+        ggml_cann_pool_alloc selected_scale_f16_alloc;
+        if (private_w8a8_scales) {
+            selected_scale_f16_alloc.alloc(ctx.pool(), static_cast<size_t>(weight_m * n_select_experts) *
+                                                        sizeof(uint16_t));
+            int64_t f16_ne[3] = { scale_d, weight_m, n_select_experts };
+            size_t f16_nb[3] = { sizeof(uint16_t), sizeof(uint16_t),
+                                 static_cast<size_t>(weight_m) * sizeof(uint16_t) };
+            acl_tensor_ptr scale_f16_src = ggml_cann_create_tensor(selected_scale_buffer, ACL_FLOAT,
+                                                                   sizeof(float), selected_scale_ne,
+                                                                   selected_scale_nb, 3);
+            acl_tensor_ptr scale_f16_dst = ggml_cann_create_tensor(selected_scale_f16_alloc.get(),
+                                                                   ACL_FLOAT16, sizeof(uint16_t), f16_ne,
+                                                                   f16_nb, 3);
+            GGML_CANN_CALL_ACLNN_OP(ctx, Cast, scale_f16_src.get(), ACL_FLOAT16, scale_f16_dst.get());
+            matmul_scale_buffer = selected_scale_f16_alloc.get();
+            matmul_scale_stride = f16_nb[2];
+        }
 
         // Process each expert for current batch
         // IndexSelect output layout: [D, M, K] in contiguous format
@@ -4368,13 +4411,26 @@ static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context & ctx, ggml_ten
                 ggml_cann_create_tensor(selected_weight_buffer, ggml_cann_type_mapping(type), weight_elem_size,
                                         weight_view_ne, weight_view_nb, 2, ACL_FORMAT_ND, weight_view_offset);
 
-            // Create scale view for current expert: [D, M, K] -> [M, D]
-            int64_t      scale_view_ne[2]  = { weight_m, scale_d };
-            size_t       scale_view_nb[2]  = { selected_scale_nb[1], selected_scale_nb[0] };
-            const size_t scale_view_offset = expert_idx * selected_scale_nb[2];
+            // Create scale view for current expert.
+            // W8A8 uses one row-constant scale per output channel, so select the first
+            // repeated scale along the block dimension and run V2 in per-channel mode.
+            int64_t      scale_view_ne[2];
+            size_t       scale_view_nb[2];
+            if (type == GGML_TYPE_W8A8) {
+                scale_view_ne[0] = weight_m;
+                scale_view_ne[1] = 1;
+                scale_view_nb[0] = sizeof(uint16_t);
+                scale_view_nb[1] = static_cast<size_t>(scale_d) * sizeof(uint16_t);
+            } else {
+                scale_view_ne[0] = weight_m;
+                scale_view_ne[1] = scale_d;
+                scale_view_nb[0] = selected_scale_nb[1];
+                scale_view_nb[1] = selected_scale_nb[0];
+            }
+            const size_t scale_view_offset = expert_idx * matmul_scale_stride;
 
             acl_tensor_ptr scale_view =
-                ggml_cann_create_tensor(selected_scale_buffer, ACL_FLOAT16, scale_elem_size, scale_view_ne,
+                ggml_cann_create_tensor(matmul_scale_buffer, ACL_FLOAT16, sizeof(uint16_t), scale_view_ne,
                                         scale_view_nb, 2, ACL_FORMAT_ND, scale_view_offset);
 
             // Create input activation tensor [D, 1]
@@ -4392,8 +4448,9 @@ static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context & ctx, ggml_ten
                                                                    output_nb, 2, ACL_FORMAT_ND, output_offset);
 
             // Perform quantized matrix multiplication
+            const int64_t antiquant_group_size = (type == GGML_TYPE_W8A8) ? 0 : group_size;
             GGML_CANN_CALL_ACLNN_OP(ctx, WeightQuantBatchMatmulV2, input_tensor.get(), weight_view.get(),
-                                    scale_view.get(), nullptr, nullptr, nullptr, nullptr, group_size,
+                                    scale_view.get(), nullptr, nullptr, nullptr, nullptr, antiquant_group_size,
                                     output_tensor.get());
         }
     }
@@ -4426,6 +4483,7 @@ void ggml_cann_mul_mat_id(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
             break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_W8A8:
             ggml_cann_mul_mat_id_quant(ctx, dst);
             break;
         default:

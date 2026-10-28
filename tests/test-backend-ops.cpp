@@ -100,9 +100,9 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
 
         std::vector<uint8_t> dataq(ggml_row_size(tensor->type, nels));
         if (tensor->type == GGML_TYPE_W8A8) {
-            GGML_ASSERT(tensor->ne[2] == 1 && tensor->ne[3] == 1);
-            ggml_quantize_chunk(GGML_TYPE_W8A8, data.data(), dataq.data(), 0, tensor->ne[1], tensor->ne[0],
-                                nullptr);
+            GGML_ASSERT(tensor->ne[3] == 1);
+            const int64_t nrows = tensor->ne[1] * tensor->ne[2];
+            ggml_quantize_chunk(GGML_TYPE_W8A8, data.data(), dataq.data(), 0, nrows, tensor->ne[0], nullptr);
             ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
             return;
         }
@@ -5070,6 +5070,10 @@ struct test_mul_mat_id : public test_case {
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
             return 2e-2;
         }
+        // CANN A8 dynamically quantizes activations; the CPU reference uses exact F32/F16 activations.
+        if (type_a == GGML_TYPE_W8A8) {
+            return 2e-2;
+        }
         return max_nmse_err();
     }
 
@@ -9791,6 +9795,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
+
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F32, 8, 2, true, 32, 4, 32));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F16, 8, 2, true, 32, 4, 32));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F32, 16, 4, true, 64, 8, 64));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F32, 32, 2, true, 64, 4, 64));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F16, 32, 2, true, 64, 4, 64));
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 16,  3,  32,   {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 128, 1,  64,   {1, 1}, {1, 1}));

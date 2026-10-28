@@ -871,7 +871,7 @@ bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
     GGML_CANN_CALL_ACLNN_OP(ctx, Div, acl_w32.get(), acl_sum.get(), acl_norm32.get());
 
     static const bool full_fusion =
-        env_enabled("GGML_CANN_MOE_FULL_FUSION", true);
+        env_enabled("GGML_CANN_MOE_FULL_FUSION", !ggml_cann_w8a8_moe_a8_enabled());
     if (full_fusion &&
             run_moe_full_fused(ctx, graph, node_idx, last, selected, weights,
                                &topk_ids, &norm32, last_fused_node)) {
@@ -898,7 +898,7 @@ bool ggml_cann_moe_gate_up_fused(ggml_backend_cann_context & ctx,
                                  int * last_fused_node) {
     static const bool enabled = env_enabled("GGML_CANN_MOE_SWIGLU_FUSION", false);
     static const bool full_fusion =
-        env_enabled("GGML_CANN_MOE_FULL_FUSION", true);
+        env_enabled("GGML_CANN_MOE_FULL_FUSION", !ggml_cann_w8a8_moe_a8_enabled());
     static const bool debug =
         env_enabled("GGML_CANN_MOE_FULL_DEBUG", false);
     static int debug_count = 0;
