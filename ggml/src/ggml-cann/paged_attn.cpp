@@ -231,14 +231,18 @@ atb::Tensor wrap_pool_nz(const ggml_tensor * pool, int num_heads_kv, int head_di
                                   ACL_FLOAT16, ACL_FORMAT_FRACTAL_NZ);
 }
 
-// Cast + permute ggml [D, N, T] f32 into contiguous f16 [T, N, D].
+// Cast or permute ggml [D, N, T] into contiguous f16 [T, N, D].
 void cast_permute_to_f16_tnd(ggml_backend_cann_context & ctx, const ggml_tensor * src, void * dst_buf,
                               int64_t n_tokens, int64_t n_heads, int64_t head_dim) {
     // ggml_cann_create_tensor reverses dims, so a ggml-order ne/nb pair yields
     // an ACL view of shape [T, N, D] with element (t, n, d) = src(d, n, t).
+    const bool     src_is_f16 = src->type == GGML_TYPE_F16;
+    aclDataType    src_type   = src_is_f16 ? ACL_FLOAT16 : ACL_FLOAT;
+    size_t         src_elem_size = src_is_f16 ? sizeof(uint16_t) : sizeof(float);
     int64_t  src_ne[3]  = { head_dim, n_heads, n_tokens };
     size_t   src_nb[3]  = { src->nb[0], src->nb[1], src->nb[2] };
-    acl_tensor_ptr acl_src = ggml_cann_create_tensor((void *) src->data, ACL_FLOAT, sizeof(float), src_ne, src_nb, 3);
+    acl_tensor_ptr acl_src = ggml_cann_create_tensor((void *) src->data, src_type, src_elem_size,
+                                                     src_ne, src_nb, 3);
 
     int64_t  dst_ne[3]  = { head_dim, n_heads, n_tokens };
     size_t   dst_nb[3]  = { sizeof(uint16_t), (size_t) head_dim * sizeof(uint16_t),
@@ -248,7 +252,7 @@ void cast_permute_to_f16_tnd(ggml_backend_cann_context & ctx, const ggml_tensor 
     GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_src.get(), ACL_FLOAT16, acl_dst.get());
 }
 
-// Cast contiguous f16 [T, N, D] back into ggml f32 [D, N, T].
+// Cast contiguous f16 [T, N, D] back into the ggml output layout and type.
 void cast_back_to_dst(ggml_backend_cann_context & ctx, const void * src_buf, ggml_tensor * dst,
                       int64_t n_tokens, int64_t n_heads, int64_t head_dim) {
     int64_t  src_ne[3]  = { head_dim, n_heads, n_tokens };
@@ -256,11 +260,15 @@ void cast_back_to_dst(ggml_backend_cann_context & ctx, const void * src_buf, ggm
                             (size_t) head_dim * n_heads * sizeof(uint16_t) };
     acl_tensor_ptr acl_src = ggml_cann_create_tensor((void *) src_buf, ACL_FLOAT16, sizeof(uint16_t), src_ne, src_nb, 3);
 
+    const bool     dst_is_f16 = dst->type == GGML_TYPE_F16;
+    aclDataType    dst_type   = dst_is_f16 ? ACL_FLOAT16 : ACL_FLOAT;
+    size_t         dst_elem_size = dst_is_f16 ? sizeof(uint16_t) : sizeof(float);
     int64_t  dst_ne[3]  = { head_dim, n_heads, n_tokens };
     size_t   dst_nb[3]  = { dst->nb[0], dst->nb[1], dst->nb[2] };
-    acl_tensor_ptr acl_dst = ggml_cann_create_tensor((void *) dst->data, ACL_FLOAT, sizeof(float), dst_ne, dst_nb, 3);
+    acl_tensor_ptr acl_dst = ggml_cann_create_tensor((void *) dst->data, dst_type, dst_elem_size,
+                                                     dst_ne, dst_nb, 3);
 
-    GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_src.get(), ACL_FLOAT, acl_dst.get());
+    GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_src.get(), dst_type, acl_dst.get());
 }
 
 // ATB SelfAttention for uncached prompt chunks. Q/K/V are packed [T,N,D] and
