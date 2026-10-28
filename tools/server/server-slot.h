@@ -7,7 +7,9 @@
 #include "sampling.h"
 #include "speculative.h"
 
+#include <memory>
 #include <random>
+#include <thread>
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
 enum slot_state {
@@ -165,6 +167,27 @@ struct server_slot {
     int32_t n_media_appended = 0;
     mtmd::batch_ptr mbatch = nullptr;
 
+    // multimodal (12.4): a media chunk encoded ahead of the scheduler pause
+    // on a worker thread, so the clip run overlaps the scheduler steps. the
+    // worker never touches the slot; the consumer joins the worker (which is
+    // the happens-before) and moves the batch out. the chunk pointer is owned
+    // by the task, so reset() joins before the task can be freed
+    struct mm_prefetch_state {
+        const mtmd_input_chunk * chunk = nullptr;
+        mtmd::batch_ptr          batch = nullptr;
+        float *                  embd  = nullptr;
+        bool                     ready = false;
+        std::thread              worker;
+    };
+    std::shared_ptr<mm_prefetch_state> mm_pref;
+
+    void mm_prefetch_join() {
+        if (mm_pref && mm_pref->worker.joinable()) {
+            mm_pref->worker.join();
+        }
+        mm_pref.reset();
+    }
+
     // speculative decoding
     common_speculative * spec;
 
@@ -285,6 +308,10 @@ struct server_slot {
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
+
+        // join any in-flight media prefetch before the task (and its chunks)
+        // can be freed
+        mm_prefetch_join();
 
         spec_is_replay = false;
 

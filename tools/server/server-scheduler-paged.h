@@ -6,7 +6,10 @@
 
 #include "server-scheduler.h"
 
+#include <mutex>
+
 struct llama_paged_scheduler;
+struct mtmd_input_chunk;
 
 class server_scheduler_paged final : public server_scheduler_interface {
   public:
@@ -21,6 +24,23 @@ class server_scheduler_paged final : public server_scheduler_interface {
   private:
     server_slot * pick_idle_slot();
     bool launch_multimodal(server_task && task);
+
+    // multimodal (12.4): the pending media chunk of a slot, in order; returns
+    // nullptr when all chunks are already appended
+    const mtmd_input_chunk * find_media_chunk(server_slot & slot, size_t * idx);
+
+    // multimodal (12.4): encode the next pending media chunk on a worker
+    // thread so the clip run overlaps the scheduler steps
+    void start_mm_prefetch(server_slot & slot);
+
+    // multimodal (12.4): warm the clip encoder with one synthetic image so
+    // the first real image request does not pay the clip first-compile cost
+    void mm_warmup();
+
+    // serializes clip encodes: the mmproj context is shared by all slots and
+    // the prefetch workers
+    std::mutex mm_encode_mutex;
+
     void fail_all(const std::string & why);
     void on_finish(int32_t request_id);
     static void on_finish_thunk(int32_t request_id, const llama_token * tokens, int32_t n_tokens, void * user_data);

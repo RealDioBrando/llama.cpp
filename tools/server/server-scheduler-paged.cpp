@@ -6,6 +6,8 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <cstring>
+#include <thread>
 
 static bool paged_task_supported(const server_task & task) {
     // chat templates are applied in the HTTP layer and arrive here as
@@ -70,6 +72,10 @@ bool server_scheduler_paged::init() {
     if (!llama_paged_scheduler_warmup(sched, ctx)) {
         SRV_WRN("%s", "paged scheduler warmup failed, first requests may be slow\n");
     }
+
+    // warm the clip encoder so the first image request does not pay the
+    // clip graph first-compile cost
+    mm_warmup();
 
     SRV_INF("%s", "paged scheduler initialized\n");
     return true;
@@ -297,57 +303,58 @@ void server_scheduler_paged::update() {
             continue;
         }
         SLT_WRN(slot, "mm: encoding pending media chunk at row %d\n", st.n_past);
-
-        // the pending media chunk: the (n_media_appended+1)-th media chunk of
-        // the task, in order. NOTE: the boundary must NOT be derived from
-        // prompt.tokens.size() - server_tokens rows and scheduler rows use
-        // different scales (one sentinel row per media chunk vs
-        // n_tokens rows per chunk) and diverge after the first media segment
-        size_t search_from = 0;
-        const mtmd_input_chunk * target = nullptr;
         size_t target_idx = 0;
-        for (int k = 0; k <= slot.n_media_appended; ++k) {
-            auto [c, i] = slot.task->tokens.find_next_media_chunk(search_from);
-            if (c == nullptr) {
-                break;
-            }
-            target        = c->get();
-            target_idx    = i;
-            search_from   = i + mtmd_input_chunk_get_n_tokens(c->get());
-        }
+        const mtmd_input_chunk * target = find_media_chunk(slot, &target_idx);
         if (target == nullptr) {
             SLT_ERR(slot, "%s", "paused but no pending media chunk found\n");
             host.send_error(slot, "failed to encode media chunk", ERROR_TYPE_SERVER);
             slot.release();
             continue;
         }
-        const auto & chunk = target;
+        const mtmd_input_chunk * chunk = target;
         const int32_t n_tok = (int32_t) mtmd_input_chunk_get_n_tokens(target);
 
-        // encode the chunk (encode half of process_mtmd_chunk); done inline on
-        // the update thread - no yield, the media decode must stay on the
-        // same thread as the scheduler step
+        // a chunk prefetched at launch time is already encoded: join the
+        // worker (the happens-before) and reuse the result; a failed or stale
+        // prefetch falls through to the inline encode
         float * embd = nullptr;
-        try {
-            slot.mbatch.reset(mtmd_batch_init(slot.mctx));
-            if (mtmd_batch_add_chunk(slot.mbatch.get(), chunk) != 0) {
-                SLT_ERR(slot, "failed to add media chunk to the encoder batch, idx = %zu\n", target_idx);
+        if (slot.mm_pref) {
+            const bool matches = slot.mm_pref->chunk == chunk;
+            if (slot.mm_pref->worker.joinable()) {
+                slot.mm_pref->worker.join();
+            }
+            if (matches && slot.mm_pref->ready) {
+                slot.mbatch = std::move(slot.mm_pref->batch);
+                embd        = slot.mm_pref->embd;
+            }
+            slot.mm_pref.reset();
+        }
+        if (embd == nullptr) {
+            // inline encode (encode half of process_mtmd_chunk); done on the
+            // update thread, the media decode must stay on the same thread as
+            // the scheduler step
+            try {
+                std::lock_guard<std::mutex> enc_lk(mm_encode_mutex);
+                slot.mbatch.reset(mtmd_batch_init(slot.mctx));
+                if (mtmd_batch_add_chunk(slot.mbatch.get(), chunk) != 0) {
+                    SLT_ERR(slot, "failed to add media chunk to the encoder batch, idx = %zu\n", target_idx);
+                    host.send_error(slot, "failed to encode media chunk", ERROR_TYPE_SERVER);
+                    slot.release();
+                    continue;
+                }
+                if (mtmd_batch_encode(slot.mbatch.get()) != 0) {
+                    SLT_ERR(slot, "failed to encode media chunk, idx = %zu\n", target_idx);
+                    host.send_error(slot, "failed to encode media chunk", ERROR_TYPE_SERVER);
+                    slot.release();
+                    continue;
+                }
+                embd = mtmd_batch_get_output_embd(slot.mbatch.get(), chunk);
+            } catch (const std::exception & e) {
+                SLT_ERR(slot, "mm encode exception: %s\n", e.what());
                 host.send_error(slot, "failed to encode media chunk", ERROR_TYPE_SERVER);
                 slot.release();
                 continue;
             }
-            if (mtmd_batch_encode(slot.mbatch.get()) != 0) {
-                SLT_ERR(slot, "failed to encode media chunk, idx = %zu\n", target_idx);
-                host.send_error(slot, "failed to encode media chunk", ERROR_TYPE_SERVER);
-                slot.release();
-                continue;
-            }
-            embd = mtmd_batch_get_output_embd(slot.mbatch.get(), chunk);
-        } catch (const std::exception & e) {
-            SLT_ERR(slot, "mm encode exception: %s\n", e.what());
-            host.send_error(slot, "failed to encode media chunk", ERROR_TYPE_SERVER);
-            slot.release();
-            continue;
         }
         if (embd == nullptr) {
             SLT_ERR(slot, "failed to encode media chunk, idx = %zu\n", target_idx);
@@ -390,6 +397,9 @@ void server_scheduler_paged::update() {
         slot.n_media_appended++;
         slot.stats.n_prompt_processed += (uint64_t) n_tok;
         slot.stats.update_prompt_last();
+
+        // overlap the next media chunk's encode with the following steps
+        start_mm_prefetch(slot);
     }
 
     // speculative decoding: draft for the generating slots and attach the
@@ -672,7 +682,135 @@ bool server_scheduler_paged::launch_multimodal(server_task && task) {
         s.release();
         return true;
     }
+
+    // overlap the first media chunk's encode with the first scheduler steps
+    start_mm_prefetch(s);
+
     return true;
+}
+
+const mtmd_input_chunk * server_scheduler_paged::find_media_chunk(server_slot & slot, size_t * idx) {
+    // the pending media chunk: the (n_media_appended+1)-th media chunk of
+    // the task, in order. NOTE: the boundary must NOT be derived from
+    // prompt.tokens.size() - server_tokens rows and scheduler rows use
+    // different scales (one sentinel row per media chunk vs n_tokens rows
+    // per chunk) and diverge after the first media segment
+    size_t search_from = 0;
+    const mtmd_input_chunk * target = nullptr;
+    if (idx) {
+        *idx = 0;
+    }
+    for (int k = 0; k <= slot.n_media_appended; ++k) {
+        auto [c, i] = slot.task->tokens.find_next_media_chunk(search_from);
+        if (c == nullptr) {
+            break;
+        }
+        target      = c->get();
+        if (idx) {
+            *idx = i;
+        }
+        search_from = i + mtmd_input_chunk_get_n_tokens(c->get());
+    }
+    return target;
+}
+
+void server_scheduler_paged::start_mm_prefetch(server_slot & slot) {
+    if (slot.mctx == nullptr || slot.mm_pref) {
+        return;
+    }
+    const mtmd_input_chunk * target = find_media_chunk(slot, nullptr);
+    if (target == nullptr) {
+        return;
+    }
+    auto pf      = std::make_shared<server_slot::mm_prefetch_state>();
+    pf->chunk    = target;
+    slot.mm_pref = pf;
+    pf->worker = std::thread([pf, mctx = slot.mctx, this]() {
+        // the mmproj context is shared by all slots, encodes are serialized;
+        // on any failure the consumer falls back to the inline encode
+        std::lock_guard<std::mutex> lk(mm_encode_mutex);
+        try {
+            pf->batch.reset(mtmd_batch_init(mctx));
+            if (mtmd_batch_add_chunk(pf->batch.get(), pf->chunk) == 0 && mtmd_batch_encode(pf->batch.get()) == 0) {
+                pf->embd  = mtmd_batch_get_output_embd(pf->batch.get(), pf->chunk);
+                pf->ready = pf->embd != nullptr;
+            }
+        } catch (...) {
+            pf->ready = false;
+        }
+    });
+}
+
+// warm the clip encoder and the media-shape scheduler ops with one synthetic
+// image so the first real request does not pay the first-compile cost; the
+// flow mirrors a real request: text head, pending media, text tail
+void server_scheduler_paged::mm_warmup() {
+    mtmd_context * mctx = host.mmctx();
+    if (mctx == nullptr) {
+        return;
+    }
+
+    std::vector<unsigned char> rgb(64 * 64 * 3, 128);
+    mtmd_bitmap * bmp = mtmd_bitmap_init(64, 64, rgb.data());
+    mtmd_input_chunks * chunks = mtmd_input_chunks_init();
+    if (bmp == nullptr || chunks == nullptr) {
+        SRV_WRN("%s", "mm warmup: failed to init the synthetic image\n");
+        mtmd_bitmap_free(bmp);
+        mtmd_input_chunks_free(chunks);
+        return;
+    }
+
+    // bitmap-only part: the media marker is model-specific, from_parts skips
+    // marker matching entirely
+    mtmd_input_part part = { nullptr, bmp };
+    const mtmd_input_part * parts[] = { &part };
+    if (mtmd_tokenize_from_parts(mctx, chunks, parts, 1, true) != 0 || mtmd_input_chunks_size(chunks) == 0) {
+        SRV_WRN("%s", "mm warmup: tokenize failed\n");
+        mtmd_bitmap_free(bmp);
+        mtmd_input_chunks_free(chunks);
+        return;
+    }
+
+    const mtmd_input_chunk * img_chunk = nullptr;
+    for (size_t i = 0; i < mtmd_input_chunks_size(chunks); ++i) {
+        const mtmd_input_chunk * c = mtmd_input_chunks_get(chunks, i);
+        if (mtmd_input_chunk_get_type(c) == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            img_chunk = c;
+            break;
+        }
+    }
+    if (img_chunk == nullptr) {
+        SRV_WRN("%s", "mm warmup: no image chunk produced\n");
+        mtmd_bitmap_free(bmp);
+        mtmd_input_chunks_free(chunks);
+        return;
+    }
+
+    // warm the clip graphs
+    mtmd::batch_ptr wb(mtmd_batch_init(mctx));
+    if (!wb || mtmd_batch_add_chunk(wb.get(), img_chunk) != 0) {
+        SRV_WRN("%s", "mm warmup: batch add_chunk failed\n");
+        mtmd_bitmap_free(bmp);
+        mtmd_input_chunks_free(chunks);
+        return;
+    }
+    if (mtmd_batch_encode(wb.get()) != 0) {
+        SRV_WRN("%s", "mm warmup: clip encode failed\n");
+        mtmd_bitmap_free(bmp);
+        mtmd_input_chunks_free(chunks);
+        return;
+    }
+    float * embd = mtmd_batch_get_output_embd(wb.get(), img_chunk);
+    if (embd == nullptr) {
+        SRV_WRN("%s", "mm warmup: clip encode produced no embedding\n");
+        mtmd_bitmap_free(bmp);
+        mtmd_input_chunks_free(chunks);
+        return;
+    }
+
+    SRV_INF("%s", "mm warmup done\n");
+    mtmd_bitmap_free(bmp);
+    mtmd_input_chunks_free(chunks);
 }
 
 void server_scheduler_paged::prepare_drafts() {
