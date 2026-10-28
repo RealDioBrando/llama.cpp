@@ -62,6 +62,31 @@ The importer:
 
 `tools/w8a8/inspect_modelslim.py` inventories a checkpoint before conversion.
 
+### MoE checkpoints
+
+For `Qwen3_5MoeForConditionalGeneration`, the importer detects separate
+per-expert `gate_proj`, `up_proj`, and `down_proj` modules and stacks them into
+the native 3D GGUF expert tensors. It also accepts fused `gate_up_proj` and
+`down_proj` tensors. The runtime shapes are:
+
+```text
+gate/up:  GGML ne [K,N,E]   public raw [E,N,(K/32)*34]
+down:     GGML ne [K,N,E]   public raw [E,N,(K/32)*34]
+scales:   [E,N]
+```
+
+The converter streams tensors through a temporary GGUF file by default. Use
+`--no-temp-file` only when there is enough host RAM to retain the whole output.
+A vision-language MoE model can emit the projector separately:
+
+```bash
+python tools/w8a8/convert_modelslim.py \
+  /path/to/Qwen3.5-35B-W8A8-310P \
+  Qwen3.5-35B-W8A8-310P.gguf \
+  --mapping-out mapping.json \
+  --mmproj-output mmproj-Qwen3.5-35B-f16.gguf
+```
+
 ## Verify a converted model
 
 ```bash

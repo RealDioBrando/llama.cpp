@@ -3,10 +3,14 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections import Counter
+import re
+from collections import Counter, defaultdict
+from contextlib import ExitStack
 from pathlib import Path
 
 from safetensors import safe_open
+
+EXPERT_RE = re.compile(r"\.mlp\.experts\.(?P<expert>\d+)?\.?(?P<projection>gate_proj|up_proj|down_proj|gate_up_proj)\.weight$")
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +45,8 @@ def tensor_locations(model_dir: Path, shards: list[Path]) -> dict[str, Path]:
 
 
 def category(name: str) -> str:
+    if ".mlp.experts." in name:
+        return "moe_expert"
     if name.startswith("mtp."):
         return "mtp"
     if ".mlp." in name:
@@ -50,11 +56,23 @@ def category(name: str) -> str:
     return "other"
 
 
+def expected_scale_shapes(weight_shape: list[int]) -> tuple[tuple[int, ...], ...]:
+    if len(weight_shape) == 2:
+        return ((weight_shape[0], 1), (weight_shape[0],))
+    if len(weight_shape) == 3:
+        return (
+            (weight_shape[0], weight_shape[1]),
+            (weight_shape[0], weight_shape[1], 1),
+        )
+    return ()
+
+
 def main() -> None:
     args = parse_args()
     model_dir = args.model_dir
     description = load_json(model_dir / "quant_model_description.json")
     config = load_json(model_dir / "config.json")
+    text_config = config.get("text_config", {})
     shards = find_shards(model_dir)
     locations = tensor_locations(model_dir, shards)
 
@@ -62,47 +80,79 @@ def main() -> None:
         value if isinstance(value, str) else type(value).__name__
         for value in description.values()
     )
-    quantized_weights = sorted(name for name, kind in description.items()
-                               if kind == "W8A8_DYNAMIC" and name.endswith(".weight"))
+    quantized_weights = sorted(
+        name for name, kind in description.items()
+        if kind == "W8A8_DYNAMIC" and name.endswith(".weight")
+    )
+    expert_weights = [name for name in quantized_weights if ".mlp.experts." in name]
     categories = Counter(category(name) for name in quantized_weights)
+    patterns = Counter(
+        re.sub(r"\.experts\.\d+\.", ".experts.N.", name)
+        for name in expert_weights
+    )
+    expert_ids: dict[str, set[int]] = defaultdict(set)
+    expert_layers: set[int] = set()
+    expert_projection_shapes: dict[str, dict[str, object]] = {}
+    for name in expert_weights:
+        match = EXPERT_RE.search(name)
+        if not match:
+            continue
+        layer_match = re.search(r"\.layers\.(\d+)\.", name)
+        if layer_match:
+            expert_layers.add(int(layer_match.group(1)))
+        if match.group("expert") is not None:
+            expert_ids[match.group("projection")].add(int(match.group("expert")))
+
     missing: list[str] = []
     nonzero_offsets: list[str] = []
     bad_shapes: list[str] = []
     scale_ranges: dict[str, tuple[float, float]] = {}
 
-    for weight_name in quantized_weights:
-        scale_name = weight_name.removesuffix(".weight") + ".weight_scale"
-        offset_name = weight_name.removesuffix(".weight") + ".weight_offset"
-        for name in (weight_name, scale_name, offset_name):
-            if name not in locations:
-                missing.append(name)
+    with ExitStack() as stack:
+        handles = {
+            shard: stack.enter_context(safe_open(shard, framework="np"))
+            for shard in shards
+        }
+        for weight_name in quantized_weights:
+            scale_name = weight_name.removesuffix(".weight") + ".weight_scale"
+            offset_name = weight_name.removesuffix(".weight") + ".weight_offset"
+            missing.extend(name for name in (weight_name, scale_name, offset_name) if name not in locations)
+            if any(name not in locations for name in (weight_name, scale_name, offset_name)):
+                continue
 
-        weight_loc = locations.get(weight_name)
-        scale_loc = locations.get(scale_name)
-        offset_loc = locations.get(offset_name)
-        if weight_loc is None or scale_loc is None or offset_loc is None:
-            continue
-
-        with safe_open(weight_loc, framework="np") as weight_file:
+            weight_file = handles[locations[weight_name]]
             weight_slice = weight_file.get_slice(weight_name)
-            weight_shape = weight_slice.get_shape()
+            weight_shape = list(weight_slice.get_shape())
             weight_dtype = weight_slice.get_dtype()
-        with safe_open(scale_loc, framework="np") as scale_file:
-            scale = scale_file.get_tensor(scale_name)
-        with safe_open(offset_loc, framework="np") as offset_file:
-            offset = offset_file.get_tensor(offset_name)
+            scale = handles[locations[scale_name]].get_tensor(scale_name)
+            offset = handles[locations[offset_name]].get_tensor(offset_name)
 
-        if len(weight_shape) != 2 or weight_dtype != "I8":
-            bad_shapes.append(f"{weight_name}: shape={weight_shape} dtype={weight_dtype}")
-        if scale.ndim != 2 or scale.shape != (weight_shape[0], 1):
-            bad_shapes.append(f"{scale_name}: shape={scale.shape} expected=({weight_shape[0]}, 1)")
-        if offset.ndim != 2 or offset.shape != (weight_shape[0], 1):
-            bad_shapes.append(f"{offset_name}: shape={offset.shape} expected=({weight_shape[0]}, 1)")
-        if offset.size and offset.any():
-            nonzero_offsets.append(offset_name)
-        if scale.size:
-            scale_ranges[weight_name] = (float(scale.min()), float(scale.max()))
+            if len(weight_shape) not in (2, 3) or weight_dtype != "I8":
+                bad_shapes.append(f"{weight_name}: shape={tuple(weight_shape)} dtype={weight_dtype}")
+            if tuple(scale.shape) not in expected_scale_shapes(weight_shape):
+                bad_shapes.append(f"{scale_name}: shape={scale.shape} weight_shape={tuple(weight_shape)}")
+            if tuple(offset.shape) != tuple(scale.shape):
+                bad_shapes.append(f"{offset_name}: shape={offset.shape} expected={scale.shape}")
+            if offset.size and offset.any():
+                nonzero_offsets.append(offset_name)
+            if scale.size:
+                scale_ranges[weight_name] = (float(scale.min()), float(scale.max()))
 
+            if ".mlp.experts." in weight_name:
+                match = EXPERT_RE.search(weight_name)
+                projection = match.group("projection") if match else "unknown"
+                expert_projection_shapes.setdefault(projection, {
+                    "source_name": weight_name,
+                    "weight_shape": weight_shape,
+                    "scale_shape": list(scale.shape),
+                    "offset_shape": list(offset.shape),
+                    "layout": "separate" if len(weight_shape) == 2 else "fused",
+                })
+
+    expert_counts = {
+        projection: len(ids)
+        for projection, ids in sorted(expert_ids.items())
+    }
     report = {
         "model_dir": str(model_dir),
         "architecture": config.get("architectures", [None])[0],
@@ -110,6 +160,18 @@ def main() -> None:
         "type_counts": dict(sorted(type_counts.items())),
         "quantized_weights": len(quantized_weights),
         "quantized_categories": dict(sorted(categories.items())),
+        "num_hidden_layers": text_config.get("num_hidden_layers"),
+        "hidden_size": text_config.get("hidden_size"),
+        "vocab_size": text_config.get("vocab_size"),
+        "expert_count_config": text_config.get("num_experts"),
+        "expert_used_count_config": text_config.get("num_experts_per_tok"),
+        "moe_intermediate_size": text_config.get("moe_intermediate_size"),
+        "expert_weights": len(expert_weights),
+        "expert_layers": sorted(expert_layers),
+        "expert_projection_counts": expert_counts,
+        "expert_projection_shapes": expert_projection_shapes,
+        "expert_patterns": dict(sorted(patterns.items())),
+        "fused_gate_up": any(".mlp.experts.gate_up_proj.weight" in name for name in expert_weights),
         "safetensors_shards": [path.name for path in shards],
         "safetensors_tensors": len(locations),
         "missing_tensors": missing,
@@ -129,6 +191,13 @@ def main() -> None:
     print(f"type counts: {report['type_counts']}")
     print(f"quantized weights: {report['quantized_weights']}")
     print(f"quantized categories: {report['quantized_categories']}")
+    print(f"model config: layers={report['num_hidden_layers']} hidden={report['hidden_size']} vocab={report['vocab_size']}")
+    print(f"expert config: count={report['expert_count_config']} used={report['expert_used_count_config']}")
+    print(f"expert weights: {report['expert_weights']}")
+    print(f"expert layers: {report['expert_layers']}")
+    print(f"expert projections: {report['expert_projection_counts']}")
+    print(f"fused gate/up: {report['fused_gate_up']}")
+    print(f"expert shapes: {json.dumps(report['expert_projection_shapes'], indent=2)}")
     print(f"safetensors shards: {len(shards)}")
     print(f"safetensors tensors: {report['safetensors_tensors']}")
     print(f"scale range: {report['scale_min']} .. {report['scale_max']}")
