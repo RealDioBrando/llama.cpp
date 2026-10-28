@@ -332,7 +332,7 @@ static paged_test_fixture make_fixture(uint32_t n_ctx        = 128,
     fixture.kv->init(fixture.backend, fixture.backend, GGML_TYPE_F16, n_gpu_blocks, n_cpu_blocks, /*watermark=*/0.0f);
 
     fixture.sched = std::unique_ptr<llama_paged_scheduler_impl>(
-        new llama_paged_scheduler_impl(n_ctx, block_size, n_batch, fixture.kv.get()));
+        new llama_paged_scheduler_impl(n_ctx, block_size, n_batch, /*n_pos_per_embd=*/1, fixture.kv.get()));
     return fixture;
 }
 
@@ -542,7 +542,8 @@ TEST(test_scheduler_prefix_cache_hit) {
     const uint32_t blk1 = (uint32_t) info0->block_table[1];
     std::vector<llama_token> sampled(info0->n_seq, 7);
     std::vector<int8_t>      stop(info0->n_seq, 1);
-    fixture.sched->update(batch, sampled, stop.data());
+    llama_paged_feedback fb = { /*request_id=*/0, sampled.data(), (int32_t) sampled.size(), stop[0] };
+    fixture.sched->update(&batch, &fb, 1);
 
     // Finalizing the request keeps its registered blocks cache-resident.
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
@@ -561,7 +562,8 @@ TEST(test_scheduler_prefix_cache_hit) {
 
     const llama_block_ids table1 = g1->block_table;
     std::vector<llama_token> sampled1(1, 8);
-    fixture.sched->update(batch, sampled1, stop.data());
+    llama_paged_feedback fb1 = { /*request_id=*/1, sampled1.data(), (int32_t) sampled1.size(), stop[0] };
+    fixture.sched->update(&batch, &fb1, 1);
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
     EXPECT_EQ(fixture.kv->block_ref_count(blk0), 1u);
     EXPECT_EQ(fixture.kv->block_ref_count(blk1), 1u);
@@ -580,7 +582,8 @@ TEST(test_scheduler_prefix_cache_zero_suffix) {
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
     std::vector<llama_token> sampled(1, 7);
     std::vector<int8_t>      stop(1, 1);
-    fixture.sched->update(batch, sampled, stop.data());
+    llama_paged_feedback fb = { /*request_id=*/0, sampled.data(), (int32_t) sampled.size(), stop[0] };
+    fixture.sched->update(&batch, &fb, 1);
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
 
     // An exact prompt match cannot replay the last token, so one block
@@ -602,7 +605,8 @@ TEST(test_scheduler_prefix_cache_eviction) {
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
     std::vector<llama_token> sampled(1, 7);
     std::vector<int8_t>      stop(1, 1);
-    fixture.sched->update(batch, sampled, stop.data());
+    llama_paged_feedback fb = { /*request_id=*/0, sampled.data(), (int32_t) sampled.size(), stop[0] };
+    fixture.sched->update(&batch, &fb, 1);
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
 
     // Only 3 blocks are free; the fresh request needs 5, so the cache
