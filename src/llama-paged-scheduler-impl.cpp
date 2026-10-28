@@ -839,9 +839,10 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
     batch = llama_batch_init(total_tokens, 0, 1);
     GGML_ASSERT(batch.token != nullptr && "llama_batch_init failed to allocate tokens.");
 
-    // mrope models take a sectioned position array ([t][y][x][z] per
-    // section); the init-allocated buffer only holds one position per row, so
-    // replace it with our own for the lifetime of this batch
+    // mrope models: text rows broadcast one position per token, media (embd)
+    // rows use a sectioned layout [section][total_tokens]; the latter needs
+    // more room than the init-allocated buffer, so replace it for the
+    // lifetime of this batch
     if (n_pos_per_embd > 1) {
         populate_pos.assign((size_t) total_tokens * n_pos_per_embd, 0);
         batch.pos = populate_pos.data();
@@ -937,15 +938,16 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
 
         // mrope models take the sectioned position array; media rows carry
         // their per-row positions from the segment
-        if (n_pos_per_embd > 1) {
+        // mrope models: text rows broadcast one position per token (written
+        // in the loop above, the batch layer replicates it to every section);
+        // only media (embd) rows use the sectioned layout [section][token]
+        // over the whole batch, carrying the per-row positions of the segment
+        if (n_pos_per_embd > 1 && media_step) {
             for (int s = 0; s < n_pos_per_embd; ++s) {
                 for (int token_idx = 0; token_idx < new_tokens; ++token_idx) {
-                    if (media_step) {
-                        const int32_t rel = group->n_past - (int32_t) seg->start_row + token_idx;
-                        populate_pos[(size_t) s * new_tokens + token_idx] = seg->pos[(size_t) rel * n_pos_per_embd + s];
-                    } else {
-                        populate_pos[(size_t) s * new_tokens + token_idx] = group->n_past + token_idx;
-                    }
+                    const int32_t rel = group->n_past - (int32_t) seg->start_row + token_idx;
+                    populate_pos[(size_t) s * total_tokens + token_offset + token_idx] =
+                        seg->pos[(size_t) rel * n_pos_per_embd + s];
                 }
             }
         }
