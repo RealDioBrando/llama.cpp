@@ -561,20 +561,16 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
-// the architectures whose graphs have been checked with F16 activations
-// TODO: add more architectures after checking them
+// scope F16 activations to the Qwen3 family on CANN
 static bool llama_arch_supports_act_f16(llm_arch arch) {
     switch (arch) {
-        case LLM_ARCH_LLAMA:
-        case LLM_ARCH_QWEN2:
-        case LLM_ARCH_QWEN2VL:
         case LLM_ARCH_QWEN3:
+        case LLM_ARCH_QWEN3MOE:
+        case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_QWEN3VL:
+        case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35:
-        case LLM_ARCH_PHI3:
-        case LLM_ARCH_GEMMA3:
-        case LLM_ARCH_GEMMA3N:
-        case LLM_ARCH_GEMMA4:
+        case LLM_ARCH_QWEN35MOE:
             return true;
         default:
             return false;
@@ -701,16 +697,22 @@ void llama_context::sched_reserve() {
 
     if (cparams.act_type != GGML_TYPE_F32) {
         if (!llama_arch_supports_act_f16(model.arch)) {
-            throw std::runtime_error(format("activation type %s is not supported for architecture %s",
+            throw std::runtime_error(format("activation type %s is only supported for Qwen3-family architecture %s",
                     ggml_type_name(cparams.act_type), llm_arch_name(model.arch)));
         }
-        // other backends do not check the result type in supports_op yet
+        bool has_cann = false;
         for (ggml_backend_t backend : backend_ptrs) {
             const char * name = ggml_backend_dev_name(ggml_backend_get_device(backend));
-            if (strcmp(name, "CPU") != 0 && strncmp(name, "CANN", 4) != 0) {
-                throw std::runtime_error(format("activation type %s is not supported with the %s backend",
+            if (strncmp(name, "CANN", 4) == 0) {
+                has_cann = true;
+            } else if (strcmp(name, "CPU") != 0) {
+                throw std::runtime_error(format("activation type %s is only supported with CANN; found %s",
                         ggml_type_name(cparams.act_type), name));
             }
+        }
+        if (!has_cann) {
+            throw std::runtime_error(format("activation type %s requires a CANN backend",
+                    ggml_type_name(cparams.act_type)));
         }
     }
 
@@ -3907,7 +3909,7 @@ llama_context * llama_init_from_model(
     }
 
     if (params.type_act != GGML_TYPE_F32 && !llama_arch_supports_act_f16(model->arch)) {
-        LLAMA_LOG_ERROR("%s: activation type %s is not supported for architecture %s\n", __func__,
+        LLAMA_LOG_ERROR("%s: activation type %s is only supported for Qwen3-family architecture %s\n", __func__,
                 ggml_type_name(params.type_act), llm_arch_name(model->arch));
         return nullptr;
     }

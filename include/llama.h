@@ -406,7 +406,7 @@ extern "C" {
 
         enum ggml_type type_k;   // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v;   // data type for V cache [EXPERIMENTAL]
-        enum ggml_type type_act; // data type of the compute graph activations: F32 or F16 [EXPERIMENTAL]
+        enum ggml_type type_act; // data type of the compute graph activations: F32 or F16 [EXPERIMENTAL; CANN and Qwen3-family only]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

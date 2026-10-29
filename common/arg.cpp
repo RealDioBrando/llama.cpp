@@ -2526,7 +2526,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-at", "--act-type"}, "TYPE",
         string_format(
-            "data type of the activations in the compute graph [EXPERIMENTAL]\n"
+            "data type of the activations in the compute graph [EXPERIMENTAL; CANN and Qwen3-family only]\n"
             "allowed values: %s\n"
             "(default: %s)",
             get_all_act_types().c_str(),
