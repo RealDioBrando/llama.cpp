@@ -795,9 +795,6 @@ struct ggml_backend_cann_context {
      */
     ~ggml_backend_cann_context() {
         ggml_cann_set_device(device);
-#ifdef USE_ACL_GRAPH
-        graph_lru_cache.clear();
-#endif
         if (copy_event != nullptr) {
             ACL_CHECK(aclrtDestroyEvent(copy_event));
         }
