@@ -1678,6 +1678,12 @@ private:
 
     // tokenize the input if it's set by CLI, return false on error
     bool tokenize_cli_input(server_task & task) {
+        if (task.cli_prompt.empty() && !task.tokens.empty()) {
+            // the task was deferred and re-queued after a first pass already
+            // tokenized it: keep the existing tokens, re-running with the
+            // cleared cli_prompt would wipe them
+            return true;
+        }
         try {
             auto & prompt = task.cli_prompt;
             if (mctx != nullptr) {
