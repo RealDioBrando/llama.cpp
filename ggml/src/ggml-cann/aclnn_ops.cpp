@@ -91,6 +91,8 @@
 #include <aclnnop/aclnn_masked_fill_scalar.h>
 #include <aclnnop/aclnn_upsample_nearest_2d.h>
 #include <aclnnop/aclnn_weight_quant_batch_matmul_v2.h>
+#include <aclnnop/level2/aclnn_dynamic_quant.h>
+#include <aclnnop/level2/aclnn_quant_matmul_v5.h>
 #include <aclnnop/aclnn_zero.h>
 #include <float.h>
 
@@ -2227,6 +2229,128 @@ static void aclnn_repeat_interleave(ggml_backend_cann_context & ctx,
     GGML_CANN_CALL_ACLNN_OP(ctx, RepeatInterleaveIntWithDim, acl_src, repeats, dim, output_size, acl_dst);
 }
 
+static acl_tensor_ptr ggml_cann_create_direct_tensor(void * data,
+                                                     std::vector<int64_t> shape,
+                                                     std::vector<int64_t> strides,
+                                                     aclDataType data_type,
+                                                     aclFormat format = ACL_FORMAT_ND) {
+    GGML_ASSERT(shape.size() == strides.size());
+    int64_t storage_size = 1;
+    for (const int64_t dimension : shape) {
+        storage_size *= dimension;
+    }
+    const std::vector<int64_t> storage_shape = { storage_size };
+    aclTensor * tensor = aclCreateTensor(shape.data(),
+                                         static_cast<uint64_t>(shape.size()),
+                                         data_type,
+                                         strides.data(),
+                                         0,
+                                         format,
+                                         storage_shape.data(),
+                                         1,
+                                         data);
+    return acl_tensor_ptr(tensor);
+}
+
+/**
+ * @brief Dense 310P W8A8 K-C matrix multiplication.
+ *
+ * The weight buffer was converted at upload time into CANN's private
+ * AI-processor-affinity INT8 layout. The FP32 per-channel scale is resident at
+ * ggml_cann_w8a8_scale_offset(weight).
+ */
+static void ggml_cann_mul_mat_w8a8_a8(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * weight = dst->src[0];
+    ggml_tensor * input  = dst->src[1];
+
+    const int64_t k = weight->ne[0];
+    const int64_t n = weight->ne[1];
+    const int64_t m = input->ne[1];
+
+    GGML_ASSERT(weight->type == GGML_TYPE_W8A8);
+    GGML_ASSERT(weight->ne[2] == 1 && weight->ne[3] == 1);
+    GGML_ASSERT(input->ne[0] == k);
+    GGML_ASSERT(input->ne[2] == 1 && input->ne[3] == 1);
+    GGML_ASSERT(k % 32 == 0);
+    GGML_ASSERT(dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32);
+
+    ggml_cann_pool_alloc input_allocator(ctx.pool());
+    input_allocator.alloc(static_cast<size_t>(m * k) * sizeof(uint16_t));
+    void * input_buffer = input_allocator.get();
+
+    {
+        int64_t input_cast_ne[GGML_MAX_DIMS];
+        size_t  input_cast_nb[GGML_MAX_DIMS];
+        memcpy(input_cast_ne, input->ne, sizeof(input_cast_ne));
+        input_cast_nb[0] = sizeof(uint16_t);
+        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+            input_cast_nb[i] = input_cast_nb[i - 1] * input_cast_ne[i - 1];
+        }
+
+        acl_tensor_ptr src  = ggml_cann_create_tensor(input);
+        acl_tensor_ptr cast = ggml_cann_create_tensor(input_buffer, ACL_FLOAT16, sizeof(uint16_t),
+                                                      input_cast_ne, input_cast_nb, GGML_MAX_DIMS);
+        aclnn_cast(ctx, src.get(), cast.get(), ACL_FLOAT16);
+    }
+
+    // src1 is stored [K,M]. DynamicQuant requires a contiguous [M,K] input.
+    acl_tensor_ptr acl_input =
+        ggml_cann_create_direct_tensor(input_buffer, { m, k }, { k, 1 }, ACL_FLOAT16);
+
+    ggml_cann_pool_alloc q_x_allocator(ctx.pool(), static_cast<size_t>(m * k));
+    ggml_cann_pool_alloc act_scale_allocator(ctx.pool(), static_cast<size_t>(m) * sizeof(float));
+    acl_tensor_ptr acl_q_x = ggml_cann_create_direct_tensor(q_x_allocator.get(), { m, k }, { k, 1 }, ACL_INT8);
+    acl_tensor_ptr acl_act_scale =
+        ggml_cann_create_direct_tensor(act_scale_allocator.get(), { m }, { 1 }, ACL_FLOAT);
+
+    const size_t scale_offset = ggml_cann_w8a8_scale_offset(weight);
+    GGML_ASSERT(weight->extra != nullptr);
+    aclTensor * acl_weight = (aclTensor *) weight->extra;
+    acl_tensor_ptr acl_weight_scale =
+        ggml_cann_create_direct_tensor((char *) weight->data + scale_offset, { n }, { 1 }, ACL_FLOAT);
+
+    ggml_cann_pool_alloc output_allocator(ctx.pool());
+    void * output_buffer = dst->data;
+    int64_t output_cast_ne[GGML_MAX_DIMS];
+    size_t  output_cast_nb[GGML_MAX_DIMS];
+    if (dst->type == GGML_TYPE_F32) {
+        output_buffer = output_allocator.alloc(static_cast<size_t>(m * n) * sizeof(uint16_t));
+        memcpy(output_cast_ne, dst->ne, sizeof(output_cast_ne));
+        output_cast_nb[0] = sizeof(uint16_t);
+        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+            output_cast_nb[i] = output_cast_nb[i - 1] * output_cast_ne[i - 1];
+        }
+    }
+    acl_tensor_ptr acl_output =
+        ggml_cann_create_direct_tensor(output_buffer, { m, n }, { n, 1 }, ACL_FLOAT16);
+
+    GGML_CANN_CALL_ACLNN_OP(ctx, DynamicQuant, acl_input.get(), nullptr, acl_q_x.get(), acl_act_scale.get());
+    {
+        uint64_t        quant_workspace_size = 0;
+        aclOpExecutor * quant_executor       = nullptr;
+        const aclnnStatus quant_status = aclnnQuantMatmulV5GetWorkspaceSize(
+            acl_q_x.get(), acl_weight, acl_act_scale.get(), acl_weight_scale.get(),
+            nullptr, nullptr, nullptr, nullptr, nullptr, false, true, 0, acl_output.get(),
+            &quant_workspace_size, &quant_executor);
+        if (quant_status != 0) {
+            GGML_LOG_ERROR("%s: QuantMatmulV5GetWorkspaceSize failed: status=%d, M=%lld, K=%lld, N=%lld, "
+                           "weight=%p, scale_offset=%zu\n", __func__, quant_status,
+                           (long long) m, (long long) k, (long long) n, weight->data, scale_offset);
+        }
+        ACL_CHECK(quant_status);
+        ggml_cann_pool_alloc quant_workspace_allocator(ctx.pool(), quant_workspace_size);
+        ACL_CHECK(aclnnQuantMatmulV5(quant_workspace_allocator.get(), quant_workspace_size, quant_executor,
+                                     ctx.stream()));
+    }
+
+    if (dst->type == GGML_TYPE_F32) {
+        acl_tensor_ptr src = ggml_cann_create_tensor(output_buffer, ACL_FLOAT16, sizeof(uint16_t),
+                                                      output_cast_ne, output_cast_nb, GGML_MAX_DIMS);
+        acl_tensor_ptr out = ggml_cann_create_tensor(dst);
+        aclnn_cast(ctx, src.get(), out.get(), ACL_FLOAT);
+    }
+}
+
 /**
  * @brief Performs matrix multiplication with floating-point precision on
  * tensors using the CANN backend.
@@ -2330,10 +2454,10 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
     float weight_elem_size;
     if (type == GGML_TYPE_Q4_0) {
         weight_elem_size = float(sizeof(uint8_t)) / 2;
-    } else if (type == GGML_TYPE_Q8_0) {
+    } else if (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_W8A8) {
         weight_elem_size = float(sizeof(uint8_t));
     } else {
-        GGML_ABORT("Only support Q4_0 and Q8_0 MUL_MAT");
+        GGML_ABORT("Only support Q4_0, Q8_0, and W8A8 MUL_MAT");
     }
     float  weight_nb[]   = { src0->ne[0] * weight_elem_size, weight_elem_size };
     size_t weight_stride = src0->ne[1] * src0->ne[0] * weight_elem_size;
@@ -2379,7 +2503,18 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
 
     // aclnn
     int64_t              max_elem_size = 65535;
-    int64_t              split_size    = (src0->ne[1] / max_elem_size) + 1;
+    int64_t              split_size    = (src0->ne[1] + max_elem_size - 1) / max_elem_size;
+    const bool           split_output  = split_size > 1;
+    ggml_cann_pool_alloc split_output_allocator(ctx.pool());
+    void *               split_output_buffer = nullptr;
+    if (split_output) {
+        int64_t split_columns = max_elem_size;
+        if (split_columns > src0->ne[1]) {
+            split_columns = src0->ne[1];
+        }
+        split_output_buffer =
+            split_output_allocator.alloc(static_cast<size_t>(dst->ne[1] * split_columns) * output_elem_size);
+    }
     ggml_cann_pool_alloc workspace_allocator(ctx.pool());
     for (int64_t n1 = 0; n1 < src1->ne[3]; n1++) {
         for (int64_t c1 = 0; c1 < src1->ne[2]; c1++) {
@@ -2399,6 +2534,7 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
             int64_t scale_ne[2]      = { weight_ne[0], weight_ne[1] / QK8_0 };
             int64_t output_ne_offset = 0;
             int64_t output_ne[2]     = { weight_ne[0], dst->ne[1] };
+            int64_t output_column_offset = 0;
 
             acl_tensor_ptr acl_weight_tensor =
                 ggml_cann_create_tensor((char *) src0->data + batch0 * weight_stride, ggml_cann_type_mapping(type),
@@ -2406,9 +2542,18 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
             acl_tensor_ptr acl_scale_tensor =
                 ggml_cann_create_tensor(scale_offset + batch0 * scale_stride, ACL_FLOAT16, scale_elem_size, scale_ne,
                                         scale_nb, 2, ACL_FORMAT_ND, scale_ne_offset);
-            acl_tensor_ptr acl_output_tensor =
-                ggml_cann_create_tensor((char *) output_buffer + batch1 * output_stride, ACL_FLOAT16, output_elem_size,
-                                        output_ne, output_nb, 2, ACL_FORMAT_ND, output_ne_offset);
+            acl_tensor_ptr acl_output_tensor;
+            if (split_output) {
+                size_t split_output_nb[] = { output_elem_size,
+                                             static_cast<size_t>(weight_ne[0]) * output_elem_size };
+                acl_output_tensor = ggml_cann_create_tensor(split_output_buffer, ACL_FLOAT16, output_elem_size,
+                                                            output_ne, split_output_nb, 2, ACL_FORMAT_ND, 0);
+            } else {
+                acl_output_tensor =
+                    ggml_cann_create_tensor((char *) output_buffer + batch1 * output_stride, ACL_FLOAT16,
+                                            output_elem_size, output_ne, output_nb, 2, ACL_FORMAT_ND,
+                                            output_ne_offset);
+            }
             int64_t antiquantGroupSize = 0;
             if (src0->ne[0] > QK8_0) {
                 antiquantGroupSize = QK8_0;
@@ -2416,9 +2561,19 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
             GGML_CANN_CALL_ACLNN_OP(ctx, WeightQuantBatchMatmulV2, acl_input_tensor.get(), acl_weight_tensor.get(),
                                     acl_scale_tensor.get(), nullptr, nullptr, nullptr, nullptr, antiquantGroupSize,
                                     acl_output_tensor.get());
+            if (split_output) {
+                ACL_CHECK(aclrtMemcpy2dAsync(
+                    (char *) output_buffer + batch1 * output_stride +
+                        static_cast<size_t>(output_column_offset) * output_elem_size,
+                    static_cast<size_t>(dst->ne[0]) * output_elem_size, split_output_buffer,
+                    static_cast<size_t>(weight_ne[0]) * output_elem_size,
+                    static_cast<size_t>(weight_ne[0]) * output_elem_size, static_cast<size_t>(dst->ne[1]),
+                    ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
+            }
 
             // other splits
             for (int64_t split = 1; split < split_size; split++) {
+                output_column_offset += weight_ne[0];
                 weight_ne_offset += weight_elem_size * weight_ne[0] * weight_ne[1];
                 weight_ne[0] =
                     max_elem_size * (split + 1) > src0->ne[1] ? src0->ne[1] - (max_elem_size * split) : max_elem_size;
@@ -2433,14 +2588,36 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
                 acl_scale_tensor =
                     ggml_cann_create_tensor(scale_offset + batch0 * scale_stride, ACL_FLOAT16, scale_elem_size,
                                             scale_ne, scale_nb, 2, ACL_FORMAT_ND, scale_ne_offset);
-                acl_output_tensor =
-                    ggml_cann_create_tensor((char *) output_buffer + batch1 * output_stride, ACL_FLOAT16,
-                                            output_elem_size, output_ne, output_nb, 2, ACL_FORMAT_ND, output_ne_offset);
+                if (split_output) {
+                    size_t split_output_nb[] = { output_elem_size,
+                                                 static_cast<size_t>(weight_ne[0]) * output_elem_size };
+                    acl_output_tensor =
+                        ggml_cann_create_tensor(split_output_buffer, ACL_FLOAT16, output_elem_size, output_ne,
+                                                split_output_nb, 2, ACL_FORMAT_ND, 0);
+                } else {
+                    acl_output_tensor =
+                        ggml_cann_create_tensor((char *) output_buffer + batch1 * output_stride, ACL_FLOAT16,
+                                                output_elem_size, output_ne, output_nb, 2, ACL_FORMAT_ND,
+                                                output_ne_offset);
+                }
                 GGML_CANN_CALL_ACLNN_OP(ctx, WeightQuantBatchMatmulV2, acl_input_tensor.get(), acl_weight_tensor.get(),
                                         acl_scale_tensor.get(), nullptr, nullptr, nullptr, nullptr, antiquantGroupSize,
                                         acl_output_tensor.get());
+                if (split_output) {
+                    ACL_CHECK(aclrtMemcpy2dAsync(
+                        (char *) output_buffer + batch1 * output_stride +
+                            static_cast<size_t>(output_column_offset) * output_elem_size,
+                        static_cast<size_t>(dst->ne[0]) * output_elem_size, split_output_buffer,
+                        static_cast<size_t>(weight_ne[0]) * output_elem_size,
+                        static_cast<size_t>(weight_ne[0]) * output_elem_size, static_cast<size_t>(dst->ne[1]),
+                        ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
+                }
             }
         }
+    }
+
+    if (split_output) {
+        ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
     }
 
     // cast out
@@ -2477,6 +2654,66 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
  *            [cast dst type]
  */
 #ifdef ASCEND_310P
+/* lm_head NPU: one-time prepare of the tied-embedding (token_embd.weight)
+ * fractal copy. Idempotent: returns true when the fractal device buffer
+ * exists (cache hit or freshly prepared). The host memcpy/malloc inside MUST
+ * run outside ACL graph capture — call at load time (preferred) or in eager
+ * compute; a first-use prepare inside a captured decode graph aborts. */
+static std::unordered_map<const void *, void *> s_lmhead_fractal_cache;
+static std::mutex                               s_lmhead_fractal_mutex;
+
+static bool ggml_cann_prepare_lmhead_fractal_impl(ggml_tensor * src0, int path) {
+    const std::string wname = ggml_get_name(src0);
+    if (wname.find("token_embd.weight") == std::string::npos) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(s_lmhead_fractal_mutex);
+    if (s_lmhead_fractal_cache.find(src0->data) != s_lmhead_fractal_cache.end()) {
+        return true;
+    }
+    const int64_t n_elems = ggml_nelements(src0);
+    const int64_t groups  = n_elems / 32; /* QK8_0 */
+    const size_t  nbytes  = ggml_nbytes(src0);
+    const size_t  layout  = ggml_cann_kq_layout_size(src0, path);
+
+    /* D2H: read the planar-format data */
+    void * h_planar = malloc(nbytes);
+    ACL_CHECK(aclrtMemcpy(h_planar, nbytes, src0->data, nbytes, ACL_MEMCPY_DEVICE_TO_HOST));
+
+    /* planar -> block reassembly: quants[0..n_elems) + scales[0..groups) -> block[i] = {d, qs[32]} */
+    const uint8_t *  planar_q = (const uint8_t *) h_planar;
+    const uint16_t * planar_s = (const uint16_t *) ((const char *) h_planar + n_elems);
+    void *           h_block = malloc(nbytes);
+    for (int64_t i = 0; i < groups; ++i) {
+        char *   blk = (char *) h_block + i * 34; /* sizeof(block_q8_0) = 2+32 */
+        uint16_t d   = planar_s[i];
+        memcpy(blk, &d, 2);
+        memcpy(blk + 2, planar_q + i * 32, 32);
+    }
+    free(h_planar);
+
+    /* block format -> fractal */
+    void * h_frac = malloc(layout);
+    ggml_backend_cann_transform_kq_pub(src0, h_block, h_frac);
+    free(h_block);
+
+    /* upload the fractal data to a separate device buffer */
+    void * d_frac = nullptr;
+    ACL_CHECK(aclrtMalloc(&d_frac, layout, ACL_MEM_MALLOC_HUGE_FIRST));
+    ACL_CHECK(aclrtMemcpy(d_frac, layout, h_frac, layout, ACL_MEMCPY_HOST_TO_DEVICE));
+    free(h_frac);
+    s_lmhead_fractal_cache[src0->data] = d_frac;
+    GGML_LOG_DEBUG("lm_head fractal prepare: '%s' %lld elems -> fractal %zuB (cached)\n",
+                   wname.c_str(), (long long) n_elems, layout);
+    return true;
+}
+
+/* lm_head NPU: load-time pre-warm entry point (called from ggml-cann.cpp after
+ * the planar upload completes — eager, before any ACL graph capture). */
+bool ggml_cann_prepare_lmhead_fractal_pub(ggml_tensor * src0, int path) {
+    return ggml_cann_prepare_lmhead_fractal_impl(src0, path);
+}
+
 static void ggml_cann_mul_mat_kquant(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     ggml_tensor * src0 = dst->src[0];  // weight (re-quantized device layout)
     ggml_tensor * src1 = dst->src[1];  // activation (k, m1, m2, ...)
@@ -2553,6 +2790,29 @@ static void ggml_cann_mul_mat_kquant(ggml_backend_cann_context & ctx, ggml_tenso
 
     // ---- 3. weight tensors from the device layout ----
     char * weight_base = (char *) src0->data;
+
+    /* lm_head NPU: tied embedding (token_embd.weight) keeps the original Q8_0
+     * planar data for GET_ROWS; the fractal copy used by MUL_MAT is pre-warmed
+     * at load time (ggml-cann.cpp, right after the planar upload) so that
+     * compute-time captures only see cache lookups. The in-compute prepare
+     * below is a fallback for uncaptured paths only — host memcpy/malloc are
+     * illegal inside a captured region. */
+    {
+        const std::string wname = ggml_get_name(src0);
+        if (wname.find("token_embd.weight") != std::string::npos) {
+            if (ggml_cann_prepare_lmhead_fractal_impl(src0, path)) {
+                std::lock_guard<std::mutex> lock(s_lmhead_fractal_mutex);
+                auto it = s_lmhead_fractal_cache.find(src0->data);
+                if (it != s_lmhead_fractal_cache.end()) {
+                    weight_base = (char *) it->second;
+                } else {
+                    GGML_LOG_WARN("lm_head fractal cache miss for '%s'\n", wname.c_str());
+                }
+            } else {
+                GGML_LOG_WARN("lm_head fractal copy unavailable for '%s'\n", wname.c_str());
+            }
+        }
+    }
     acl_tensor_ptr acl_x2;
     acl_tensor_ptr acl_x2_scale;
     acl_tensor_ptr acl_yoffset;
@@ -2669,6 +2929,13 @@ void ggml_cann_mul_mat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
             break;
 #endif
 #ifdef ASCEND_310P
+        case GGML_TYPE_W8A8:
+            if (ggml_cann_w8a8_a8_enabled()) {
+                ggml_cann_mul_mat_w8a8_a8(ctx, dst);
+            } else {
+                ggml_cann_mul_mat_quant(ctx, dst, type);
+            }
+            break;
         // Re-quantized weights (device layout written at load time);
         // reachable only when ggml_cann_kq_matmul_path(src0) != NONE.
         case GGML_TYPE_Q4_K:

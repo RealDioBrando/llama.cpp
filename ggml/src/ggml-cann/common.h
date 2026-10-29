@@ -107,6 +107,32 @@ bool                       parse_bool(const std::string & value);
 int                        parse_integer(const std::string & value);
 
 /**
+ * @brief Return the CANN 9.1 AI-processor-affinity element capacity for a 2D
+ *        W8A8 weight with GGML shape ne = [K, N].
+ *
+ * The installed 310P operator uses 32-element K blocks and 16-element N blocks.
+ */
+static inline size_t ggml_cann_w8a8_hp_elements(const ggml_tensor * tensor) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_W8A8);
+    GGML_ASSERT(tensor->ne[0] % 32 == 0);
+    const int64_t k1 = (tensor->ne[0] + 31) / 32;
+    const int64_t n1 = (tensor->ne[1] + 15) / 16;
+    return static_cast<size_t>(k1) * static_cast<size_t>(n1) * 16 * 32;
+}
+
+/** @brief Byte offset of the resident FP32 per-channel scale array. */
+static inline size_t ggml_cann_w8a8_scale_offset(const ggml_tensor * tensor) {
+    return GGML_PAD(ggml_cann_w8a8_hp_elements(tensor), 128);
+}
+
+/** @brief Whether the DynamicQuant + QuantMatmulV5 A8 path is selected. */
+static inline bool ggml_cann_w8a8_a8_enabled() {
+    static const bool enabled =
+        parse_bool(get_env_as_lowercase("GGML_CANN_W8A8_A8").value_or("on"));
+    return enabled;
+}
+
+/**
  * @brief Abstract base class for memory pools used by CANN.
  */
 struct ggml_cann_pool {
