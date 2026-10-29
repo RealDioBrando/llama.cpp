@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cassert>
 #include <vector>
+#include <array>
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -124,7 +125,83 @@ static void ggml_graph_compute_helper(std::vector<uint8_t> & buf, ggml_cgraph * 
     ggml_graph_compute(graph, &plan);
 }
 
+static void test_mrope_reference() {
+    // An independent axis table catches a shared CPU/backend implementation bug.
+    const std::array<std::array<int, 4>, 5> layouts = {{
+        {24, 20, 20, 0}, {16, 16, 16, 16}, {24, 20, 20, 0}, {16, 16, 16, 16}, {64, 0, 0, 0},
+    }};
+    for (int layout = 0; layout < 5; ++layout) {
+        const bool interleaved = layout < 2 || layout == 4;
+        std::array<int, 64> axes{};
+        if (interleaved) {
+            for (int j = 0; j < layouts[layout][1]; ++j) { axes[1 + 3*j] = 1; }
+            for (int j = 0; j < layouts[layout][2]; ++j) { axes[2 + 3*j] = 2; }
+            if (layouts[layout][3]) {
+                for (int j = 48; j < 64; ++j) { axes[j] = 3; }
+            }
+        } else {
+            int j = 0;
+            for (int axis = 0; axis < 4; ++axis) {
+                for (int k = 0; k < layouts[layout][axis]; ++k) { axes[j++] = axis; }
+            }
+        }
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+            // The zero T/H/W case must be identity even with a nonzero unused extra coordinate.
+            for (int profile = 0; profile < 3; ++profile) {
+                ggml_init_params params = {1024*1024, nullptr, false};
+                ggml_context * ctx = ggml_init(params);
+                GGML_ASSERT(ctx);
+                ggml_tensor * input = ggml_new_tensor_3d(ctx, type, 128, 1, 1);
+                ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
+                const std::array<int32_t, 4> coords = profile == 0 ? std::array<int32_t, 4>{4, 6, 9, 32768}
+                    : std::array<int32_t, 4>{0, 0, 0, profile == 1 ? 0 : 32768};
+                for (int i = 0; i < 4; ++i) { ((int32_t *) pos->data)[i] = coords[i]; }
+                std::array<float, 128> values{};
+                for (int i = 0; i < 128; ++i) {
+                    float value = profile == 0 ? std::sin(float(i)*0.137f) : (i == 61 || i == 62 ? 1.0f : 0.0f);
+                    if (type == GGML_TYPE_F16) {
+                        ((ggml_fp16_t *) input->data)[i] = ggml_fp32_to_fp16(value);
+                        value = ggml_fp16_to_fp32(((ggml_fp16_t *) input->data)[i]);
+                    } else {
+                        ((float *) input->data)[i] = value;
+                    }
+                    values[i] = value;
+                }
+                auto sections = layouts[layout];
+                ggml_tensor * output = ggml_rope_multi(ctx, input, pos, nullptr, 128, sections.data(),
+                    interleaved ? GGML_ROPE_TYPE_IMROPE : GGML_ROPE_TYPE_MROPE,
+                    0, 5000000.0f, 1.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+                ggml_cgraph * graph = ggml_new_graph(ctx);
+                ggml_build_forward_expand(graph, output);
+                std::vector<uint8_t> work;
+                ggml_graph_compute_helper(work, graph, 2);
+                double max_error = 0.0;
+                for (int j = 0; j < 64; ++j) {
+                    const double angle = coords[axes[j]]*std::pow(5000000.0, -2.0*j/128.0);
+                    const double expected[2] = {
+                        values[j]*std::cos(angle) - values[j+64]*std::sin(angle),
+                        values[j]*std::sin(angle) + values[j+64]*std::cos(angle),
+                    };
+                    for (int half = 0; half < 2; ++half) {
+                        const int index = j + half*64;
+                        const float actual = type == GGML_TYPE_F32 ? ((float *) output->data)[index]
+                            : ggml_fp16_to_fp32(((ggml_fp16_t *) output->data)[index]);
+                        max_error = std::max(max_error, std::fabs(actual - expected[half]));
+                    }
+                }
+                const double tolerance = profile == 0 ? (type == GGML_TYPE_F32 ? 1e-4 : 2e-3)
+                                                      : (type == GGML_TYPE_F32 ? 1e-5 : 1e-3);
+                printf("mrope_reference layout=%d type=%s profile=%d max_error=%.9g\n",
+                       layout, ggml_type_name(type), profile, max_error);
+                GGML_ASSERT(max_error < tolerance);
+                ggml_free(ctx);
+            }
+        }
+    }
+}
+
 int main(int /*argc*/, const char ** /*argv*/) {
+    test_mrope_reference();
     struct ggml_init_params params = {
         /* .mem_size   = */ 128*1024*1024,
         /* .mem_buffer = */ NULL,

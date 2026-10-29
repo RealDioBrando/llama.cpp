@@ -12,6 +12,7 @@ if "NO_LOCAL_GGUF" not in os.environ:
 import gguf
 import pytest
 
+import conversion
 from conversion.qwen import DFlashModel, DSparkModel, Qwen3Model
 
 
@@ -193,3 +194,56 @@ def test_dflash_metadata_round_trip(dflash2_config, tmp_path):
     for key, value in expected.items():
         assert reader.fields[key].contents() == value
     assert "dflash.sample_from_anchor" not in reader.fields
+
+
+@pytest.mark.parametrize("model_class", [DFlashModel, DSparkModel])
+@pytest.mark.parametrize("target_config,expected_arch", [
+    ({"architectures": ["Qwen3ForCausalLM"]}, "Qwen3ForCausalLM"),
+    ({"architectures": ["Qwen3VLForConditionalGeneration"]}, "Qwen3VLForConditionalGeneration"),
+    ({"architectures": ["Lfm2VlForConditionalGeneration"], "text_config": {"architectures": ["Lfm2ForCausalLM"]}}, "Lfm2ForCausalLM"),
+    ({"architectures": ["Qwen3VLForConditionalGeneration"], "text_config": {"architectures": ["Qwen3ForCausalLM"]}}, "Qwen3ForCausalLM"),
+    ({"text_config": {"architectures": ["Qwen3ForCausalLM"]}}, "Qwen3ForCausalLM"),
+], ids=["text", "vl-flat", "lfm2-vl-nested", "qwen3-vl-nested", "text-config-only"])
+def test_draft_target_vocab_architecture(model_class, target_config, expected_arch, monkeypatch, tmp_path):
+    """Resolve vision wrappers before delegating draft vocabulary loading."""
+    draft, target = tmp_path / "draft", tmp_path / "target"
+    draft.mkdir()
+    target.mkdir()
+    config = {
+        "architectures": ["DFlashDraftModel"], "num_hidden_layers": 1,
+        "hidden_size": 256, "intermediate_size": 384, "vocab_size": 32,
+        "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 128,
+        "rms_norm_eps": 1e-6, "max_position_embeddings": 512,
+        "dflash_config": {"mask_token_id": 7, "target_layer_ids": [0]},
+    }
+    (draft / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (target / "config.json").write_text(json.dumps(target_config), encoding="utf-8")
+    output = tmp_path / "vocab.gguf"
+    model = model_class(draft, gguf.LlamaFileType.MOSTLY_F16, output,
+                        hparams=config, target_model_dir=target)
+    get_model_class = conversion.get_model_class
+    target_class = get_model_class(expected_arch)
+    architectures, directories = [], []
+
+    def resolve_class(architecture):
+        architectures.append(architecture)
+        return get_model_class(architecture)
+
+    def load_vocab(self):
+        directories.append(self.dir_model)
+        self.gguf_writer.add_token_list(["<unk>", "hello", "world"])
+
+    # Keep the real resolver and registry; replace only tokenizer loading.
+    monkeypatch.setattr(conversion, "get_model_class", resolve_class)
+    monkeypatch.setattr(target_class, "set_vocab", load_vocab)
+    model.set_vocab()
+    assert architectures == [expected_arch]
+    assert directories == [target]
+    assert model.dir_model == draft
+    writer = model.gguf_writer
+    writer.write_header_to_file(output)
+    writer.write_kv_data_to_file()
+    writer.close()
+    reader = gguf.GGUFReader(output)
+    assert reader.fields["tokenizer.ggml.tokens"].contents() == ["<unk>", "hello", "world"]
+    assert reader.fields["tokenizer.ggml.mask_token_id"].contents() == 7

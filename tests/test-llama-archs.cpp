@@ -10,6 +10,8 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-ext.h"
+#include "speculative.h"
 
 #include <cinttypes>
 #include <cstddef>
@@ -21,6 +23,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <array>
+#include <algorithm>
 
 // normalized mean squared error = mse(a, b) / mse(a, 0)
 static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
@@ -390,7 +394,7 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, uint32_t n_seq_max = 1) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -401,6 +405,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
+    ctx_params.n_seq_max = n_seq_max;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
     if (!encode) {
@@ -808,6 +813,178 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
     return all_ok ? 0 : 1;
 }
 
+struct dflash_injection_check {
+    struct chunk {
+        std::vector<float> features;
+        std::vector<llama_pos> positions;
+    };
+    std::vector<chunk> expected;
+    size_t features_seen = 0;
+    size_t positions_seen = 0;
+    int rope_mode = LLAMA_ROPE_TYPE_MROPE;
+
+    static bool callback(ggml_tensor * tensor, bool ask, void * data) {
+        auto & self = *static_cast<dflash_injection_check *>(data);
+        const bool features = tensor->op == GGML_OP_MUL_MAT && tensor->src[1]
+            && strcmp(tensor->src[1]->name, "inp_target_features") == 0;
+        const bool positions = strcmp(tensor->name, "Kcur_injected-0") == 0;
+        if (ask) { return !self.expected.empty() && (features || positions); }
+        if (features) {
+            GGML_ASSERT(self.features_seen < self.expected.size());
+            const auto & expected = self.expected[self.features_seen++].features;
+            // Read at the projection, before the allocator can reuse its input buffer.
+            const ggml_tensor * input = tensor->src[1];
+            GGML_ASSERT(ggml_nbytes(input) == expected.size()*sizeof(float));
+            std::vector<float> actual(expected.size());
+            ggml_backend_tensor_get(input, actual.data(), 0, ggml_nbytes(input));
+            if (memcmp(actual.data(), expected.data(), actual.size()*sizeof(float)) != 0) {
+                for (size_t i = 0; i < actual.size(); ++i) {
+                    if (memcmp(&actual[i], &expected[i], sizeof(float)) != 0) {
+                        fprintf(stderr, "feature mismatch: chunk=%zu index=%zu actual=%g expected=%g\n",
+                            self.features_seen - 1, i, actual[i], expected[i]);
+                        break;
+                    }
+                }
+                GGML_ABORT("injected target features differ");
+            }
+        }
+        if (positions) {
+            GGML_ASSERT(self.positions_seen < self.expected.size());
+            GGML_ASSERT(tensor->op == GGML_OP_ROPE);
+            int32_t parameters[16];
+            memcpy(parameters, tensor->op_params, sizeof(parameters));
+            GGML_ASSERT(parameters[1] == 128 && parameters[2] == self.rope_mode);
+            GGML_ASSERT(parameters[11] == 24 && parameters[12] == 20 && parameters[13] == 20 && parameters[14] == 0);
+            const auto & expected = self.expected[self.positions_seen++].positions;
+            const ggml_tensor * input = tensor->src[1];
+            GGML_ASSERT(ggml_nbytes(input) == expected.size()*sizeof(llama_pos));
+            std::vector<llama_pos> actual(expected.size());
+            ggml_backend_tensor_get(input, actual.data(), 0, ggml_nbytes(input));
+            GGML_ASSERT(actual == expected);
+        }
+        return true;
+    }
+};
+
+static int test_dflash_mrope(const size_t seed) {
+    // Use the real loader and generated weights; vocab_only would skip hparams.
+    gguf_context_ptr target_meta = get_gguf_ctx(LLM_ARCH_QWEN3VL, false);
+    const uint32_t sections[] = {24, 20, 20, 0};
+    gguf_set_val_u32(target_meta.get(), "qwen3vl.block_count", 36);
+    gguf_set_arr_data(target_meta.get(), "qwen3vl.rope.dimension_sections", GGUF_TYPE_UINT32, sections, 4);
+    auto target = get_model_and_ctx(target_meta.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, false, 2);
+    const std::array<uint32_t, 5> layers = {4, 10, 18, 26, 34};
+    for (auto layer : layers) { llama_set_embeddings_layer_inp(target.second.get(), layer, true); }
+
+    for (int flag : {-1, 0, 1}) {
+        for (bool swa : {false, true}) {
+            auto meta = get_gguf_ctx(LLM_ARCH_DFLASH, false);
+            gguf_set_arr_data(meta.get(), "dflash.rope.dimension_sections", GGUF_TYPE_UINT32, sections, 4);
+            gguf_set_arr_data(meta.get(), "dflash.target_layers", GGUF_TYPE_UINT32, layers.data(), layers.size());
+            if (flag >= 0) { gguf_set_val_bool(meta.get(), "dflash.rope.mrope_interleaved", flag != 0); }
+            if (swa) {
+                const bool pattern[] = {true, true};
+                gguf_set_arr_data(meta.get(), "dflash.attention.sliding_window_pattern", GGUF_TYPE_BOOL, pattern, 2);
+            } else {
+                gguf_remove_key(meta.get(), "dflash.attention.sliding_window");
+            }
+            llama_model_params mp = llama_model_default_params();
+            ggml_backend_dev_t devices[] = {nullptr};
+            mp.devices = devices;
+            size_t tensor_seed = seed;
+            llama_model_ptr model(llama_model_init_from_user(meta.get(), set_tensor_data, &tensor_seed, mp));
+            GGML_ASSERT(model);
+            GGML_ASSERT(llama_model_rope_type(model.get()) == (flag == 1 ? LLAMA_ROPE_TYPE_IMROPE : LLAMA_ROPE_TYPE_MROPE));
+            GGML_ASSERT((llama_model_n_swa(model.get()) > 0) == swa);
+            dflash_injection_check check;
+            check.rope_mode = flag == 1 ? LLAMA_ROPE_TYPE_IMROPE : LLAMA_ROPE_TYPE_MROPE;
+            llama_context_params cp = llama_context_default_params();
+            cp.n_ctx = 256;
+            cp.n_seq_max = 2;
+            cp.n_batch = 8;
+            cp.n_ubatch = 2;
+            cp.n_threads = cp.n_threads_batch = 2;
+            cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+            cp.cb_eval = dflash_injection_check::callback;
+            cp.cb_eval_user_data = &check;
+            llama_context_ptr draft(llama_init_from_model(model.get(), cp));
+            GGML_ASSERT(draft);
+            common_params_speculative params;
+            params.types = {COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH};
+            params.draft.ctx_tgt = target.second.get();
+            params.draft.ctx_dft = draft.get();
+            params.draft.backend_sampling = false;
+            common_speculative_ptr spec(common_speculative_init(params, 2));
+            GGML_ASSERT(spec);
+            for (int scenario = 0; scenario < 5; ++scenario) {
+                llama_memory_clear(llama_get_memory(target.second.get()), true);
+                llama_memory_clear(llama_get_memory(draft.get()), true);
+                check.expected.clear();
+                check.features_seen = check.positions_seen = 0;
+                const bool image = scenario != 3;
+                const int rows = scenario == 1 ? 1 : scenario == 4 ? 7 : 5;
+                const bool pinned = scenario != 2;
+                llama_batch batch = llama_batch_init(rows, image ? 256 : 0, 1);
+                if (image) {
+                    free(batch.pos);
+                    batch.pos = static_cast<llama_pos *>(malloc(4*rows*sizeof(llama_pos)));
+                }
+                batch.n_tokens = rows;
+                for (int i = 0; i < rows; ++i) {
+                    if (image) {
+                        for (int j = 0; j < 256; ++j) { batch.embd[256*i+j] = 0.001f*(1+i+j); }
+                    } else { batch.token[i] = i+1; }
+                    batch.pos[i] = image && pinned ? (scenario == 4 && i >= 5 ? 9 : 4) : i;
+                    if (image) {
+                        batch.pos[rows+i] = 101+i;
+                        batch.pos[2*rows+i] = 201+i;
+                        batch.pos[3*rows+i] = 0;
+                    }
+                    batch.n_seq_id[i] = 1;
+                    batch.seq_id[i][0] = scenario == 4 && i < 5 ? 1 : 0;
+                    batch.logits[i] = true;
+                }
+                GGML_ASSERT(llama_decode(target.second.get(), batch) == 0);
+                for (auto layer : layers) { GGML_ASSERT(llama_get_embeddings_layer_inp(target.second.get(), layer)); }
+                if (!(swa && image && pinned && rows > 1)) {
+                    // Literal row tables exercise the final short chunk and reversed sequence order.
+                    const std::vector<std::vector<int>> row_table = scenario == 4
+                        ? std::vector<std::vector<int>>{{5, 6}, {0, 1}, {2, 3}, {4}}
+                        : rows == 1 ? std::vector<std::vector<int>>{{0}}
+                                    : std::vector<std::vector<int>>{{0, 1}, {2, 3}, {4}};
+                    for (const auto & indices : row_table) {
+                        dflash_injection_check::chunk expected;
+                        for (int row : indices) {
+                            for (auto layer : layers) {
+                                const float * source = llama_get_embeddings_layer_inp(target.second.get(), layer) + 256*row;
+                                expected.features.insert(expected.features.end(), source, source+256);
+                            }
+                        }
+                        for (int axis = 0; axis < 4; ++axis) {
+                            for (int row : indices) {
+                                expected.positions.push_back(axis == 3 ? 0 : image && axis > 0 ? (axis == 1 ? 101 : 201)+row
+                                    : image && pinned ? (scenario == 4 && row >= 5 ? 9 : 4) : row);
+                            }
+                        }
+                        check.expected.push_back(std::move(expected));
+                    }
+                }
+                GGML_ASSERT(common_speculative_process(spec.get(), batch));
+                GGML_ASSERT(check.features_seen == check.expected.size());
+                GGML_ASSERT(check.positions_seen == check.expected.size());
+                if (scenario == 4 && !swa) {
+                    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(draft.get()), 0) == 9);
+                    GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(draft.get()), 1) == 4);
+                }
+                printf("dflash_injection flag=%d swa=%d scenario=%d chunks=%zu features=%zu positions=%zu\n",
+                    flag, swa, scenario, check.expected.size(), check.features_seen, check.positions_seen);
+                llama_batch_free(batch);
+            }
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
     common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
@@ -867,6 +1044,10 @@ int main(int argc, char ** argv) {
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (arch == LLM_ARCH_DFLASH && out.empty()) {
+            common_log_set_verbosity_thold(verbosity);
+            return test_dflash_mrope(seed);
+        }
         if (!out.empty()) {
             return save_models(arch, seed, verbosity, out);
         }

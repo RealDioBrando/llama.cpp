@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 import os
 import sys
+import tempfile
 
 # Necessary to load the local gguf package
 if "NO_LOCAL_GGUF" not in os.environ and (Path(__file__).parent.parent.parent / 'gguf-py').exists():
@@ -232,6 +233,35 @@ class TestMetadataMethod(unittest.TestCase):
         got = gguf.Metadata.apply_metadata_heuristic(gguf.Metadata(), model_card=None, hf_params=None, model_path=model_dir_path)
         expect = gguf.Metadata(name='Hermes 2 Pro Llama 3 8b DPO', finetune='DPO', basename='hermes-2-pro-llama-3', size_label='8B')
         self.assertEqual(got, expect)
+
+
+class TestMRopeMetadata(unittest.TestCase):
+    def test_interleaved_roundtrip(self):
+        for value in (True, False, None):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "draft.gguf"
+                writer = gguf.GGUFWriter(path, "dflash")
+                writer.add_rope_dimension_sections([24, 20, 20, 0])
+                if value is not None:
+                    writer.add_rope_mrope_interleaved(value)
+                writer.write_header_to_file()
+                writer.write_kv_data_to_file()
+                writer.write_tensors_to_file()
+                writer.close()
+                reader = gguf.GGUFReader(path)
+                key = "dflash.rope.mrope_interleaved"
+                sections = reader.get_field("dflash.rope.dimension_sections")
+                assert sections is not None
+                self.assertEqual(sections.contents(), [24, 20, 20, 0])
+                if value is None:
+                    self.assertIsNone(reader.get_field(key))
+                else:
+                    field = reader.get_field(key)
+                    assert field is not None
+                    self.assertEqual(field.types, [gguf.GGUFValueType.BOOL])
+                    self.assertEqual(field.contents(), value)
+                    del field
+                del sections, reader
 
 
 if __name__ == "__main__":
