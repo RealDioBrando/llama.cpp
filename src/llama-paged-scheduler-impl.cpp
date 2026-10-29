@@ -601,10 +601,6 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
 
     curr_info.n_seq            = batch_size;
     curr_info.n_tokens         = total_tokens;
-    curr_info.is_prefill       = std::any_of(candidates.begin(), candidates.end(),
-                                             [](const llama_sequence_group * group) {
-                                                 return group && group->n_decoded == 0;
-                                             });
     // Keep the block table shape fixed so ACL graph replay matches across
     // decode steps. Invalid padding is ignored because context_lens bounds
     // each sequence.

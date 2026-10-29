@@ -280,10 +280,6 @@ const llama_ubatch & llama_memory_hybrid_paged_context::get_ubatch() const {
     return ubatches[i_next];
 }
 
-bool llama_memory_hybrid_paged_context::is_prefill() const {
-    return ctx_attn->is_prefill();
-}
-
 const llama_kv_cache_paged_context * llama_memory_hybrid_paged_context::get_paged_attn() const {
     return static_cast<const llama_kv_cache_paged_context *>(ctx_attn.get());
 }

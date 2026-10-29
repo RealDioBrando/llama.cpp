@@ -521,10 +521,6 @@ const llama_ubatch & llama_kv_cache_paged_context::get_ubatch() const {
     return ubatches[i_cur];
 }
 
-bool llama_kv_cache_paged_context::is_prefill() const {
-    return batch_info != nullptr && batch_info->is_prefill;
-}
-
 struct ggml_tensor * llama_kv_cache_paged_context::get_k(int layer_idx) const {
     GGML_ASSERT(manager && "manager has not been initialized.");
     return manager->get_k_tensor(layer_idx);

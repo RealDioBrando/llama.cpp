@@ -3127,11 +3127,35 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
 
     bool graph_capture_required = false;
 #ifdef USE_ACL_GRAPH
-    // llama_context supplies the execution phase explicitly. Infer from an op
-    // shape is unsafe for hybrid graphs with internal width-one matmuls.
+    // Paged metadata gives a backend-local phase signal: one token per
+    // sequence is decode, while chunked prefill has several tokens per seq.
+    // Keep the matmul fallback for graphs without paged attention.
+    auto graph_is_prefill = [&](const ggml_cgraph * graph) {
+        bool has_paged_attn = false;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            const ggml_tensor * node = graph->nodes[i];
+            if (node->op != GGML_OP_PAGED_ATTN) {
+                continue;
+            }
+            has_paged_attn = true;
+            if (node->src[6] && node->src[9] && node->src[9]->ne[0] > 0) {
+                return node->src[6]->ne[0] > node->src[9]->ne[0];
+            }
+        }
+        if (!has_paged_attn) {
+            for (int i = 0; i < graph->n_nodes; i++) {
+                ggml_tensor * node = graph->nodes[i];
+                if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr) {
+                    return node->src[1]->ne[1] > 1;
+                }
+            }
+        }
+        return false;
+    };
+
     static bool prefill_use_graph_override =
         parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
-    bool use_cann_graph = !cann_ctx->graph_prefill || prefill_use_graph_override;
+    bool use_cann_graph = !graph_is_prefill(cgraph) || prefill_use_graph_override;
 
     if (!cann_ctx->acl_graph_mode) {
         use_cann_graph = false;
@@ -3928,11 +3952,6 @@ static size_t ggml_backend_cann_reg_get_device_count(ggml_backend_reg_t reg) {
     return ctx->devices.size();
 }
 
-static void ggml_backend_cann_set_prefill(ggml_backend_t backend, bool prefill) {
-    auto * ctx = (ggml_backend_cann_context *) backend->context;
-    ctx->graph_prefill = prefill;
-}
-
 static ggml_backend_dev_t ggml_backend_cann_reg_get_device(ggml_backend_reg_t reg, size_t index) {
     ggml_backend_cann_reg_context * ctx = (ggml_backend_cann_reg_context *) reg->context;
     GGML_ASSERT(index < ctx->devices.size());
@@ -3940,9 +3959,9 @@ static ggml_backend_dev_t ggml_backend_cann_reg_get_device(ggml_backend_reg_t re
 }
 
 static void * ggml_backend_cann_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-    if (strcmp(name, "ggml_backend_cann_set_prefill") == 0) {
-        return (void *) ggml_backend_cann_set_prefill;
-    }
+    GGML_UNUSED(reg);
+    GGML_UNUSED(name);
+    // reserved for future use
     return nullptr;
 }
 

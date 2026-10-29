@@ -89,7 +89,6 @@ public:
 
     llama_memory_status get_status() const override;
     const llama_ubatch & get_ubatch() const override;
-    bool is_prefill() const override;
 
     const llama_kv_cache_paged_context * get_paged_attn() const;
     const llama_memory_recurrent_context * get_recr() const;

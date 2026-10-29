@@ -763,7 +763,6 @@ struct ggml_backend_cann_context {
     bool                      capturing       = false;   /**< true between CaptureBegin/End. */
 #endif
     bool                   async_mode;
-    bool                   graph_prefill = false;
     // Rope Cache
     ggml_cann_rope_cache   rope_cache;
     // Constant Pool

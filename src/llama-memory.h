@@ -62,10 +62,6 @@ struct llama_memory_context_i {
     // get the current ubatch
     virtual const llama_ubatch & get_ubatch() const = 0;
 
-    // whether the current ubatch is a prefill phase; paged scheduler provides
-    // this explicitly. Other memory types fall back to ubatch shape.
-    virtual bool is_prefill() const { return get_ubatch().n_seq_tokens > 1; }
-
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
 };
