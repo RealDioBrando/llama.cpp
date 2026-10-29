@@ -93,14 +93,6 @@ llama_model_gemma3::graph<iswa>::graph(const llama_model & model, const llm_grap
     inpL = ggml_scale(ctx0, inpL, ubatch.token ? sqrtf(n_embd) : 1.0f);
     cb(inpL, "inp_scaled", -1);
 
-    // the residual stream overflows F16 (above 65504 after a few layers), so it
-    // stays F32; attention and the FFN up to the output projections use act_type
-    if (inpL->type != GGML_TYPE_F32) {
-        type_res = GGML_TYPE_F32;
-        inpL     = ggml_cast(ctx0, inpL, GGML_TYPE_F32);
-    }
-
-
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
@@ -166,8 +158,8 @@ llama_model_gemma3::graph<iswa>::graph(const llama_model & model, const llm_grap
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f, il);
         }
         if (il == n_layer - 1 && inp_out_ids) {
-            cur  = build_out_rows( cur, inp_out_ids);
-            inpL = build_out_rows(inpL, inp_out_ids);
+            cur  = ggml_get_rows(ctx0,  cur, inp_out_ids);
+            inpL = ggml_get_rows(ctx0, inpL, inp_out_ids);
         }
         cur = build_norm(cur,
                 model.layers[il].attn_post_norm, NULL,
@@ -215,7 +207,7 @@ llama_model_gemma3::graph<iswa>::graph(const llama_model & model, const llm_grap
     res->t_embd = cur;
 
     // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s, GGML_TYPE_F32);
+    cur = build_lora_mm(model.output, cur, model.output_s);
 
     if (hparams.f_final_logit_softcapping) {
         cur = ggml_scale(ctx0, cur, 1.0f / hparams.f_final_logit_softcapping);

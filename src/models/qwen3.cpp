@@ -150,7 +150,7 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
     res->t_embd = cur;
 
     // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur, model.output_s, GGML_TYPE_F32);
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;

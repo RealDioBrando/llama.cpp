@@ -169,8 +169,8 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
         }
 
         if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
-            cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
-            inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            cur   = build_out_rows(cur, inp_out_ids);
+            inpSA = build_out_rows(inpSA, inp_out_ids);
         }
 
         // Residual connection
@@ -207,14 +207,14 @@ llama_model_qwen3next::graph::graph(const llama_model & model, const llm_graph_p
     res->t_h_nextn = cur;
 
     if (!cparams.embeddings_nextn_masked && inp_out_ids) {
-        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+        cur = build_out_rows(cur, inp_out_ids);
     }
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
     // LM head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur, model.output_s, GGML_TYPE_F32);
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
@@ -747,8 +747,8 @@ llama_model_qwen3next::graph_mtp::graph_mtp(const llama_model & model, const llm
     cb(cur, "mtp_attn_out", il);
 
     if (inp_out_ids) {
-        cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
-        inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+        cur   = build_out_rows(cur,   inp_out_ids);
+        inpSA = build_out_rows(inpSA, inp_out_ids);
     }
 
     cur = ggml_add(ctx0, cur, inpSA);
@@ -814,7 +814,7 @@ llama_model_qwen3next::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN3NEXT MTP: missing LM head (nextn.shared_head_head or model.output)");
-    cur = build_lora_mm(head_w, cur, head_s);
+    cur = build_lora_mm(head_w, cur, head_s, GGML_TYPE_F32);
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
