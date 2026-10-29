@@ -2809,7 +2809,7 @@ static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
         return true;
     }
 
-    return true;
+    return false;
 }
 
 #ifdef USE_ACL_GRAPH
@@ -3015,7 +3015,6 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
             }
 
             if (opt_fusion) {
-                // Two-way: ADD + RMS_NORM
                 if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM })) {
                     ggml_cann_op_add_rms_norm_fused(*cann_ctx, node, cgraph->nodes[i + 1]);
                     i++;
@@ -3559,7 +3558,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 return false;
             }
             return true;
-       case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_EXT:
             {
                 float maxBias      = 0.0f;
                 float logitSoftcap = 0.0f;

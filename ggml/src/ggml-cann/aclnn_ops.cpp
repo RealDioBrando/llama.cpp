@@ -94,13 +94,10 @@
 #include <aclnnop/aclnn_zero.h>
 #include <float.h>
 
-#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <exception>
-#include <atomic>
-#include <memory>
-#include <string>
 #include <vector>
 
 #define GGML_COMMON_DECL_C
@@ -2259,8 +2256,15 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
         }
     }
 
-    static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
+    acl_tensor_ptr acl_input_tensor = ggml_cann_create_tensor(input, bcast_input_ne, bcast_input_nb, n_dims);
+    int64_t        transpose_ne[]   = { bcast_weight_ne[1], bcast_weight_ne[0], bcast_weight_ne[2],
+                                        bcast_weight_ne[3], bcast_weight_ne[4], bcast_weight_ne[5] };
+    size_t         transpose_nb[]   = { bcast_weight_nb[1], bcast_weight_nb[0], bcast_weight_nb[2],
+                                        bcast_weight_nb[3], bcast_weight_nb[4], bcast_weight_nb[5] };
+    acl_tensor_ptr acl_weight_tensor;
 
+    // Only check env once.
+    static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
     bool used_tied_copy = false;
 #ifdef ASCEND_310P
     // The tied lm head (token_embd.weight) keeps its ND data for GET_ROWS;
@@ -2270,30 +2274,18 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
     if (tied_cache != nullptr && n_dims == 2) {
         auto it = tied_cache->entries.find(weight);
         if (it != tied_cache->entries.end()) {
+            acl_weight_tensor = ggml_cann_create_tensor(it->second->buffer, ACL_FLOAT16, sizeof(uint16_t),
+                                                        transpose_ne, transpose_nb, n_dims,
+                                                        ACL_FORMAT_FRACTAL_NZ);
             used_tied_copy = true;
         }
     }
 #endif
 
-    acl_tensor_ptr acl_input_tensor = ggml_cann_create_tensor(input, bcast_input_ne, bcast_input_nb, n_dims);
-    int64_t        transpose_ne[]   = { bcast_weight_ne[1], bcast_weight_ne[0], bcast_weight_ne[2],
-                                        bcast_weight_ne[3], bcast_weight_ne[4], bcast_weight_ne[5] };
-    size_t         transpose_nb[]   = { bcast_weight_nb[1], bcast_weight_nb[0], bcast_weight_nb[2],
-                                        bcast_weight_nb[3], bcast_weight_nb[4], bcast_weight_nb[5] };
-    acl_tensor_ptr acl_weight_tensor;
-
-#ifdef ASCEND_310P
-    if (used_tied_copy) {
-        acl_weight_tensor = ggml_cann_create_tensor(tied_cache->entries.at(weight)->buffer, ACL_FLOAT16,
-                                                    sizeof(uint16_t), transpose_ne, transpose_nb, n_dims,
-                                                    ACL_FORMAT_FRACTAL_NZ);
-    } else
-#endif
     if (!used_tied_copy && weight_to_nz && weight->type != GGML_TYPE_BF16 &&
         ggml_cann_is_weight_layout_candidate(weight)) {
-        acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims,
-                                                    ACL_FORMAT_FRACTAL_NZ);
-    } else {
+        acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_FRACTAL_NZ);
+    } else if (!used_tied_copy) {
         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_ND);
     }
     acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst, bcast_dst_ne, bcast_dst_nb, n_dims);
@@ -2312,7 +2304,6 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
             GGML_CANN_CALL_ACLNN_OP(ctx, Matmul, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(), 1);
             break;
     }
-
 }
 
 /**
@@ -5268,8 +5259,8 @@ void ggml_cann_gated_linear_attn(ggml_backend_cann_context & ctx, ggml_tensor * 
                 aclnn_add(ctx, acl_s_new.get(), tmp_tensor.get(), nullptr);
                 // compute output
                 GGML_CANN_CALL_ACLNN_OP(ctx, Mv, acl_s_new_t.get(), acl_q.get(), acl_o.get(), 1);
-               aclnn_muls(ctx, acl_o.get(), scale, nullptr, true);
-           }
-       }
-   }
+                aclnn_muls(ctx, acl_o.get(), scale, nullptr, true);
+            }
+        }
+    }
 }

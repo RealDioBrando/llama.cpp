@@ -1458,7 +1458,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
-
         graph_alloc_us = graph_timing ? ggml_time_us() - t_alloc_us : 0;
     }
 

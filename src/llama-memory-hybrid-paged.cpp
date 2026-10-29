@@ -50,7 +50,7 @@ llama_memory_hybrid_paged::llama_memory_hybrid_paged(
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     GGML_ASSERT(cpu_dev && "no CPU device found for paged KV cache");
 
-    auto * backend_gpu = gpu_dev && ggml_backend_dev_type(gpu_dev) != GGML_BACKEND_DEVICE_TYPE_CPU
+    auto * backend_gpu = gpu_dev && ggml_backend_dev_type(gpu_dev) == GGML_BACKEND_DEVICE_TYPE_GPU
                              ? ggml_backend_dev_init(gpu_dev, nullptr)
                              : ggml_backend_dev_init(cpu_dev, nullptr);
     auto * backend_cpu = ggml_backend_dev_init(cpu_dev, nullptr);

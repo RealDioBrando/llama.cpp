@@ -769,6 +769,7 @@ struct ggml_backend_cann_context {
     // Constant Pool
     ggml_cann_tensor_cache rms_norm_one_tensor_cache;
     ggml_cann_tensor_cache rms_norm_zero_tensor_cache;
+
     aclrtStream streams[GGML_CANN_MAX_STREAMS] = { nullptr }; /**< Array of streams for the device. */
 
     /**
@@ -839,6 +840,7 @@ struct ggml_backend_cann_context {
      * @return A unique pointer to the new memory pool.
      */
     static std::unique_ptr<ggml_cann_pool> new_pool_for_device(int device);
+
     /**
      * @brief Get or create the memory pool for the context.
      * @return Reference to the memory pool.
@@ -849,7 +851,6 @@ struct ggml_backend_cann_context {
         }
         return *mem_pool;
     }
-
 };
 
 #endif  // CANN_COMMON_H

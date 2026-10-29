@@ -1753,8 +1753,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-kvbls", "--kv-block-size"}, "N",
         "fixed number of tokens for a given paged block (default: 16)",
         [](common_params & params, int value) {
-            if (value <= 0 || value % 16 != 0) {
-                throw std::invalid_argument("--kv-block-size must be a positive multiple of 16");
+            if (value <= 0 || (value & (value - 1)) != 0) {
+                throw std::invalid_argument("--kv-block-size must be a positive power of 2");
             }
             params.block_size = value;
         }
