@@ -10,7 +10,7 @@ import torch
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .base import LazyTorchTensor, ModelBase, TextModel, gguf, logger
+from .base import LazyTorchTensor, ModelBase, ModelType, TextModel, get_model_architecture, gguf, logger
 
 
 @ModelBase.register("QWenLMHeadModel")
@@ -688,7 +688,8 @@ class DFlashModel(Qwen3Model):
         from . import get_model_class
         with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
             target_hparams = json.load(f)
-            target_arch = target_hparams["architectures"][0]
+        # Resolve vision wrappers to the text architecture used for vocabulary loading.
+        target_arch = get_model_architecture(target_hparams, ModelType.TEXT)
         target_cls = get_model_class(target_arch)
 
         if target_cls is not type(self):
