@@ -330,7 +330,10 @@ llama_memory_context_ptr llama_kv_cache_paged::init_batch(llama_batch_allocr & b
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = balloc.split_simple(n_ubatch);
+            // Paged metadata requires one token count per sequence set.
+            // split_simple emits one pseudo-sequence per token and hides
+            // prefill from phase-sensitive backends.
+            auto ubatch = balloc.split_equal(n_ubatch, false, 0);
             if (ubatch.n_tokens == 0) {
                 break;
             }
@@ -516,6 +519,10 @@ bool llama_kv_cache_paged_context::apply() {
 const llama_ubatch & llama_kv_cache_paged_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     return ubatches[i_cur];
+}
+
+bool llama_kv_cache_paged_context::is_prefill() const {
+    return batch_info != nullptr && batch_info->is_prefill;
 }
 
 struct ggml_tensor * llama_kv_cache_paged_context::get_k(int layer_idx) const {

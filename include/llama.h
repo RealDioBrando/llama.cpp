@@ -286,6 +286,7 @@ extern "C" {
         int32_t * context_lens;  // [n_seq]
         int32_t * batch_offsets;  // [n_seq]
         int32_t * batch_lens;  // [n_seq]
+        bool      is_prefill;
     } llama_paged_batch_info;
 
     enum llama_model_kv_override_type {

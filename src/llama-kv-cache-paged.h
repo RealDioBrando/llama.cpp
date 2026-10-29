@@ -183,6 +183,7 @@ class llama_kv_cache_paged_context : public llama_memory_context_i {
     bool                 next() override;
     bool                 apply() override;
     const llama_ubatch & get_ubatch() const override;
+    bool                 is_prefill() const override;
 
     llama_memory_status get_status() const override { return status; }
 

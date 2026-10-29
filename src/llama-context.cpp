@@ -1477,7 +1477,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const auto compute_t0 = graph_timing ? ggml_time_us() : 0;
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, ubatch.n_seq_tokens > 1);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, mctx->is_prefill());
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
