@@ -2993,14 +2993,23 @@ static void ggml_backend_cann_synchronize(ggml_backend_t backend) {
 static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
                                int                                 node_idx,
                                std::initializer_list<enum ggml_op> ops) {
-    if (!ggml_can_fuse(cgraph, node_idx, ops)) {
-        return false;
-    }
-
-    // CANN backend supports fusing ADD + RMS_NORM operations
     if ((ops.size() == 2) && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_RMS_NORM) {
-        ggml_tensor * add_node = cgraph->nodes[node_idx];
-        // TODO: support broadcast for ADD + RMS_NORM
+        ggml_tensor * add_node       = cgraph->nodes[node_idx];
+        ggml_tensor * rms_norm_node  = cgraph->nodes[node_idx + 1];
+
+        if (add_node->op != GGML_OP_ADD || rms_norm_node->op != GGML_OP_RMS_NORM) {
+            return false;
+        }
+        if ((add_node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            (rms_norm_node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+        if (rms_norm_node->src[0] != add_node) {
+            return false;
+        }
+        if (add_node->type != rms_norm_node->type) {
+            return false;
+        }
         if (add_node->src[0]->ne[0] != add_node->src[1]->ne[0] || add_node->src[0]->ne[1] != add_node->src[1]->ne[1] ||
             add_node->src[0]->ne[2] != add_node->src[1]->ne[2] || add_node->src[0]->ne[3] != add_node->src[1]->ne[3]) {
             return false;
@@ -3008,7 +3017,8 @@ static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
         return true;
     }
 
-    return false;
+    // 其他融合模式走 ggml 原生通用判断
+    return ggml_can_fuse(cgraph, node_idx, ops);
 }
 
 #ifdef USE_ACL_GRAPH
