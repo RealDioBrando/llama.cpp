@@ -4226,7 +4226,8 @@ static void ggml_cann_mul_mat_id_fp(ggml_backend_cann_context & ctx, ggml_tensor
  * @param ctx The CANN backend context for operation execution.
  * @param dst The destination tensor where the multiplication result will be stored.
  *
- * @note Only Q4_0 and Q8_0 quantization formats are supported.
+ * @note Q4_0, Q8_0, and W8A8 expert weights are supported. W8A8 uses
+ * per-channel scales rather than per-32-value-block scales.
  * @note The function handles automatic type conversion to/from F16 as needed by the hardware.
  */
 static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
