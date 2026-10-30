@@ -4252,6 +4252,73 @@ void ggml_cann_mul_mat_id(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
 
 #ifdef ASCEND_310P
 
+// GQA head expansion for one k/v batch-element slab: (K, Nk, D) -> (K, N, D)
+// with Q head n reading KV head n / ratio. IFA on 310P rejects GQA when
+// head_dim > 128, so the KV heads must be materialized to MHA before the call.
+// All mechanisms below produce byte-identical output (the same
+// (K, N, D) contiguous layout the IFA k/v descriptors assume); they only
+// differ in kernel efficiency. msprof #56/#58/#59 showed the expansion is
+// 87% of the FA decode device time and the RepeatInterleave kernel runs ~5x
+// below copy speed, while the Cat-based variant halves it (-56% expansion,
+// -49% FA section). Env GGML_CANN_FA_EXPAND, sampled once:
+//   cat (default)  aclnnCat of N strided single-head views (D, 1, K) along dim 1
+//   ri             aclnnRepeatInterleaveIntWithDim on the flat row view (D, K*Nk, 1)
+static void ggml_cann_fa_gqa_expand_310p(ggml_backend_cann_context & ctx, const void * src, void * dst,
+                                         int64_t D, int64_t K, int64_t Nk, int64_t N) {
+    static const int mode = []() {
+        const char * e = getenv("GGML_CANN_FA_EXPAND");
+        if (e != nullptr && e[0] != '\0') {
+            if ((e[0] | 0x20) == 'r') return 0;                 // ri
+        }
+        return 2;                                               // cat (default)
+    }();
+    const int64_t ratio = N / Nk;
+    const size_t   es    = sizeof(uint16_t);
+
+    if (mode == 2) {
+        // N single-head strided views (D, 1, K) concatenated along the head
+        // dim -> (D, N, K); input order [h0 x ratio, h1 x ratio, ...] gives
+        // the head order n -> n / ratio that the IFA contract expects.
+        int64_t view_ne[3] = { D, 1, K };
+        size_t  view_nb[3] = { es, (size_t) D * es, (size_t) Nk * D * es };
+        int64_t out_ne[3]  = { D, N, K };
+        size_t  out_nb[3];
+        out_nb[0] = es;
+        for (int i = 1; i < 3; ++i) {
+            out_nb[i] = out_nb[i - 1] * out_ne[i - 1];
+        }
+        std::vector<acl_tensor_ptr> views;
+        views.reserve(N);
+        for (int64_t n = 0; n < N; ++n) {
+            const char * head_base = (const char *) src + (n / ratio) * D * es;
+            views.push_back(ggml_cann_create_tensor((void *) head_base, ACL_FLOAT16, es, view_ne, view_nb, 3));
+        }
+        acl_tensor_list_ptr view_list = ggml_cann_create_tensor_list(views);
+        acl_tensor_ptr      acl_out   = ggml_cann_create_tensor(dst, ACL_FLOAT16, es, out_ne, out_nb, 3);
+        GGML_CANN_CALL_ACLNN_OP(ctx, Cat, view_list.get(), (int64_t) 1, acl_out.get());
+        return;
+    }
+
+    int64_t src_ne[3];
+    size_t  src_nb[3];
+    int64_t dst_ne[3];
+    size_t  dst_nb[3];
+    // flat row view: (D, K*Nk, 1) -> interleave dim 1 -> (D, K*N, 1)
+    src_ne[0] = D; src_ne[1] = K * Nk; src_ne[2] = 1;
+    dst_ne[0] = D; dst_ne[1] = K * N;  dst_ne[2] = 1;
+    const int64_t inter_dim_size = K * N;  // size of the interleaved dim after expansion
+    src_nb[0] = es;
+    dst_nb[0] = es;
+    for (int i = 1; i < 3; ++i) {
+        src_nb[i] = src_nb[i - 1] * src_ne[i - 1];
+        dst_nb[i] = dst_nb[i - 1] * dst_ne[i - 1];
+    }
+    acl_tensor_ptr acl_src = ggml_cann_create_tensor((void *) src, ACL_FLOAT16, es, src_ne, src_nb, 3);
+    acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst, ACL_FLOAT16, es, dst_ne, dst_nb, 3);
+    GGML_CANN_CALL_ACLNN_OP(ctx, RepeatInterleaveIntWithDim, acl_src.get(), ratio, (int64_t) 1, inter_dim_size,
+                            acl_dst.get());
+}
+
 // FlashAttention on Ascend 310P, based on ops-transformer kernels:
 //  - prefill (q_len > 1): aclnnPromptFlashAttentionV3
 //  - decode  (q_len == 1): aclnnIncreFlashAttentionV4
@@ -4314,15 +4381,23 @@ static void ggml_cann_flash_attn_ext_310p(ggml_backend_cann_context & ctx, ggml_
 
     if (q_len == 1) {
         // ================= decode: aclnnIncreFlashAttentionV4 =================
-        // One IFA call per batch element. IFA consumes ONE k/v tensor-list
-        // entry per batch element; the previous single-entry list left every
-        // element beyond the first uncomputed (all-zero output — verified by
-        // device dumps: with B=2, b=0 correct, b=1 exactly zero), which
-        // silently dropped the attention contribution of every sequence but
-        // the first during multi-sequence decode.
+        // IFA consumes ONE k/v tensor-list entry per batch element. Two ways
+        // to satisfy that contract:
+        //  - per-batch-element loop: one IFA call per element, the verified
+        //    contract from the multi-sequence zero-output fix (the historical
+        //    single-entry list left every element beyond the first uncomputed:
+        //    b=0 correct, b>=1 exactly zero). Measured against the batched
+        //    alternative (one call with a B-entry tensor list) in 17
+        //    combinations - graph/eager x GDR-CPU/NPU x concurrency levels -
+        //    the loop wins or ties in every single one (msprof: the IFA
+        //    kernel processes list entries strictly serially, and the loop
+        //    carries an L2 locality bonus), so the loop is the only path kept
+        //    here; the batched experiment remains available on the
+        //    fa-batched-multiseq branch.
+
         // k/v: (B, K, Nk, D) -> per-b slab -> expand heads to N when GQA
         const size_t q_b_stride = (src0->type == GGML_TYPE_F16) ? src0->nb[3]
-                                                                : (size_t) N * D * sizeof(uint16_t);
+                                                                 : (size_t) N * D * sizeof(uint16_t);
 
         // output f16 (B,1,N,D)
         ggml_cann_pool_alloc out_f16_allocator(ctx.pool());
@@ -4349,31 +4424,13 @@ static void ggml_cann_flash_attn_ext_310p(ggml_backend_cann_context & ctx, ggml_
             bsnd(kv_ne, kv_nb, D, N, K, 1, sizeof(uint16_t));
 
             if (Nk != N) {
-                const int64_t ratio = N / Nk;
                 void * k_exp = k_exp_allocator.alloc((size_t) K * N * D * sizeof(uint16_t));
                 void * v_exp = v_exp_allocator.alloc((size_t) K * N * D * sizeof(uint16_t));
                 k_exp_ptr = k_exp;
                 v_exp_ptr = v_exp;
 
-                // per-b slab reinterpreted as (K*Nk, D); interleave along dim 1 gives
-                // (K*N, D) with head order [0,0,...,1,1,...] matching h -> h / ratio
-                int64_t flat_ne[3] = { D, K * Nk, 1 };
-                size_t  flat_nb[3] = { sizeof(uint16_t), (size_t) D * sizeof(uint16_t),
-                                        (size_t) D * K * Nk * sizeof(uint16_t) };
-                int64_t expd_ne[3] = { D, K * N, 1 };
-                size_t  expd_nb[3] = { sizeof(uint16_t), (size_t) D * sizeof(uint16_t),
-                                        (size_t) D * K * N * sizeof(uint16_t) };
-
-                for (int i = 0; i < 2; i++) {
-                    char *        src_p  = i == 0 ? k_b : v_b;
-                    void *        dst_p  = i == 0 ? k_exp : v_exp;
-                    acl_tensor_ptr acl_flat =
-                        ggml_cann_create_tensor(src_p, ACL_FLOAT16, sizeof(uint16_t), flat_ne, flat_nb, 3);
-                    acl_tensor_ptr acl_expd =
-                        ggml_cann_create_tensor(dst_p, ACL_FLOAT16, sizeof(uint16_t), expd_ne, expd_nb, 3);
-                    GGML_CANN_CALL_ACLNN_OP(ctx, RepeatInterleaveIntWithDim, acl_flat.get(), ratio, (int64_t) 1,
-                                            K * N, acl_expd.get());
-                }
+                ggml_cann_fa_gqa_expand_310p(ctx, k_b, k_exp, D, K, Nk, N);
+                ggml_cann_fa_gqa_expand_310p(ctx, v_b, v_exp, D, K, Nk, N);
 
                 acl_k = ggml_cann_create_tensor(k_exp, ACL_FLOAT16, sizeof(uint16_t), kv_ne, kv_nb, GGML_MAX_DIMS);
                 acl_v = ggml_cann_create_tensor(v_exp, ACL_FLOAT16, sizeof(uint16_t), kv_ne, kv_nb, GGML_MAX_DIMS);
