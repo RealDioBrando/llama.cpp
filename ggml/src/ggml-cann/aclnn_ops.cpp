@@ -4383,17 +4383,30 @@ static void ggml_cann_flash_attn_ext_310p(ggml_backend_cann_context & ctx, ggml_
         // ================= decode: aclnnIncreFlashAttentionV4 =================
         // IFA consumes ONE k/v tensor-list entry per batch element. Two ways
         // to satisfy that contract:
-        //  - per-batch-element loop: one IFA call per element, the verified
-        //    contract from the multi-sequence zero-output fix (the historical
-        //    single-entry list left every element beyond the first uncomputed:
-        //    b=0 correct, b>=1 exactly zero). Measured against the batched
-        //    alternative (one call with a B-entry tensor list) in 17
-        //    combinations - graph/eager x GDR-CPU/NPU x concurrency levels -
-        //    the loop wins or ties in every single one (msprof: the IFA
-        //    kernel processes list entries strictly serially, and the loop
-        //    carries an L2 locality bonus), so the loop is the only path kept
-        //    here; the batched experiment remains available on the
-        //    fa-batched-multiseq branch.
+        //  - per-batch-element loop (DEFAULT): one IFA call per element, the
+        //    verified contract from the multi-sequence zero-output fix (the
+        //    historical single-entry list left every element beyond the first
+        //    uncomputed: b=0 correct, b>=1 exactly zero). msprof #56/#57
+        //    showed this path also carries an L2 locality bonus: the per-b
+        //    expansion reuses one pool block, keeping the working set hot.
+        //  - batched (opt-in): ONE IFA call over the whole ubatch with a
+        //    B-entry tensor list. Measured NO gain and -0.5..-2% end-to-end
+        //    at pl10/pl32: under ACL graph replay the launch count is
+        //    already amortized, and the IFA kernel processes list entries
+        //    strictly serially (avg duration scales exactly with B), so the
+        //    only remaining effect is the lost locality. Kept behind
+        //    GGML_CANN_FA_BATCH=on|1|true for experimentation.
+        // The switch is sampled once at the first FA op, so a captured graph
+        // bakes exactly one of the two paths.
+        static const bool fa_batch = []() {
+            const char * e = getenv("GGML_CANN_FA_BATCH");
+            if (e == nullptr || e[0] == '\0') {
+                return false;
+            }
+            if ((e[0] | 0x20) == 'o' && (e[1] | 0x20) == 'n') return true;  // on
+            if (e[0] == '1' || (e[0] | 0x20) == 't' || (e[0] | 0x20) == 'y') return true;
+            return false;
+        }();
 
         // k/v: (B, K, Nk, D) -> per-b slab -> expand heads to N when GQA
         const size_t q_b_stride = (src0->type == GGML_TYPE_F16) ? src0->nb[3]
@@ -4406,6 +4419,102 @@ static void ggml_cann_flash_attn_ext_310p(ggml_backend_cann_context & ctx, ggml_
             out_f16 = out_f16_allocator.alloc((size_t) B * N * D * sizeof(uint16_t));
         }
 
+        if (fa_batch && B <= 64) {
+            // ---- batched: single IFA call, B-entry k/v tensor lists ----
+            ggml_cann_pool_alloc k_exp_allocator(ctx.pool());
+            ggml_cann_pool_alloc v_exp_allocator(ctx.pool());
+            void *               k_exp = nullptr;
+            void *               v_exp = nullptr;
+
+            // per-entry descriptor: (1, K, N, D) BSND contiguous
+            int64_t entry_ne[GGML_MAX_DIMS];
+            size_t  entry_nb[GGML_MAX_DIMS];
+            bsnd(entry_ne, entry_nb, D, N, K, 1, sizeof(uint16_t));
+
+            std::vector<acl_tensor_ptr> k_entries;
+            std::vector<acl_tensor_ptr> v_entries;
+            k_entries.reserve(B);
+            v_entries.reserve(B);
+
+            for (int64_t b = 0; b < B; ++b) {
+                char * k_b = (char *) src1->data + b * src1->nb[3];
+                char * v_b = (char *) src2->data + b * src2->nb[3];
+                char * k_entry;
+                char * v_entry;
+
+                if (Nk != N) {
+                    const size_t slab = (size_t) K * N * D * sizeof(uint16_t);
+                    if (b == 0) {
+                        k_exp = k_exp_allocator.alloc((size_t) B * slab);
+                        v_exp = v_exp_allocator.alloc((size_t) B * slab);
+                    }
+                    k_entry = (char *) k_exp + b * slab;
+                    v_entry = (char *) v_exp + b * slab;
+
+                    ggml_cann_fa_gqa_expand_310p(ctx, k_b, k_entry, D, K, Nk, N);
+                    ggml_cann_fa_gqa_expand_310p(ctx, v_b, v_entry, D, K, Nk, N);
+                } else {
+                    // MHA: the list entries point straight into the cache view slabs
+                    k_entry = k_b;
+                    v_entry = v_b;
+                }
+
+                k_entries.push_back(ggml_cann_create_tensor(k_entry, ACL_FLOAT16, sizeof(uint16_t), entry_ne,
+                                                            entry_nb, GGML_MAX_DIMS));
+                v_entries.push_back(ggml_cann_create_tensor(v_entry, ACL_FLOAT16, sizeof(uint16_t), entry_ne,
+                                                            entry_nb, GGML_MAX_DIMS));
+            }
+
+            // whole-batch pseShift: (B,1,1,K) -> repeat across heads -> (B,N,1,K)
+            ggml_cann_pool_alloc pse_allocator(ctx.pool());
+            void *               pse_buf = pse_allocator.alloc((size_t) B * N * K * sizeof(uint16_t));
+            acl_tensor_ptr       acl_pse;
+            {
+                int64_t mask_ne[GGML_MAX_DIMS];
+                size_t  mask_nb[GGML_MAX_DIMS];
+                int64_t pse_ne[GGML_MAX_DIMS];
+                size_t  pse_nb[GGML_MAX_DIMS];
+                bsnd(mask_ne, mask_nb, K, 1, 1, B, sizeof(uint16_t));
+                mask_nb[3] = src3->nb[3];  // honor the mask tensor's batch stride
+                // pseShift layout for IFA: ACL (B, N, 1, K)
+                bsnd(pse_ne, pse_nb, K, 1, N, B, sizeof(uint16_t));
+                acl_tensor_ptr acl_mask = ggml_cann_create_tensor(src3->data, ACL_FLOAT16, sizeof(uint16_t), mask_ne,
+                                                                  mask_nb, GGML_MAX_DIMS);
+                acl_pse =
+                    ggml_cann_create_tensor(pse_buf, ACL_FLOAT16, sizeof(uint16_t), pse_ne, pse_nb, GGML_MAX_DIMS);
+                // repeats in ACL dim order (B, N, S, K)
+                int64_t repeats[] = { 1, N, 1, 1 };
+                aclnn_repeat(ctx, acl_mask.get(), acl_pse.get(), repeats);
+            }
+
+            // whole-batch q (B,1,N,D) and out (B,1,N,D)
+            int64_t qb_ne[GGML_MAX_DIMS];
+            size_t  qb_nb[GGML_MAX_DIMS];
+            bsnd(qb_ne, qb_nb, D, N, 1, B, sizeof(uint16_t));
+            qb_nb[3] = q_b_stride;  // honor the q view's batch stride
+            acl_tensor_ptr acl_q =
+                ggml_cann_create_tensor(q_f16, ACL_FLOAT16, sizeof(uint16_t), qb_ne, qb_nb, GGML_MAX_DIMS);
+            int64_t ob_ne[GGML_MAX_DIMS];
+            size_t  ob_nb[GGML_MAX_DIMS];
+            bsnd(ob_ne, ob_nb, D, N, 1, B, sizeof(uint16_t));
+            acl_tensor_ptr acl_out =
+                ggml_cann_create_tensor(out_f16, ACL_FLOAT16, sizeof(uint16_t), ob_ne, ob_nb, GGML_MAX_DIMS);
+
+            acl_tensor_list_ptr acl_k_list = ggml_cann_create_tensor_list(k_entries);
+            acl_tensor_list_ptr acl_v_list = ggml_cann_create_tensor_list(v_entries);
+
+            std::vector<int64_t> act_seq_lens_buf(B, K);
+            acl_int_array_ptr    act_seq_lens = ggml_cann_create_int_array(act_seq_lens_buf.data(), B);
+            char                 layout[]     = "BSND";
+            GGML_CANN_CALL_ACLNN_OP(ctx, IncreFlashAttentionV4, acl_q.get(), acl_k_list.get(), acl_v_list.get(),
+                                    acl_pse.get(),                        // pseShift (additive mask)
+                                    nullptr,                              // attenMask
+                                    act_seq_lens.get(),                   // actualSeqLengths
+                                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                    nullptr,                              // quant/antiquant/blocktable/kvPadding
+                                    N, (double) scaleValue, layout, N, (int64_t) 0, (int64_t) 1, acl_out.get());
+        } else {
+            // ---- per-batch-element loop (default, verified contract) ----
         for (int64_t b = 0; b < B; ++b) {
             char * q_b    = (char *) q_f16      + b * q_b_stride;
             char * k_b    = (char *) src1->data + b * src1->nb[3];
@@ -4480,6 +4589,7 @@ static void ggml_cann_flash_attn_ext_310p(ggml_backend_cann_context & ctx, ggml_
                                     nullptr,                              // quant/antiquant/blocktable/kvPadding
                                     N, (double) scaleValue, layout, N, (int64_t) 0, (int64_t) 1, acl_out.get());
         }
+        }  // end per-batch-element fallback loop
 
         if (dst->type != GGML_TYPE_F16) {
             int64_t      out_ne[GGML_MAX_DIMS];
