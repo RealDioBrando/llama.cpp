@@ -46,6 +46,7 @@ def load_source_tensor(locations: dict[str, Path], name: str) -> np.ndarray:
 
 
 def sample_records(records: list[dict], count: int) -> list[dict]:
+    """Select representative dense, gate, up, and down records for verification."""
     if count >= len(records):
         return records
     groups: dict[tuple[str, str], list[dict]] = collections.defaultdict(list)
@@ -72,6 +73,7 @@ def block_view(raw: np.ndarray, shape: tuple[int, ...], blocks: int) -> np.ndarr
 
 
 def compare_raw(expected: np.ndarray, actual: np.ndarray, blocks: int) -> tuple[bool, float]:
+    """Compare exact INT8 payload bytes and FP16 block-scale values."""
     expected_blocks = block_view(expected, expected.shape[:-1], blocks)
     actual_blocks = block_view(actual, actual.shape[:-1], blocks)
     payload_equal = bool(np.array_equal(expected_blocks["qs"], actual_blocks["qs"]))
@@ -82,6 +84,7 @@ def compare_raw(expected: np.ndarray, actual: np.ndarray, blocks: int) -> tuple[
 
 
 def verify_record(record: dict, locations: dict[str, Path], tensors: dict[str, Any]) -> dict:
+    """Verify one mapped ModelSlim tensor against the final GGUF block bytes."""
     source_raw = record["source_name_raw"]
     scale_name = source_raw.removesuffix(".weight") + ".weight_scale"
     offset_name = source_raw.removesuffix(".weight") + ".weight_offset"

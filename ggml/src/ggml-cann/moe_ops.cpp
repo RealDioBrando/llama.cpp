@@ -44,6 +44,8 @@ static int64_t acl_tensor_first_dim(const aclTensor * tensor) {
     return dims[0];
 }
 
+// Gate the 310P grouped W8A8 path on type, shape, layout, and routing shape.
+// This is the first place to look when a new MoE model does not take the A8 path.
 bool ggml_cann_mul_mat_id_grouped_supported(const ggml_tensor * dst) {
     const ggml_tensor * weight = dst->src[0];
     const ggml_tensor * input  = dst->src[1];
@@ -51,6 +53,8 @@ bool ggml_cann_mul_mat_id_grouped_supported(const ggml_tensor * dst) {
     const bool down_expert = is_down_expert_weight(weight);
 
     if (weight->type == GGML_TYPE_W8A8) {
+        // The grouped A8 route requires the 3D W8A8 expert layout and an I32
+        // routing tensor whose expanded shape matches the gate/up or down input.
         const bool supported = ggml_cann_w8a8_moe_a8_enabled() &&
                ggml_cann_w8a8_is_expert(weight) &&
                weight->ne[0] % 16 == 0 && weight->ne[1] % 16 == 0 &&
@@ -104,8 +108,11 @@ void ggml_cann_mul_mat_id_grouped(ggml_backend_cann_context & ctx, ggml_tensor *
 
     GGML_ASSERT(ggml_cann_mul_mat_id_grouped_supported(dst));
 
+    // ND is the stable path; NZ is experimental and default-off.
     const bool use_nz =
         parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("off"));
+    // CANN 9.1.0 can return incorrect results when most expert groups are empty.
+    // Compact only the ND path, because the NZ operator consumes all experts.
     const bool compact_groups = weight->type == GGML_TYPE_W8A8 && !use_nz && n_rows < n_exp;
 
     ggml_cann_pool_alloc input_f16_alloc;
@@ -233,8 +240,8 @@ void ggml_cann_mul_mat_id_grouped(ggml_backend_cann_context & ctx, ggml_tensor *
         void * weight_scale_data = (char *) weight->data + ggml_cann_w8a8_expert_scale_offset(weight);
 
         if (compact_groups) {
-            // CANN 9.1.0 gives wrong results when most expert groups are empty.
-            // Keep only used experts and pass a compact group list to the matmul.
+            // Build a compact group list from only the experts that actually occur.
+            // This avoids the CANN empty-group bug and keeps the operator input dense.
             ggml_cann_pool_alloc sorted_ids_alloc(ctx.pool(), n_rows * sizeof(int32_t));
             ggml_cann_pool_alloc sort_index_alloc(ctx.pool(), n_rows * sizeof(int64_t));
             ggml_cann_pool_alloc unique_ids_alloc(ctx.pool(), n_rows * sizeof(int32_t));

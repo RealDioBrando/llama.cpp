@@ -17,6 +17,26 @@ Example:
 python tools/w8a8/convert_w8a8.py input.npz output.gguf --tensor-name weight
 ```
 
+## Review map
+
+| File | Why it matters |
+|---|---|
+| `ggml/src/ggml-cann/common.h` | W8A8 layout helpers and dense/MoE A8 flags |
+| `ggml/src/ggml-cann/ggml-cann.cpp` | W8A8 upload, expert private layout, and graph dispatch |
+| `ggml/src/ggml-cann/moe_ops.cpp` | 310P grouped MoE A8 path and CANN operator calls |
+| `ggml/src/ggml-cann/aclnn_ops.cpp` | W8A16-style MoE fallback and dense W8A8 A8 path |
+| `tools/w8a8/convert_modelslim.py` | Direct ModelSlim GGUF importer and block packing |
+| `tools/w8a8/verify_modelslim_gguf.py` | Payload/scale verification against source shards |
+| `tests/test-w8a8-modelslim.py` | Importer packing tests |
+
+### Model compatibility
+
+| Producer | Dense W8A8 | MoE grouped W8A8 |
+|---|---|---|
+| llama.cpp F16/BF16 GGUF | `llama-quantize ... W8A8` | opt-in with `GGML_CANN_MOE_W8A8_A8=1` |
+| ModelSlim W8A8 | direct importer | direct importer, separate or fused experts |
+| ModelSlim mixed precision | preserved | preserved |
+
 ## Complete GGUF model quantization
 
 The tensor-only adapter above is useful for explicit weight artifacts. For a

@@ -104,6 +104,8 @@ bool ggml_cann_weight_layout_enabled() {
 }
 
 bool ggml_cann_is_weight_layout_candidate(const ggml_tensor * tensor) {
+    // Keep the generic NZ weight-layout path limited to F16 tensors. W8A8 uses
+    // its own private layout and grouped-matmul operator path.
     if (!ggml_cann_weight_layout_enabled() || tensor->type != GGML_TYPE_F16 ||
         !ggml_is_contiguous(tensor)) {
         return false;
