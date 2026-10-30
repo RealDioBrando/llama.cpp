@@ -133,7 +133,12 @@ static inline size_t ggml_cann_w8a8_expert_scale_offset(const ggml_tensor * tens
     return GGML_PAD(ggml_cann_w8a8_expert_transformed_size(tensor), 128);
 }
 
-/** @brief Whether the tensor is a 3D W8A8 expert weight. */
+/**
+ * @brief Whether the tensor is a 3D W8A8 expert weight.
+ *
+ * Dense W8A8 weights are 2D [K,N]. Expert weights are 3D [K,N,E], which lets
+ * the CANN backend distinguish the MoE path from the dense path.
+ */
 static inline bool ggml_cann_w8a8_is_expert(const ggml_tensor * tensor) {
     return tensor->type == GGML_TYPE_W8A8 && tensor->ne[2] > 1 && tensor->ne[3] == 1;
 }
@@ -144,7 +149,13 @@ static inline bool ggml_cann_w8a8_a8_enabled() {
     return enabled;
 }
 
-/** @brief Whether the experimental grouped MoE A8 path is explicitly selected. */
+/**
+ * @brief Whether the experimental grouped MoE A8 path is explicitly selected.
+ *
+ * The MoE flag intentionally depends on the dense W8A8 flag. Expert tensors are
+ * only uploaded into the CANN private A8 layout when the dense flag is enabled,
+ * so turning on the MoE flag alone would leave the weights in the wrong layout.
+ */
 static inline bool ggml_cann_w8a8_moe_a8_enabled() {
     static const bool enabled =
         parse_bool(get_env_as_lowercase("GGML_CANN_MOE_W8A8_A8").value_or("off")) &&

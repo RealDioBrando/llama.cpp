@@ -1769,6 +1769,8 @@ static void weight_format_to_nz(ggml_tensor * tensor, int device) {
     ggml_cann_weight_format_to_nz(tensor, device);
 }
 
+// Ask CANN for the exact device-side storage size of a 3D INT8 expert tensor.
+// The result can include backend padding, so E*N*K is not a safe substitute.
 size_t ggml_cann_w8a8_expert_transformed_size(const ggml_tensor * tensor) {
     GGML_ASSERT(tensor->type == GGML_TYPE_W8A8);
     GGML_ASSERT(tensor->ne[3] == 1);
@@ -1786,6 +1788,7 @@ static void ggml_backend_cann_w8a8_upload_a8(ggml_tensor * tensor, const void * 
     GGML_ASSERT(tensor->ne[0] % 32 == 0);
     GGML_ASSERT(tensor->ne[3] == 1);
 
+    // Expert W8A8 weights use a different device layout from dense W8A8 weights.
     if (ggml_cann_w8a8_is_expert(tensor)) {
         const int64_t expert_k = tensor->ne[0];
         const int64_t expert_n = tensor->ne[1];
@@ -1793,6 +1796,9 @@ static void ggml_backend_cann_w8a8_upload_a8(ggml_tensor * tensor, const void * 
         const int64_t blocks_per_row = expert_k / QK_W8A8;
         const size_t scale_offset = ggml_cann_w8a8_expert_scale_offset(tensor);
 
+        // Unpack the public 34-byte blocks into a payload plane and one FP32
+        // scale per [expert, output channel]. The repeated-scale invariant is
+        // checked below, so this is a lossless reinterpretation for the payload.
         std::vector<int8_t> weights(static_cast<size_t>(expert_count * expert_n * expert_k));
         std::vector<float> scales(static_cast<size_t>(expert_count * expert_n));
         for (int64_t expert = 0; expert < expert_count; ++expert) {
@@ -1818,6 +1824,8 @@ static void ggml_backend_cann_w8a8_upload_a8(ggml_tensor * tensor, const void * 
             const size_t padding_size = scale_offset - weights.size();
             ACL_CHECK(aclrtMemset((char *) tensor->data + weights.size(), padding_size, 0, padding_size));
         }
+        // ND is the stable grouped layout. The NZ layout remains opt-in because
+        // the installed CANN build still has unresolved grouped-matmul issues.
         const bool transform_expert_weight =
             ggml_cann_w8a8_moe_a8_enabled() &&
             parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("off"));
@@ -2849,6 +2857,8 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
                 fprintf(stderr, "MoE dispatch: dst=%s weight=%s type=%s\n", ggml_get_name(dst),
                         ggml_get_name(dst->src[0]), ggml_type_name(dst->src[0]->type));
             }
+            // The generic grouped path remains opt-in. W8A8 expert tensors
+            // automatically use the grouped A8 route when the MoE A8 flag is set.
             if ((parse_bool(get_env_as_lowercase("GGML_CANN_MOE_GROUPED").value_or("off")) ||
                  (dst->src[0]->type == GGML_TYPE_W8A8 && ggml_cann_w8a8_moe_a8_enabled())) &&
                 ggml_cann_mul_mat_id_grouped_supported(dst)) {
@@ -3775,6 +3785,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     return true;
 #ifdef ASCEND_310P
                 case GGML_TYPE_W8A8: {
+                    // The support contract differs between fallback and grouped A8.
                     const bool moe_a8 = ggml_cann_w8a8_moe_a8_enabled();
                     return ggml_cann_w8a8_is_expert(op->src[0]) &&
                            op->src[0]->ne[0] % (moe_a8 ? 16 : 32) == 0 &&

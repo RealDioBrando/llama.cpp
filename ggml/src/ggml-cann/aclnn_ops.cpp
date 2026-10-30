@@ -4201,6 +4201,11 @@ static void ggml_cann_mul_mat_id_fp(ggml_backend_cann_context & ctx, ggml_tensor
  * @brief Performs quantized matrix multiplication for Mixture of Experts (MoE)
  * models using the CANN backend.
  *
+ * This is the Level 1 fallback. It is not the grouped W8A8 target path.
+ * W8A8 expert weights are handled here only when the grouped A8 route is
+ * disabled or unsupported; activations remain F16 while the INT8 weights are
+ * consumed with per-channel scales.
+ *
  * This function implements MUL_MAT_ID operation for quantized weight matrices
  * (Q4_0 and Q8_0 formats). It selects expert-specific weight matrices based on
  * the provided expert indices, and computes matrix multiplication using CANN's
@@ -4221,7 +4226,8 @@ static void ggml_cann_mul_mat_id_fp(ggml_backend_cann_context & ctx, ggml_tensor
  * @param ctx The CANN backend context for operation execution.
  * @param dst The destination tensor where the multiplication result will be stored.
  *
- * @note Only Q4_0 and Q8_0 quantization formats are supported.
+ * @note Q4_0, Q8_0, and W8A8 expert weights are supported. W8A8 uses
+ * per-channel scales rather than per-32-value-block scales.
  * @note The function handles automatic type conversion to/from F16 as needed by the hardware.
  */
 static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
@@ -4252,6 +4258,8 @@ static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context & ctx, ggml_ten
                                    (GGML_ABORT("MUL_MAT_ID only supports Q4_0, Q8_0, and W8A8"), 0.0f);
 
     // W8A8 expert tensors use a private FP32 scale plane when uploaded for A8.
+    // The upload path is controlled by the dense flag, so this fallback must
+    // understand that layout even when the grouped MoE flag itself is off.
     const bool   private_w8a8_scales = type == GGML_TYPE_W8A8 && ggml_cann_w8a8_a8_enabled() &&
                                      ggml_cann_w8a8_is_expert(src0);
     const size_t weight_size         = src0->ne[0] * src0->ne[1] * src0->ne[2] * weight_elem_size;
@@ -4377,6 +4385,8 @@ static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context & ctx, ggml_ten
         size_t   matmul_scale_stride = selected_scale_nb[2];
         ggml_cann_pool_alloc selected_scale_f16_alloc;
         if (private_w8a8_scales) {
+            // WeightQuantBatchMatmulV2 expects F16 scales, but only the selected
+            // experts are cast here; the resident scale plane stays FP32.
             selected_scale_f16_alloc.alloc(ctx.pool(), static_cast<size_t>(weight_m * n_select_experts) *
                                                         sizeof(uint16_t));
             int64_t f16_ne[3] = { scale_d, weight_m, n_select_experts };
@@ -4448,6 +4458,7 @@ static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context & ctx, ggml_ten
                                                                    output_nb, 2, ACL_FORMAT_ND, output_offset);
 
             // Perform quantized matrix multiplication
+            // W8A8 uses one scale per output channel, not one per 32-value block.
             const int64_t antiquant_group_size = (type == GGML_TYPE_W8A8) ? 0 : group_size;
             GGML_CANN_CALL_ACLNN_OP(ctx, WeightQuantBatchMatmulV2, input_tensor.get(), weight_view.get(),
                                     scale_view.get(), nullptr, nullptr, nullptr, nullptr, antiquant_group_size,

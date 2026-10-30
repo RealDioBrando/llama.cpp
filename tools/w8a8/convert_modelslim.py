@@ -73,6 +73,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def w8a8_blocks(weight: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    """Pack a 2D ModelSlim W8A8 tensor into GGML block bytes."""
     require(weight.dtype == np.int8, f"weight must be INT8, got {weight.dtype}")
     require(weight.ndim == 2, f"weight must be 2D, got {weight.shape}")
     require(scale.dtype in (np.float16, np.float32), f"weight_scale must be FP16/FP32, got {scale.dtype}")
@@ -83,12 +84,15 @@ def w8a8_blocks(weight: np.ndarray, scale: np.ndarray) -> np.ndarray:
     n, k = weight.shape
     scale_f16 = scale.reshape(-1).astype(np.float16, copy=False)
     blocks = np.empty((n, k // 32), dtype=np.dtype([("d", "<f2"), ("qs", "i1", 32)]))
+    # ModelSlim gives one scale per output-channel row. The GGML block format
+    # has a scale slot in every 32-value block, so broadcast the same row scale.
     blocks["d"] = scale_f16[:, None]
     blocks["qs"] = weight.reshape(n, k // 32, 32)
     return np.frombuffer(blocks.tobytes(order="C"), dtype=np.uint8).reshape(n, (k // 32) * 34)
 
 
 def normalize_expert_scale(scale: np.ndarray) -> np.ndarray:
+    """Normalize ModelSlim expert scales to the logical [E,N] plane."""
     require(scale.dtype in (np.float16, np.float32), f"expert weight_scale must be FP16/FP32, got {scale.dtype}")
     if scale.ndim == 3 and scale.shape[-1] == 1:
         scale = scale[..., 0]
@@ -97,6 +101,7 @@ def normalize_expert_scale(scale: np.ndarray) -> np.ndarray:
 
 
 def w8a8_expert_blocks(weight: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    """Pack a 3D ModelSlim expert tensor into GGML W8A8 block bytes."""
     require(weight.dtype == np.int8, f"expert weight must be INT8, got {weight.dtype}")
     require(weight.ndim == 3, f"expert weight must be 3D [E,N,K], got {weight.shape}")
     scale = normalize_expert_scale(scale)
