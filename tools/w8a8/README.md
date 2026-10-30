@@ -53,12 +53,21 @@ tensor mapping. Use `--mapping-out mapping.json` to save the mapping report.
 
 The importer:
 
+- supports `Qwen3MoeForCausalLM` text-only checkpoints;
+- supports `W8A8_DYNAMIC` expert triples and, with
+  `--allow-static-w8a8`, static `W8A8` attention weights whose BF16 scales
+  are converted to FP32 before packing;
 - preserves the original INT8 weight payload;
 - preserves the FP32 scale subject to the existing FP16 GGUF scale slot;
 - rejects nonzero `weight_offset` values;
 - leaves non-W8A8 tensors in F16/BF16/F32 according to the existing converter;
-- reuses the Qwen3.5 tensor mapping, linear-attention reorder, tokenizer, MTP,
-  and metadata logic from `convert_hf_to_gguf.py`.
+- reuses the existing Qwen model mapping, tokenizer, MTP, and metadata logic
+  from `convert_hf_to_gguf.py`.
+
+For the static `W8A8` variant, `input_scale`, `input_offset`, `quant_bias`,
+and `deq_scale` are deliberately omitted because the llama.cpp W8A8 runtime
+computes dynamic activation quantization. The mapping report records every
+omitted tensor, and the flag must be supplied explicitly.
 
 `tools/w8a8/inspect_modelslim.py` inventories a checkpoint before conversion.
 

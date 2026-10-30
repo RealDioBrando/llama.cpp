@@ -9,6 +9,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from safetensors import safe_open
+import torch
 
 EXPERT_RE = re.compile(r"\.mlp\.experts\.(?P<expert>\d+)?\.?(?P<projection>gate_proj|up_proj|down_proj|gate_up_proj)\.weight$")
 
@@ -26,19 +27,22 @@ def load_json(path: Path):
 
 
 def find_shards(model_dir: Path) -> list[Path]:
-    return sorted(path for path in model_dir.glob("quant_model_weights-*.safetensors") if path.is_file())
+    patterns = ("quant_model_weights-*.safetensors", "quant_model_weight_w8a8_dynamic-*.safetensors")
+    return sorted({path for pattern in patterns for path in model_dir.glob(pattern) if path.is_file()})
 
 
 def tensor_locations(model_dir: Path, shards: list[Path]) -> dict[str, Path]:
-    index_path = model_dir / "quant_model_weights.safetensors.index.json"
-    if index_path.is_file():
-        index = load_json(index_path)
+    index_paths = sorted(model_dir.glob("*.safetensors.index.json"))
+    if len(index_paths) > 1:
+        raise ValueError(f"ambiguous ModelSlim index files: {[path.name for path in index_paths]}")
+    if index_paths:
+        index = load_json(index_paths[0])
         weight_map = index.get("weight_map", {})
         return {name: model_dir / shard for name, shard in weight_map.items()}
 
     locations: dict[str, Path] = {}
     for shard in shards:
-        with safe_open(shard, framework="np") as handle:
+        with safe_open(shard, framework="pt") as handle:
             for name in handle.keys():
                 locations[name] = shard
     return locations
@@ -72,7 +76,7 @@ def main() -> None:
     model_dir = args.model_dir
     description = load_json(model_dir / "quant_model_description.json")
     config = load_json(model_dir / "config.json")
-    text_config = config.get("text_config", {})
+    text_config = config.get("text_config") or config
     shards = find_shards(model_dir)
     locations = tensor_locations(model_dir, shards)
 
@@ -82,7 +86,11 @@ def main() -> None:
     )
     quantized_weights = sorted(
         name for name, kind in description.items()
-        if kind == "W8A8_DYNAMIC" and name.endswith(".weight")
+        if kind in ("W8A8", "W8A8_DYNAMIC") and name.endswith(".weight")
+    )
+    static_w8a8_weights = sorted(
+        name for name, kind in description.items()
+        if kind == "W8A8" and name.endswith(".weight")
     )
     expert_weights = [name for name in quantized_weights if ".mlp.experts." in name]
     categories = Counter(category(name) for name in quantized_weights)
@@ -110,7 +118,7 @@ def main() -> None:
 
     with ExitStack() as stack:
         handles = {
-            shard: stack.enter_context(safe_open(shard, framework="np"))
+            shard: stack.enter_context(safe_open(shard, framework="pt"))
             for shard in shards
         }
         for weight_name in quantized_weights:
@@ -126,17 +134,19 @@ def main() -> None:
             weight_dtype = weight_slice.get_dtype()
             scale = handles[locations[scale_name]].get_tensor(scale_name)
             offset = handles[locations[offset_name]].get_tensor(offset_name)
+            scale_np = scale.float().numpy() if isinstance(scale, torch.Tensor) else scale
+            offset_np = offset.float().numpy() if isinstance(offset, torch.Tensor) else offset
 
             if len(weight_shape) not in (2, 3) or weight_dtype != "I8":
                 bad_shapes.append(f"{weight_name}: shape={tuple(weight_shape)} dtype={weight_dtype}")
-            if tuple(scale.shape) not in expected_scale_shapes(weight_shape):
-                bad_shapes.append(f"{scale_name}: shape={scale.shape} weight_shape={tuple(weight_shape)}")
-            if tuple(offset.shape) != tuple(scale.shape):
-                bad_shapes.append(f"{offset_name}: shape={offset.shape} expected={scale.shape}")
-            if offset.size and offset.any():
+            if tuple(scale_np.shape) not in expected_scale_shapes(weight_shape):
+                bad_shapes.append(f"{scale_name}: shape={scale_np.shape} weight_shape={tuple(weight_shape)}")
+            if tuple(offset_np.shape) != tuple(scale_np.shape):
+                bad_shapes.append(f"{offset_name}: shape={offset_np.shape} expected={scale_np.shape}")
+            if offset_np.size and offset_np.any():
                 nonzero_offsets.append(offset_name)
-            if scale.size:
-                scale_ranges[weight_name] = (float(scale.min()), float(scale.max()))
+            if scale_np.size:
+                scale_ranges[weight_name] = (float(scale_np.min()), float(scale_np.max()))
 
             if ".mlp.experts." in weight_name:
                 match = EXPERT_RE.search(weight_name)
@@ -144,8 +154,8 @@ def main() -> None:
                 expert_projection_shapes.setdefault(projection, {
                     "source_name": weight_name,
                     "weight_shape": weight_shape,
-                    "scale_shape": list(scale.shape),
-                    "offset_shape": list(offset.shape),
+                    "scale_shape": list(scale_np.shape),
+                    "offset_shape": list(offset_np.shape),
                     "layout": "separate" if len(weight_shape) == 2 else "fused",
                 })
 
@@ -160,6 +170,7 @@ def main() -> None:
         "type_counts": dict(sorted(type_counts.items())),
         "quantized_weights": len(quantized_weights),
         "quantized_categories": dict(sorted(categories.items())),
+        "static_w8a8_weights": len(static_w8a8_weights),
         "num_hidden_layers": text_config.get("num_hidden_layers"),
         "hidden_size": text_config.get("hidden_size"),
         "vocab_size": text_config.get("vocab_size"),

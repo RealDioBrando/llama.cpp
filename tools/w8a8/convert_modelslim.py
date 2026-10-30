@@ -18,10 +18,11 @@ sys.path.insert(0, str(REPO_ROOT / "gguf-py"))
 
 import gguf  # noqa: E402
 from conversion.base import LazyTorchTensor, ModelBase, ModelType, get_model_architecture, logger  # noqa: E402
-from conversion.qwen import Qwen3_5MoeTextModel, Qwen3_5TextModel  # noqa: E402
+from conversion.qwen import Qwen3MoeModel, Qwen3_5MoeTextModel, Qwen3_5TextModel  # noqa: E402
 from conversion.qwen3vl import Qwen3VLVisionModel  # noqa: E402
 
 W8A8_TYPE = gguf.GGMLQuantizationType.W8A8
+QUANT_TYPES = frozenset({"W8A8_DYNAMIC", "W8A8"})
 SEPARATE_EXPERT_RE = re.compile(
     r"^model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<projection>gate_proj|up_proj|down_proj)\.weight$"
@@ -48,6 +49,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mmproj-output", type=Path, help="optionally write the vision projector as a separate mmproj GGUF")
     parser.add_argument("--mmproj-only", action="store_true", help="write only the vision projector")
     parser.add_argument("--no-lazy", action="store_true", help="load tensors eagerly while writing")
+    parser.add_argument(
+        "--allow-static-w8a8",
+        action="store_true",
+        help="accept static W8A8 weights while omitting their static activation metadata",
+    )
+    parser.add_argument(
+        "--dequant-static-w8a8",
+        action="store_true",
+        help="diagnostic: dequantize static W8A8 weights to F16 instead of packing them",
+    )
+    parser.add_argument(
+        "--dequant-expert-w8a8",
+        action="store_true",
+        help="diagnostic: dequantize routed expert weights to F16 instead of packing them",
+    )
     parser.add_argument(
         "--no-temp-file",
         action="store_true",
@@ -101,13 +117,17 @@ def index_modelslim_tensors(model: ModelBase, remote_hf_model_id: str | None = N
     if remote_hf_model_id is not None:
         raise NotImplementedError("remote ModelSlim indexing is not supported")
 
-    shards = sorted(model.dir_model.glob("quant_model_weights-*.safetensors"))
-    require(len(shards) > 0, f"no quant_model_weights-*.safetensors files in {model.dir_model}")
+    shard_patterns = ("quant_model_weights-*.safetensors", "quant_model_weight_w8a8_dynamic-*.safetensors")
+    shards = sorted({path for pattern in shard_patterns for path in model.dir_model.glob(pattern)})
+    require(len(shards) > 0, f"no ModelSlim safetensors shards in {model.dir_model}")
+    require(all(path.is_file() for path in shards), f"incomplete ModelSlim shard set in {model.dir_model}")
 
     tensors: dict[str, Callable[[], torch.Tensor]] = {}
-    index_path = model.dir_model / "quant_model_weights.safetensors.index.json"
+    index_paths = sorted(model.dir_model.glob("*.safetensors.index.json"))
+    require(len(index_paths) <= 1, f"ambiguous ModelSlim index files: {[p.name for p in index_paths]}")
+    index_path = index_paths[0] if index_paths else None
     index = None
-    if index_path.is_file():
+    if index_path is not None:
         with open(index_path, "r", encoding="utf-8") as f:
             index = json.load(f)
     expected_names = set(index.get("weight_map", {})) if index else set()
@@ -144,6 +164,9 @@ class _ModelslimQwen35Mixin:
         self.modelslim_description = self._load_description(self.dir_model)
         self.w8a8_mapping: list[dict[str, object]] = []
         self._accounted_w8a8_sources: set[str] = set()
+        self.allow_static_w8a8 = False
+        self.dequant_static_w8a8 = False
+        self.dequant_expert_w8a8 = False
 
     @staticmethod
     def _load_description(model_dir: Path) -> dict[str, object]:
@@ -171,7 +194,7 @@ class _ModelslimQwen35Mixin:
     def _quantized_weight_names(self) -> list[tuple[str, str]]:
         result: list[tuple[str, str]] = []
         for original_name, kind in self.modelslim_description.items():
-            if kind != "W8A8_DYNAMIC" or not original_name.endswith(".weight"):
+            if kind not in QUANT_TYPES or not original_name.endswith(".weight"):
                 continue
             normalized = self._normalize_description_name(original_name)
             if normalized is None:
@@ -200,7 +223,29 @@ class _ModelslimQwen35Mixin:
         require(nonzero == 0, f"nonzero weight offset in {name}")
         return nonzero
 
+    @staticmethod
+    def _quant_aux_names(weight_name: str) -> list[str]:
+        base = weight_name.removesuffix(".weight")
+        return [base + suffix for suffix in (".input_scale", ".input_offset", ".quant_bias", ".deq_scale")]
+
+    def _check_quantization_mode(self, source_name: str) -> str:
+        quant_type = str(self.modelslim_description.get(source_name))
+        if quant_type == "W8A8":
+            require(
+                self.allow_static_w8a8,
+                f"static W8A8 tensor {source_name} requires --allow-static-w8a8",
+            )
+        require(quant_type in QUANT_TYPES, f"unsupported quantization type {quant_type} for {source_name}")
+        return quant_type
+
+    def _remove_quant_aux(self, weight_name: str) -> list[str]:
+        present = [name for name in self._quant_aux_names(weight_name) if name in self.model_tensors]
+        for name in present:
+            self.model_tensors.pop(name, None)
+        return present
+
     def _pack_dense_weight(self, source_name: str, weight_name: str) -> dict[str, object]:
+        quant_type = self._check_quantization_mode(source_name)
         scale_name, offset_name = self._triple_names(weight_name)
         weight_lazy = self._tensor(weight_name, "weight")
         scale_lazy = self._tensor(scale_name, "scale")
@@ -216,8 +261,11 @@ class _ModelslimQwen35Mixin:
         scale = self._validate_scale(scale_lazy, scale_name)
 
         gguf_name = self.map_tensor_name(weight_name)
+        omitted = self._remove_quant_aux(weight_name)
         record = {
             "kind": "dense",
+            "source_quant_type": quant_type,
+            "omitted_static_metadata": omitted,
             "source_name_raw": source_name,
             "source_name": weight_name,
             "gguf_name": gguf_name,
@@ -229,8 +277,14 @@ class _ModelslimQwen35Mixin:
         }
 
         weight = LazyTorchTensor.to_eager(weight_lazy).cpu().numpy()
-        raw = w8a8_blocks(weight, scale.cpu().numpy())
-        self.gguf_writer.add_tensor(gguf_name, raw, raw_dtype=W8A8_TYPE)
+        if quant_type == "W8A8" and self.dequant_static_w8a8:
+            dequantized = (weight.astype(np.float32) * scale.cpu().numpy().reshape(-1, 1)).astype(np.float16)
+            self.gguf_writer.add_tensor(gguf_name, dequantized)
+            record["output_type"] = "F16"
+        else:
+            raw = w8a8_blocks(weight, scale.cpu().numpy())
+            self.gguf_writer.add_tensor(gguf_name, raw, raw_dtype=W8A8_TYPE)
+            record["output_type"] = "W8A8"
         for name in (weight_name, scale_name, offset_name):
             self.model_tensors.pop(name, None)
         self._accounted_w8a8_sources.add(source_name)
@@ -241,6 +295,7 @@ class _ModelslimQwen35Mixin:
         for source_name, weight_name in self._quantized_weight_names():
             if ".mlp.experts." in weight_name:
                 continue
+            quant_type = self._check_quantization_mode(source_name)
             if load_payload:
                 records.append(self._pack_dense_weight(source_name, weight_name))
                 continue
@@ -260,6 +315,8 @@ class _ModelslimQwen35Mixin:
             scale = self._validate_scale(scale_lazy, scale_name)
             records.append({
                 "kind": "dense",
+                "source_quant_type": quant_type,
+                "omitted_static_metadata": [name for name in self._quant_aux_names(weight_name) if name in self.model_tensors],
                 "source_name_raw": source_name,
                 "source_name": weight_name,
                 "gguf_name": self.map_tensor_name(weight_name),
@@ -280,7 +337,7 @@ class _ModelslimQwen35Mixin:
         records = self._collect_mapping_impl(load_payload)
         described = {
             name for name, kind in self.modelslim_description.items()
-            if kind == "W8A8_DYNAMIC" and name.endswith(".weight")
+            if kind in QUANT_TYPES and name.endswith(".weight")
         }
         missing = sorted(described - self._accounted_w8a8_sources)
         require(not missing, f"unmapped W8A8 weights: {missing[:10]}")
@@ -300,12 +357,11 @@ class ModelslimQwen35Model(_ModelslimQwen35Mixin, Qwen3_5TextModel):
     model_arch = gguf.MODEL_ARCH.QWEN35
 
 
-class ModelslimQwen35MoeModel(_ModelslimQwen35Mixin, Qwen3_5MoeTextModel):
-    model_arch = gguf.MODEL_ARCH.QWEN35MOE
-
+class _ModelslimMoeMixin:
     def _num_experts(self) -> int:
-        n_experts = self._text_hparams().get("num_experts")
-        require(isinstance(n_experts, int) and n_experts > 0, f"invalid num_experts: {n_experts}")
+        hparams = self._text_hparams()
+        n_experts = hparams.get("num_experts", hparams.get("num_local_experts"))
+        require(isinstance(n_experts, int) and n_experts > 0, f"invalid num_experts/num_local_experts: {n_experts}")
         return n_experts
 
     @staticmethod
@@ -368,11 +424,13 @@ class ModelslimQwen35MoeModel(_ModelslimQwen35Mixin, Qwen3_5MoeTextModel):
             require(weight_shape[1] % 32 == 0, f"K must be divisible by 32, got {weight_shape[1]}")
 
             gguf_name = self.map_tensor_name(self._merged_expert_name(layer, projection))
+            dequant_experts = self.dequant_expert_w8a8
             raw = None
             if load_payload:
                 raw = np.empty(
+                    (n_experts, *weight_shape) if dequant_experts else
                     (n_experts, weight_shape[0], (weight_shape[1] // 32) * 34),
-                    dtype=np.uint8,
+                    dtype=np.float16 if dequant_experts else np.uint8,
                 )
 
             for expert_id in range(n_experts):
@@ -391,9 +449,13 @@ class ModelslimQwen35MoeModel(_ModelslimQwen35Mixin, Qwen3_5MoeTextModel):
                 scale = self._validate_scale(scale_lazy, scale_name)
                 if load_payload:
                     weight = LazyTorchTensor.to_eager(weight_lazy).cpu().numpy()
-                    raw[expert_id] = w8a8_blocks(weight, scale.cpu().numpy())
+                    if dequant_experts:
+                        raw[expert_id] = (weight.astype(np.float32) * scale.cpu().numpy().reshape(-1, 1)).astype(np.float16)
+                    else:
+                        raw[expert_id] = w8a8_blocks(weight, scale.cpu().numpy())
                 records.append({
                     "kind": "expert",
+                    "output_type": "F16" if dequant_experts else "W8A8",
                     "layout": "separate",
                     "layer": layer,
                     "projection": projection,
@@ -415,8 +477,12 @@ class ModelslimQwen35MoeModel(_ModelslimQwen35Mixin, Qwen3_5MoeTextModel):
 
             if load_payload:
                 assert raw is not None
-                self.gguf_writer.add_tensor(gguf_name, raw, raw_dtype=W8A8_TYPE)
-                logger.info(f"gguf: wrote {gguf_name} as W8A8 [{n_experts},{weight_shape[0]},{weight_shape[1]}]")
+                if dequant_experts:
+                    self.gguf_writer.add_tensor(gguf_name, raw)
+                    logger.info(f"gguf: wrote {gguf_name} as F16 [{n_experts},{weight_shape[0]},{weight_shape[1]}]")
+                else:
+                    self.gguf_writer.add_tensor(gguf_name, raw, raw_dtype=W8A8_TYPE)
+                    logger.info(f"gguf: wrote {gguf_name} as W8A8 [{n_experts},{weight_shape[0]},{weight_shape[1]}]")
             else:
                 logger.info(f"gguf: validated {n_experts} experts for {gguf_name}")
         return records
@@ -523,6 +589,14 @@ class ModelslimQwen35MoeModel(_ModelslimQwen35Mixin, Qwen3_5MoeTextModel):
         return records
 
 
+class ModelslimQwen3MoeModel(_ModelslimMoeMixin, _ModelslimQwen35Mixin, Qwen3MoeModel):
+    model_arch = gguf.MODEL_ARCH.QWEN3MOE
+
+
+class ModelslimQwen35MoeModel(_ModelslimMoeMixin, _ModelslimQwen35Mixin, Qwen3_5MoeTextModel):
+    model_arch = gguf.MODEL_ARCH.QWEN35MOE
+
+
 class ModelslimQwen35VisionModel(Qwen3VLVisionModel):
     model_arch = gguf.MODEL_ARCH.MMPROJ
 
@@ -535,6 +609,7 @@ MODEL_CLASSES = {
     "Qwen3_5ForCausalLM": ModelslimQwen35Model,
     "Qwen3_5MoeForConditionalGeneration": ModelslimQwen35MoeModel,
     "Qwen3_5MoeForCausalLM": ModelslimQwen35MoeModel,
+    "Qwen3MoeForCausalLM": ModelslimQwen3MoeModel,
 }
 
 
@@ -567,6 +642,9 @@ def main() -> None:
                 eager=args.no_lazy,
                 use_temp_file=use_temp_file,
             )
+            model.allow_static_w8a8 = args.allow_static_w8a8
+            model.dequant_static_w8a8 = args.dequant_static_w8a8
+            model.dequant_expert_w8a8 = args.dequant_expert_w8a8
             if args.dry_run:
                 records = model.collect_mapping(load_payload=False)
             else:

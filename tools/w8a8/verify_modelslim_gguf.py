@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 from safetensors import safe_open
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -33,16 +34,21 @@ def parse_args() -> argparse.Namespace:
 
 
 def tensor_index(model_dir: Path) -> dict[str, Path]:
-    index_path = model_dir / "quant_model_weights.safetensors.index.json"
-    with open(index_path, "r", encoding="utf-8") as f:
+    index_paths = sorted(model_dir.glob("*.safetensors.index.json"))
+    if len(index_paths) != 1:
+        raise ValueError(f"expected one ModelSlim index file, found {[path.name for path in index_paths]}")
+    with open(index_paths[0], "r", encoding="utf-8") as f:
         index = json.load(f)
     return {name: model_dir / shard for name, shard in index["weight_map"].items()}
 
 
 def load_source_tensor(locations: dict[str, Path], name: str) -> np.ndarray:
     path = locations[name]
-    with safe_open(path, framework="np") as f:
-        return f.get_tensor(name)
+    with safe_open(path, framework="pt") as f:
+        tensor = f.get_tensor(name)
+        if tensor.dtype == torch.bfloat16:
+            tensor = tensor.float()
+        return tensor.numpy()
 
 
 def sample_records(records: list[dict], count: int) -> list[dict]:
@@ -116,10 +122,16 @@ def verify_record(record: dict, locations: dict[str, Path], tensors: dict[str, A
         shape = list(weight.shape)
         expert_axis = "all"
     else:
-        expected = w8a8_blocks(weight, scale)
-        payload_equal, scale_max_delta = compare_raw(expected, actual_raw, weight.shape[1] // 32)
         shape = list(weight.shape)
         expert_axis = None
+        if record.get("output_type") == "F16":
+            expected = (weight.astype(np.float32) * scale.reshape(-1, 1)).astype(np.float16)
+            actual = np.asarray(actual_raw, dtype=np.float16).reshape(expected.shape)
+            payload_equal = bool(np.array_equal(expected, actual))
+            scale_max_delta = 0.0
+        else:
+            expected = w8a8_blocks(weight, scale)
+            payload_equal, scale_max_delta = compare_raw(expected, actual_raw, weight.shape[1] // 32)
 
     offset_nonzero = int(np.count_nonzero(offset))
     return {
@@ -156,7 +168,10 @@ def main() -> None:
     if block_count is not None and nextn_layers:
         first_mtp_block = block_count - int(nextn_layers)
         mtp_prefixes = [f"blk.{index}." for index in range(first_mtp_block, block_count)]
-    expected_w8a8_names = {record["gguf_name"] for record in records}
+    expected_w8a8_names = {
+        record["gguf_name"] for record in records
+        if record.get("output_type", "W8A8") == "W8A8"
+    }
     actual_w8a8_names = {
         tensor.name for tensor in reader.tensors
         if tensor.tensor_type == gguf.GGMLQuantizationType.W8A8
