@@ -433,6 +433,9 @@ extern "C" {
         uint32_t n_gpu_blocks;       // GPU block pool size
         uint32_t n_cpu_blocks;       // CPU block pool size for swap-out
         float    kv_paged_watermark; // percentage of GPU blocks reserved as safety margin [0, 0.1)
+        // Order paged requests by request priority instead of FCFS.
+        // Decided at llama_paged_scheduler_init() time and fixed afterwards.
+        bool     paged_priority;
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -1669,6 +1672,7 @@ extern "C" {
         int32_t n_past;
         int64_t t_arrival_us;
         int64_t t_first_token_us;
+        int32_t priority;
     };
 
     typedef void (*llama_paged_on_finish_cb)(int32_t             request_id,
@@ -1685,10 +1689,24 @@ extern "C" {
                                                 struct llama_context *         ctx);
 
     // Queueing and stepping.
+    // Lower `priority` values are served first (default 0; negative values are
+    // higher priority). Requests with equal priority are served in arrival
+    // order. Priority only takes effect when the scheduler was created with
+    // llama_context_params.paged_priority = true; that mode is decided at
+    // llama_paged_scheduler_init() time, not by this argument. Otherwise the
+    // value is recorded and ignored. The value is clamped to [-1000000, 1000000].
+    //
+    // C has no default arguments: C callers must pass `priority` explicitly
+    // (pass 0). The default below only applies to C++ callers.
     LLAMA_API bool llama_paged_scheduler_add_request(struct llama_paged_scheduler * sched,
                                                      const llama_token *            tokens,
                                                      int32_t                        n_tokens,
-                                                     int32_t                        request_id);
+                                                     int32_t                        request_id,
+                                                     int32_t                        priority
+#if defined(__cplusplus)
+                                                     = 0
+#endif
+                                                     );
 
     LLAMA_API bool llama_paged_scheduler_prepare_batch(struct llama_paged_scheduler * sched,
                                                        struct llama_batch *           batch);

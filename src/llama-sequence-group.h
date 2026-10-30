@@ -18,6 +18,13 @@ struct llama_sequence_group {
     int64_t t_arrival_time   = 0;
     int64_t t_first_token_us = 0;
 
+    // Request priority: smaller values are served first, default 0.
+    // Read-only after queue_request().
+    int32_t priority = 0;
+    // Monotonic enqueue sequence assigned by the scheduler in queue_request().
+    // Only used to break ties between equal (priority, t_arrival_time).
+    uint64_t arrival_seq = 0;
+
     uint32_t n_prompt  = 0;
     uint32_t n_prompt_total = 0;  // prompt length before any prefix-cache split
     uint32_t n_decoded = 0;
@@ -29,5 +36,5 @@ struct llama_sequence_group {
 };
 
 using llama_sequence_group_raw_list = std::vector<llama_sequence_group *>;
-using llama_sequence_group_ptr      = std::unique_ptr<llama_sequence_group>;
+using llama_sequence_group_ptr      = std::shared_ptr<llama_sequence_group>;
 using llama_sequence_group_list     = std::list<llama_sequence_group_ptr>;

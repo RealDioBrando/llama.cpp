@@ -2,6 +2,7 @@
 !*.*
 !snapshots/
 !fusion/
+!req_priority/
 *.o
 ggml-common.h
 **/*.swp

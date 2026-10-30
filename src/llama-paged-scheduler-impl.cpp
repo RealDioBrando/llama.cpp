@@ -10,7 +10,11 @@ llama_paged_scheduler_impl::llama_paged_scheduler_impl(uint32_t               n_
                                                        uint32_t               block_sz,
                                                        int32_t                n_batch,
                                                        llama_kv_cache_paged * kv_manager,
-                                                       llama_memory_hybrid_paged * hybrid_memory) :
+                                                       llama_memory_hybrid_paged * hybrid_memory,
+                                                       bool                   priority_enabled) :
+    priority_enabled_(priority_enabled),
+    swapped(llama_paged_queue_create(priority_enabled)),
+    waiting(llama_paged_queue_create(priority_enabled)),
     n_seq_max_ctx(n_ctx),
     block_size(block_sz),
     n_batch(n_batch),
@@ -92,23 +96,30 @@ llama_scheduler_status llama_paged_scheduler_impl::step(llama_batch & batch) {
     // Drain queued prefills before decoding. Otherwise the first ready
     // sequence starts decoding while later sequences wait and a queued batch
     // runs with a tiny active batch.
-    if (!waiting.empty()) {
+    if (!waiting->empty()) {
         process_waiting_list(candidates, n_batch);
     }
 
-    auto prefill_it = std::find_if(candidates.begin(), candidates.end(),
-                                   [](const llama_sequence_group * group) {
-                                       return group && group->n_decoded == 0;
-                                   });
-    if (prefill_it != candidates.end()) {
-        llama_sequence_group * prefill = *prefill_it;
+    // Keep exactly one prefill candidate. FCFS keeps the first one in
+    // candidates order (running -> swapped -> waiting); priority mode picks
+    // the best-ranked prefill across all candidates.
+    llama_sequence_group * best_prefill = nullptr;
+    for (llama_sequence_group * group : candidates) {
+        if (!group || group->n_decoded != 0) {
+            continue;
+        }
+        if (!best_prefill || (priority_enabled_ && group_precedes(*group, *best_prefill))) {
+            best_prefill = group;
+        }
+    }
+    if (best_prefill) {
         candidates.clear();
-        candidates.push_back(prefill);
+        candidates.push_back(best_prefill);
     }
 
     const uint32_t n_running    = running.size();
-    const uint32_t n_swapped    = swapped.size();
-    const uint32_t n_waiting    = waiting.size();
+    const uint32_t n_swapped    = swapped->size();
+    const uint32_t n_waiting    = waiting->size();
     const uint32_t n_candidates = candidates.size();
 
     LLAMA_LOG_INFO("%s: Scheduler status: running=%d, swapped=%d, waiting=%d, candidates=%d\n", __func__, n_running,
@@ -142,7 +153,24 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group) {
 
     group.n_prompt_total = (uint32_t) group.logical_seq.size();
 
-    auto group_ptr = std::make_unique<llama_sequence_group>(std::move(group));
+    // Bounded so the ordering keys stay well-defined even for bogus callers.
+    constexpr int32_t priority_limit = 1000000;
+    if (group.priority > priority_limit || group.priority < -priority_limit) {
+        LLAMA_LOG_WARN("%s: request %d priority %d is out of range, clamping to [-%d, %d].\n", __func__,
+                       group.request_id, group.priority, priority_limit, priority_limit);
+        group.priority = std::clamp(group.priority, -priority_limit, priority_limit);
+    }
+    if (!priority_enabled_ && group.priority != 0 && !warned_priority_ignored) {
+        LLAMA_LOG_WARN("%s: request %d has priority %d but priority scheduling is disabled; "
+                       "priority is recorded and ignored.\n",
+                       __func__, group.request_id, group.priority);
+        warned_priority_ignored = true;
+    }
+    // Assigned here (not in the C API wrapper) so tests and direct callers
+    // also get a well-defined tie-break key.
+    group.arrival_seq = next_arrival_seq++;
+
+    auto group_ptr = std::make_shared<llama_sequence_group>(std::move(group));
 
     id_to_group[group_ptr->request_id] = group_ptr.get();
 
@@ -277,12 +305,12 @@ bool llama_paged_scheduler_impl::evict_cached_blocks() {
 void llama_paged_scheduler_impl::insert_sorted_by_arrival_time(llama_sequence_group_ptr    new_group_ptr,
                                                                llama_sequence_group_list & list) {
     GGML_ASSERT(new_group_ptr && "New group cannot be sorted because it's nullptr.");
-    auto it =
-        std::lower_bound(list.begin(), list.end(), new_group_ptr->t_arrival_time,
-                         [](const llama_sequence_group_ptr & group, int64_t time) {
-                             GGML_ASSERT(group && "group cannot be checked for arrival time because it's nullptr.");
-                             return group->t_arrival_time < time;
-                         });
+    auto it = std::lower_bound(
+        list.begin(), list.end(), *new_group_ptr,
+        [](const llama_sequence_group_ptr & group, const llama_sequence_group & key) {
+            GGML_ASSERT(group && "group cannot be checked for arrival time because it's nullptr.");
+            return arrival_precedes(*group, key);
+        });
     list.insert(it, std::move(new_group_ptr));
 }
 
@@ -297,14 +325,17 @@ void llama_paged_scheduler_impl::set_swapped(llama_sequence_group_ptr group_ptr)
     GGML_ASSERT(group_ptr && group_ptr->status != llama_sequence_group_status::SWAPPED &&
                 "Request is already swapped.");
     group_ptr->status = llama_sequence_group_status::SWAPPED;
-    insert_sorted_by_arrival_time(std::move(group_ptr), swapped);
+    swapped->push(std::move(group_ptr));
 }
 
 void llama_paged_scheduler_impl::set_waiting(llama_sequence_group_ptr group_ptr) {
     GGML_ASSERT(group_ptr && group_ptr->status != llama_sequence_group_status::WAITING &&
                 "Request is already waiting.");
     group_ptr->status = llama_sequence_group_status::WAITING;
-    insert_sorted_by_arrival_time(std::move(group_ptr), waiting);
+    // FCFS inserts back at its keyed position; PRIORITY re-inserts into the
+    // heap. Recomputed requests keep their (priority, t, seq) keys, so a plain
+    // push restores their original rank -- no push_front is needed.
+    waiting->push(std::move(group_ptr));
 }
 
 void llama_paged_scheduler_impl::finish(llama_sequence_group & group) {
@@ -391,18 +422,34 @@ void llama_paged_scheduler_impl::swap_out_or_recompute(llama_sequence_group_ptr 
     set_waiting(std::move(group_ptr));
 }
 
-void llama_paged_scheduler_impl::evict() {
+llama_sequence_group_ptr llama_paged_scheduler_impl::evict() {
     GGML_ASSERT(kv_cache_manager && "kv_cache_manager is nullptr.");
     LLAMA_LOG_DEBUG("%s: Eviction requested...\n", __func__);
-    if (running.empty()) {
-        return;
+
+    // Consider the whole running list. A victim that was already added to this
+    // step's `candidates` is fine as long as the caller removes it from that
+    // vector before swap-out/recompute; the batch is built afterwards, so a CPU
+    // block id can never reach populate_batch_from(). Restricting the scan to
+    // [it, end) used to protect candidates implicitly, but it also shielded
+    // low-priority groups that happened to be scheduled first, causing a
+    // priority inversion within the step.
+    auto victim = running.end();
+    for (auto it = running.begin(); it != running.end(); ++it) {
+        const llama_sequence_group & g = **it;
+        if (g.status == llama_sequence_group_status::FINISHED) {
+            continue;
+        }
+        if (victim == running.end() || eviction_precedes(g, **victim, priority_enabled_)) {
+            victim = it;
+        }
+    }
+    if (victim == running.end()) {
+        return nullptr;
     }
 
-    llama_sequence_group_ptr most_recent_request = std::move(running.back());
-    running.pop_back();
-    GGML_ASSERT(most_recent_request && "request selected for eviction is nullptr.");
-
-    swap_out_or_recompute(std::move(most_recent_request));
+    llama_sequence_group_ptr evicted = std::move(*victim);
+    running.erase(victim);
+    return evicted;
 }
 
 void llama_paged_scheduler_impl::process_running_list(llama_sequence_group_raw_list & candidates) {
@@ -434,19 +481,31 @@ void llama_paged_scheduler_impl::process_running_list(llama_sequence_group_raw_l
             }
             if (!success) {
                 if (running.size() > 1) {
-                    const bool curr_is_back = (std::next(it) == running.end());
-                    // Evict pops the back of the list (most recent request)
-                    evict();
+                    llama_sequence_group_ptr victim = evict();
+                    if (victim) {
+                        // Compare object identity: request ids are not enforced
+                        // to be unique by queue_request().
+                        const bool victim_is_curr = (victim.get() == group);
+                        if (!victim_is_curr) {
+                            // The victim may already be part of this step's
+                            // candidates. Drop it before swap-out/recompute so
+                            // populate_batch_from() never sees CPU block ids.
+                            auto cit = std::find(candidates.begin(), candidates.end(), victim.get());
+                            if (cit != candidates.end()) {
+                                candidates.erase(cit);
+                            }
+                        }
+                        swap_out_or_recompute(std::move(victim));
 
-                    // Evict might have removed the current group from running
-                    if (curr_is_back) {
-                        // Current group was evicted
-                        it = running.end();
-                        continue;
+                        // Evict might have removed the current group from running.
+                        if (victim_is_curr) {
+                            it = running.end();
+                            continue;
+                        }
+
+                        // Try allocating again after eviction
+                        success = kv_cache_manager->allocate(1, *group);
                     }
-
-                    // Try allocating again after eviction
-                    success = kv_cache_manager->allocate(1, *group);
                 }
 
                 if (!success) {
@@ -471,59 +530,61 @@ void llama_paged_scheduler_impl::process_running_list(llama_sequence_group_raw_l
 
 void llama_paged_scheduler_impl::process_swapped_list(llama_sequence_group_raw_list & candidates) {
     GGML_ASSERT(kv_cache_manager && "kv_cache_manager is nullptr.");
-    llama_sequence_group_list::iterator it = swapped.begin();
-    while (it != swapped.end()) {
-        llama_sequence_group * group = it->get();
+    while (!swapped->empty()) {
+        llama_sequence_group * group = swapped->peek();
         GGML_ASSERT(group && "the group to swap is nullptr.");
-        const bool success = kv_cache_manager->swap_in(*group);
-        if (!success) {
-            // We respect FCFS, so we stop here to prevent a younger swapped request from jumping ahead.
+        if (!kv_cache_manager->swap_in(*group)) {
+            // Swap in queue order (FCFS = earliest arrival, PRIORITY = highest
+            // priority); if the head cannot be swapped in we stop, so a younger
+            // request cannot jump ahead.
+            LLAMA_LOG_DEBUG("%s: head request_id=%d (prio=%d) cannot be swapped in, stop swapping this step\n",
+                            __func__, group->request_id, group->priority);
             break;
         }
         candidates.push_back(group);
-        llama_sequence_group_ptr group_ptr = std::move(*it);
-        LLAMA_LOG_DEBUG("%s: (swapped_in) request_id=%d back in for processing.\n", __func__, group_ptr->request_id);
+        llama_sequence_group_ptr group_ptr = swapped->pop();
+        LLAMA_LOG_DEBUG("%s: (swapped_in) request_id=%d back in for processing.\n", __func__,
+                        group_ptr->request_id);
         set_running(std::move(group_ptr));
-        it = swapped.erase(it);
     }
 }
 
 void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_list & candidates,
                                                       int32_t                         remaining_token_budget) {
     GGML_ASSERT(kv_cache_manager && "kv_cache_manager is nullptr.");
-    llama_sequence_group_list::iterator it    = waiting.begin();
-    size_t                              count = 0;
-    while (it != waiting.end()) {
-        llama_sequence_group * group = it->get();
-        GGML_ASSERT(group && "the waiting group is nullptr.");
-
-        // The cache may have grown since this request was queued.
-        try_apply_prefix_cache(*group);
-
-        const int32_t chunk_tokens = std::min<int32_t>((int32_t) group->n_prompt, remaining_token_budget);
-        if (chunk_tokens <= 0) {
-            break;
-        }
-        ++count;
-        // Reserve the full prompt plus one decode slot; only chunk_tokens run now.
-        bool success = kv_cache_manager->allocate(1, *group);
-        while (!success && evict_cached_blocks()) {
-            success = kv_cache_manager->allocate(1, *group);
-        }
-        if (!success) {
-            // We respect FCFS, so we stop here to prevent a younger waiting request from jumping ahead.
-            break;
-        }
-        candidates.push_back(group);
-        llama_sequence_group_ptr group_ptr = std::move(*it);
-        LLAMA_LOG_DEBUG("%s: (start) request_id=%d sent for processing.\n", __func__, group_ptr->request_id);
-        set_running(std::move(group_ptr));
-        it = waiting.erase(it);
-        break;
+    if (waiting->empty()) {
+        return;
     }
-    if (count > 0) {
-        LLAMA_LOG_DEBUG("%s: Started %ld waiting requests\n", __func__, count);
+
+    // Head of the queue: FCFS = earliest arrival, PRIORITY = highest priority.
+    llama_sequence_group * group = waiting->peek();
+    GGML_ASSERT(group && "the waiting group is nullptr.");
+
+    // The cache may have grown since this request was queued.
+    try_apply_prefix_cache(*group);
+
+    const int32_t chunk_tokens = std::min<int32_t>((int32_t) group->n_prompt, remaining_token_budget);
+    if (chunk_tokens <= 0) {
+        return;  // token budget exhausted for this step
     }
+
+    // Reserve the full prompt plus one decode slot; only chunk_tokens run now.
+    bool success = kv_cache_manager->allocate(1, *group);
+    while (!success && evict_cached_blocks()) {
+        success = kv_cache_manager->allocate(1, *group);
+    }
+    if (!success) {
+        // Strict head-of-queue semantics (matches vLLM): do not skip an
+        // inadmissible head to serve later requests.
+        LLAMA_LOG_DEBUG("%s: head request_id=%d (prio=%d) is inadmissible, stop scheduling waiting this step\n",
+                        __func__, group->request_id, group->priority);
+        return;
+    }
+
+    candidates.push_back(group);
+    llama_sequence_group_ptr group_ptr = waiting->pop();
+    LLAMA_LOG_DEBUG("%s: (start) request_id=%d sent for processing.\n", __func__, group_ptr->request_id);
+    set_running(std::move(group_ptr));
 }
 
 int32_t llama_paged_scheduler_impl::calculate_global_slot_index(int32_t                 token_pos,
