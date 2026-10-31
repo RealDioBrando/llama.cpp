@@ -9811,6 +9811,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W8A8, GGML_TYPE_F16, 16,  3,  32,  {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W8A8, GGML_TYPE_F16, 128, 1,  64,  {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W8A8, GGML_TYPE_F16, 256, 32, 128, {1, 1}, {1, 1}));
+    // W8A16 fallback: output width above 65535 exercises split-output assembly.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W8A8, GGML_TYPE_F16, 70000, 1, 32, {1, 1}, {1, 1}));
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {

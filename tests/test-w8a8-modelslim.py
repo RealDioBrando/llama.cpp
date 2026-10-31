@@ -43,5 +43,47 @@ class W8A8PackingTest(unittest.TestCase):
         np.testing.assert_array_equal(decoded[:, :, 0:2].view('<f2').reshape(-1), scale.astype(np.float16).reshape(-1))
 
 
+class W8A8ValidationTest(unittest.TestCase):
+    def assert_rejected(self, fn) -> None:
+        with self.assertRaises(SystemExit):
+            fn()
+
+    def test_dense_rejects_invalid_dtype(self) -> None:
+        weight = np.zeros((2, 32), dtype=np.float32)
+        scale = np.ones((2, 1), dtype=np.float32)
+        self.assert_rejected(lambda: w8a8_blocks(weight, scale))
+
+    def test_dense_rejects_invalid_k(self) -> None:
+        weight = np.zeros((2, 31), dtype=np.int8)
+        scale = np.ones((2, 1), dtype=np.float32)
+        self.assert_rejected(lambda: w8a8_blocks(weight, scale))
+
+    def test_dense_rejects_invalid_scale_shape(self) -> None:
+        weight = np.zeros((2, 32), dtype=np.int8)
+        scale = np.ones((2,), dtype=np.float32)
+        self.assert_rejected(lambda: w8a8_blocks(weight, scale))
+
+    def test_expert_rejects_invalid_dtype(self) -> None:
+        weight = np.zeros((2, 2, 32), dtype=np.float32)
+        scale = np.ones((2, 2), dtype=np.float32)
+        self.assert_rejected(lambda: w8a8_expert_blocks(weight, scale))
+
+    def test_expert_rejects_invalid_scale_shape(self) -> None:
+        weight = np.zeros((2, 2, 32), dtype=np.int8)
+        scale = np.ones((2, 3), dtype=np.float32)
+        self.assert_rejected(lambda: w8a8_expert_blocks(weight, scale))
+
+    def test_fused_gate_up_slice_order(self) -> None:
+        weight = np.arange(2 * 4 * 32, dtype=np.int8).reshape(2, 4, 32)
+        scale = np.ones((2, 4), dtype=np.float32)
+        half = 2
+        gate = w8a8_expert_blocks(weight[:, :half, :], scale[:, :half])
+        up = w8a8_expert_blocks(weight[:, half:, :], scale[:, half:])
+        gate_payload = gate.reshape(2, 2, 1, 34)[:, :, :, 2:].view(np.int8).reshape(2, 2, 32)
+        up_payload = up.reshape(2, 2, 1, 34)[:, :, :, 2:].view(np.int8).reshape(2, 2, 32)
+        np.testing.assert_array_equal(gate_payload, weight[:, :half, :])
+        np.testing.assert_array_equal(up_payload, weight[:, half:, :])
+
+
 if __name__ == "__main__":
     unittest.main()

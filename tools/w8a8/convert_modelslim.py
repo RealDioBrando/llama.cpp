@@ -215,6 +215,7 @@ class _ModelslimQwen35Mixin:
         offset_shape = tuple(offset_lazy.shape)
 
         require(len(weight_shape) == 2, f"{weight_name} must be 2D, got {weight_shape}")
+        require(weight_lazy.dtype == torch.int8, f"{weight_name} must be INT8, got {weight_lazy.dtype}")
         require(scale_shape == (weight_shape[0], 1), f"{scale_name} shape {scale_shape} != ({weight_shape[0]}, 1)")
         require(offset_shape == scale_shape, f"{offset_name} shape {offset_shape} != {scale_shape}")
         self._validate_offset(offset_lazy, offset_name)
@@ -258,6 +259,8 @@ class _ModelslimQwen35Mixin:
             scale_shape = tuple(scale_lazy.shape)
             offset_shape = tuple(offset_lazy.shape)
             require(len(weight_shape) == 2, f"{weight_name} must be 2D, got {weight_shape}")
+            require(weight_lazy.dtype == torch.int8, f"{weight_name} must be INT8, got {weight_lazy.dtype}")
+            require(weight_shape[1] % 32 == 0, f"K must be divisible by 32, got {weight_shape[1]}")
             require(scale_shape == (weight_shape[0], 1),
                     f"{scale_name} shape {scale_shape} != ({weight_shape[0]}, 1)")
             require(offset_shape == scale_shape, f"{offset_name} shape {offset_shape} != {scale_shape}")
@@ -367,6 +370,7 @@ class ModelslimQwen35MoeModel(_ModelslimQwen35Mixin, Qwen3_5MoeTextModel):
             scale_shape = tuple(first_scale.shape)
             offset_shape = tuple(first_offset.shape)
             require(len(weight_shape) == 2, f"{first_name} must be 2D, got {weight_shape}")
+            require(first_weight.dtype == torch.int8, f"{first_name} must be INT8, got {first_weight.dtype}")
             require(scale_shape == (weight_shape[0], 1),
                     f"{first_scale_name} shape {scale_shape} != ({weight_shape[0]}, 1)")
             require(offset_shape == scale_shape, f"{first_offset_name} shape {offset_shape} != {scale_shape}")
