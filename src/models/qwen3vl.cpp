@@ -82,6 +82,9 @@ llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_par
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
+        // Expose layer inputs for speculative feature extraction.
+        res->t_layer_inp[il] = inpL;
+
         ggml_tensor * inpSA = inpL;
 
         // norm

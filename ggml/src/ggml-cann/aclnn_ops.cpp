@@ -3224,7 +3224,8 @@ static void aclnn_rope_cache_init(ggml_backend_cann_context & ctx,
                     } else if (sector % 3 == 0 && sector < 3 * sections[0]) {
                         ctx.rope_cache.position_select_index_host[i] = 0;
                     } else {
-                        ctx.rope_cache.position_select_index_host[i] = 3;
+                        // Keep extra-axis routing only when a fourth section is configured.
+                        ctx.rope_cache.position_select_index_host[i] = sections[3] == 0 ? 0 : 3;
                     }
                 } else {
                     if (sector >= sections[0] && sector < sec_w) {
