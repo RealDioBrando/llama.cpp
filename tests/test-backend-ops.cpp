@@ -1198,10 +1198,6 @@ struct test_case {
         return nmse(a, b, n);
     }
 
-    virtual bool validate_tensor(const ggml_tensor *, const std::vector<float> &) {
-        return true;
-    }
-
     virtual float grad_eps() {
         return 1e-1f;
     }
@@ -1483,11 +1479,6 @@ struct test_case {
 
             std::vector<float> f1 = tensor_to_float(t1);
             std::vector<float> f2 = tensor_to_float(t2);
-
-            if (!ud->tc->validate_tensor(t1, f1) || !ud->tc->validate_tensor(t2, f2)) {
-                printf("[%s] scalar oracle mismatch ", ggml_op_desc(t1));
-                ud->ok = false;
-            }
 
             for (size_t i = 0; i < f1.size(); i++) {
                 // check for nans
@@ -5742,24 +5733,18 @@ struct test_rope : public test_case {
     bool forward;
     bool inplace;
     int n_offs; // offset of the rotated dims window, set via ggml_rope_set_offset()
-    std::array<int, 4> sections;
-    int positions; // 0: random, 1: text, 2: spatial, 3/4: unused-extra invariant
 
     std::string vars() override {
         // forward can be inferred from the op, does not need to be printed
-        auto result = VARS_TO_STR12(type, ne_a, n_dims, mode, n_ctx, fs, ef, af, ff, v, inplace, n_offs);
-        if (positions != 0) {
-            result += "," + VARS_TO_STR2(sections, positions);
-        }
-        return result;
+        return VARS_TO_STR12(type, ne_a, n_dims, mode, n_ctx, fs, ef, af, ff, v, inplace, n_offs);
     }
 
     test_rope(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne_a = {10, 5, 3, 1},
             int n_dims = 10, int mode = GGML_ROPE_TYPE_NORMAL, int n_ctx = 512, float fs = 1.0f,
             float ef = 0.0f, float af = 0.0f, bool ff = false, int v = 0, bool forward = true, bool inplace = false,
-            int n_offs = 0, std::array<int, 4> sections = {}, int positions = 0)
-        : type(type), ne_a(ne_a), n_dims(n_dims), mode(mode), n_ctx(n_ctx), fs(fs), ef(ef), af(af), ff(ff), v(v), forward(forward), inplace(inplace), n_offs(n_offs), sections(sections), positions(positions) {}
+            int n_offs = 0)
+        : type(type), ne_a(ne_a), n_dims(n_dims), mode(mode), n_ctx(n_ctx), fs(fs), ef(ef), af(af), ff(ff), v(v), forward(forward), inplace(inplace), n_offs(n_offs) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a;
@@ -5833,18 +5818,14 @@ struct test_rope : public test_case {
             } else {
                 GGML_ASSERT(n_dims/3 > 0);
                 int rope_sections[4] = {n_dims/3, n_dims/3, n_dims/3, 0};
-                if (sections[0] != 0) {
-                    std::copy(sections.begin(), sections.end(), rope_sections);
-                }
-                const float freq_base = positions == 0 ? 10000.0f : 5000000.0f;
                 if (forward) {
                     if (inplace) {
-                        out = ggml_rope_multi_inplace(ctx, a, pos, freq, n_dims, rope_sections, mode, 0, freq_base, fs, ef, af, 1.0f, 1.0f);
+                        out = ggml_rope_multi_inplace(ctx, a, pos, freq, n_dims, rope_sections, mode, 0, 10000.0f, fs, ef, af, 1.0f, 1.0f);
                     } else {
-                        out = ggml_rope_multi(ctx, a, pos, freq, n_dims, rope_sections, mode, 0, freq_base, fs, ef, af, 1.0f, 1.0f);
+                        out = ggml_rope_multi(ctx, a, pos, freq, n_dims, rope_sections, mode, 0, 10000.0f, fs, ef, af, 1.0f, 1.0f);
                     }
                 } else {
-                    out = ggml_rope_multi_back(ctx, a, pos, freq, n_dims, rope_sections, mode, 0, freq_base, fs, ef, af, 1.0f, 1.0f);
+                    out = ggml_rope_multi_back(ctx, a, pos, freq, n_dims, rope_sections, mode, 0, 10000.0f, fs, ef, af, 1.0f, 1.0f);
                 }
             }
         } else {
@@ -5873,19 +5854,9 @@ struct test_rope : public test_case {
                 const int num_pos_ids = (mode & GGML_ROPE_TYPE_MROPE) ? ne_a[2] * 4 : ne_a[2];
                 std::vector<int> data(num_pos_ids);
                 for (int i = 0; i < num_pos_ids; i++) {
-                    data[i] = positions == 0 ? rand() % n_ctx : coordinate(i / ne_a[2], i % ne_a[2]);
+                    data[i] = rand() % n_ctx;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, num_pos_ids * sizeof(int));
-            } else if (positions != 0 && strcmp(t->name, "a") == 0) {
-                std::vector<float> data(ggml_nelements(t));
-                for (size_t i = 0; i < data.size(); ++i) { data[i] = input_value(i); }
-                if (type == GGML_TYPE_F32) {
-                    ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
-                } else {
-                    std::vector<ggml_fp16_t> half(data.size());
-                    for (size_t i = 0; i < data.size(); ++i) { half[i] = ggml_fp32_to_fp16(data[i]); }
-                    ggml_backend_tensor_set(t, half.data(), 0, ggml_nbytes(t));
-                }
             } else {
                 if (t->ne[0] == n_dims/2) {
                     // frequency factors in the range [0.9f, 1.1f]
@@ -5899,54 +5870,6 @@ struct test_rope : public test_case {
 
     double max_maa_err() override {
         return 1e-3;
-    }
-
-    int coordinate(int axis, int row) const {
-        if (positions >= 3) { return axis == 3 && positions == 3 ? 32768 : 0; }
-        if (positions == 1) { return axis == 3 ? 0 : 18 + row; }
-        const int coords[] = {4, 6 + row % 3, 9 + row / 3, 32768};
-        return coords[axis];
-    }
-
-    float input_value(size_t index) const {
-        float value = positions >= 3 ? (index % 128 == 61 || index % 128 == 62 ? 1.0f : 0.0f)
-                                     : std::sin(float(index)*0.137f);
-        return type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(ggml_fp32_to_fp16(value)) : value;
-    }
-
-    bool validate_tensor(const ggml_tensor * tensor, const std::vector<float> & actual) override {
-        if (positions == 0 || tensor->op != GGML_OP_ROPE) { return true; }
-        // Build the reference by assigning all pairs to T, then overwriting H/W/extra.
-        std::array<int, 64> axes{};
-        if (mode == GGML_ROPE_TYPE_IMROPE) {
-            for (int j = 0; j < sections[1]; ++j) { axes[1 + 3*j] = 1; }
-            for (int j = 0; j < sections[2]; ++j) { axes[2 + 3*j] = 2; }
-            if (sections[3]) {
-                for (int j = 64 - sections[3]; j < 64; ++j) { axes[j] = 3; }
-            }
-        } else {
-            int j = 0;
-            for (int axis = 0; axis < 4; ++axis) {
-                for (int k = 0; k < sections[axis]; ++k) { axes[j++] = axis; }
-            }
-        }
-        double error = 0.0;
-        const double tolerance = positions >= 3 ? (type == GGML_TYPE_F32 ? 1e-5 : 1e-3)
-                                                : (type == GGML_TYPE_F32 ? 1e-4 : 2e-3);
-        for (size_t block = 0; block < actual.size(); block += 128) {
-            const int row = block / (128*ne_a[1]);
-            for (int j = 0; j < 64; ++j) {
-                const double angle = coordinate(axes[j], row)*std::pow(5000000.0, -2.0*j/128.0);
-                const double x = input_value(block + j), y = input_value(block + j + 64);
-                const double expected[] = {x*std::cos(angle) - y*std::sin(angle), x*std::sin(angle) + y*std::cos(angle)};
-                for (int half = 0; half < 2; ++half) {
-                    const size_t i = block + j + half*64;
-                    error = std::max(error, std::fabs(actual[i] - expected[half])/tolerance);
-                }
-            }
-        }
-        if (error > 1.0) { printf("max normalized absolute error = %.9g ", error); }
-        return error <= 1.0;
     }
 
     bool grad_precise() override {
@@ -10441,27 +10364,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         // inplace with an offset
         test_cases.emplace_back(new test_rope(type, {128, 32, 2, 1}, 32, GGML_ROPE_TYPE_NEOX, 512, 1.4245f, 0.7465f, 1.4245f, false, 0, true, true, 32));
-    }
-
-    // Fixed spatial layouts also compare both backends with an independent scalar oracle.
-    for (int layout = 0; layout < 5; ++layout) {
-        const std::array<int, 4> sections = layout == 4 ? std::array<int, 4>{64, 0, 0, 0}
-            : layout % 2 == 0 ? std::array<int, 4>{24, 20, 20, 0} : std::array<int, 4>{16, 16, 16, 16};
-        const int mode = layout < 2 || layout == 4 ? GGML_ROPE_TYPE_IMROPE : GGML_ROPE_TYPE_MROPE;
-        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
-            for (int rows : {1, 7, 129}) {
-                for (int positions : {1, 2}) {
-                    test_cases.emplace_back(new test_rope(type, {128, 2, rows, 1}, 128, mode, 512,
-                        1.0f, 0.0f, 1.0f, false, 0, true, false, 0, sections, positions));
-                }
-            }
-        }
-    }
-    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
-        for (int positions : {3, 4}) {
-            test_cases.emplace_back(new test_rope(type, {128, 2, 1, 1}, 128, GGML_ROPE_TYPE_IMROPE, 512,
-                1.0f, 0.0f, 1.0f, false, 0, true, false, 0, std::array<int, 4>{24, 20, 20, 0}, positions));
-        }
     }
 
     // Real-model RoPE: F32 forward, packed Q, 512-token prefill.

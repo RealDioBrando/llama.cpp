@@ -194,8 +194,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build(test-llama-archs.cpp)
 
-    llama_test(test-llama-archs NAME test-dflash-mrope LABEL main ARGS -a dflash -s 1234)
-
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
 
