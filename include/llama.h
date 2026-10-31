@@ -1690,12 +1690,18 @@ extern "C" {
                                                 struct llama_context *         ctx);
 
     // Queueing and stepping.
+
+// Priority is clamped by llama_paged_scheduler_add_request() to
+// [-LLAMA_PAGED_PRIORITY_LIMIT, LLAMA_PAGED_PRIORITY_LIMIT].
+#define LLAMA_PAGED_PRIORITY_LIMIT 1000000
+
     // Lower `priority` values are served first (default 0; negative values are
     // higher priority). Requests with equal priority are served in arrival
     // order. Priority only takes effect when the scheduler was created with
     // llama_context_params.paged_priority = true; that mode is decided at
     // llama_paged_scheduler_init() time, not by this argument. Otherwise the
-    // value is recorded and ignored. The value is clamped to [-1000000, 1000000].
+    // value is recorded and ignored. The value is clamped to
+    // [-LLAMA_PAGED_PRIORITY_LIMIT, LLAMA_PAGED_PRIORITY_LIMIT].
     //
     // C has no default arguments: C callers must pass `priority` explicitly
     // (pass 0). The default below only applies to C++ callers.

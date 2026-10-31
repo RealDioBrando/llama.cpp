@@ -208,7 +208,7 @@ int main(int argc, char ** argv) {
             return 0;
         }
         const int64_t p = (int64_t) priority_base - (int64_t) seq_id * priority_step;
-        return (int32_t) std::clamp<int64_t>(p, -1000000, 1000000);
+        return (int32_t) std::clamp<int64_t>(p, -LLAMA_PAGED_PRIORITY_LIMIT, LLAMA_PAGED_PRIORITY_LIMIT);
     };
 
     while (true) {

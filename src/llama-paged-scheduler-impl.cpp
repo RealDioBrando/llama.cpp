@@ -154,11 +154,10 @@ bool llama_paged_scheduler_impl::queue_request(llama_sequence_group group) {
     group.n_prompt_total = (uint32_t) group.logical_seq.size();
 
     // Bounded so the ordering keys stay well-defined even for bogus callers.
-    constexpr int32_t priority_limit = 1000000;
-    if (group.priority > priority_limit || group.priority < -priority_limit) {
+    if (group.priority > LLAMA_PAGED_PRIORITY_LIMIT || group.priority < -LLAMA_PAGED_PRIORITY_LIMIT) {
         LLAMA_LOG_WARN("%s: request %d priority %d is out of range, clamping to [-%d, %d].\n", __func__,
-                       group.request_id, group.priority, priority_limit, priority_limit);
-        group.priority = std::clamp(group.priority, -priority_limit, priority_limit);
+                       group.request_id, group.priority, LLAMA_PAGED_PRIORITY_LIMIT, LLAMA_PAGED_PRIORITY_LIMIT);
+        group.priority = std::clamp(group.priority, -LLAMA_PAGED_PRIORITY_LIMIT, LLAMA_PAGED_PRIORITY_LIMIT);
     }
     if (!priority_enabled_ && group.priority != 0 && !warned_priority_ignored) {
         LLAMA_LOG_WARN("%s: request %d has priority %d but priority scheduling is disabled; "
