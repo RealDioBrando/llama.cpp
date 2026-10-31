@@ -307,6 +307,7 @@ llama_context::llama_context(
     cparams.n_gpu_blocks = params.n_gpu_blocks;
     cparams.n_cpu_blocks = params.n_cpu_blocks;
     cparams.kv_paged_watermark = params.kv_paged_watermark;
+    cparams.act_type           = params.type_act;
     cparams.paged_priority     = params.paged_priority;
 
     // initialized later
@@ -348,6 +349,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified            = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    LLAMA_LOG_INFO("%s: act_type              = %s\n",   __func__, ggml_type_name(cparams.act_type));
     LLAMA_LOG_INFO("%s: freq_base             = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale            = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq              = %u\n",   __func__, cparams.n_rs_seq);
@@ -560,6 +562,22 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
+// scope F16 activations to the Qwen3 family on CANN
+static bool llama_arch_supports_act_f16(llm_arch arch) {
+    switch (arch) {
+        case LLM_ARCH_QWEN3:
+        case LLM_ARCH_QWEN3MOE:
+        case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_QWEN3VL:
+        case LLM_ARCH_QWEN3VLMOE:
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
     const char * func = __func__;
     auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled) {
@@ -677,6 +695,27 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
 
     resolve_fused_ops(mctx.get(), n_seqs);
+
+    if (cparams.act_type != GGML_TYPE_F32) {
+        if (!llama_arch_supports_act_f16(model.arch)) {
+            throw std::runtime_error(format("activation type %s is only supported for Qwen3-family architecture %s",
+                    ggml_type_name(cparams.act_type), llm_arch_name(model.arch)));
+        }
+        bool has_cann = false;
+        for (ggml_backend_t backend : backend_ptrs) {
+            const char * name = ggml_backend_dev_name(ggml_backend_get_device(backend));
+            if (strncmp(name, "CANN", 4) == 0) {
+                has_cann = true;
+            } else if (strcmp(name, "CPU") != 0) {
+                throw std::runtime_error(format("activation type %s is only supported with CANN; found %s",
+                        ggml_type_name(cparams.act_type), name));
+            }
+        }
+        if (!has_cann) {
+            throw std::runtime_error(format("activation type %s requires a CANN backend",
+                    ggml_type_name(cparams.act_type)));
+        }
+    }
 
     // reserve worst-case graph
     int n_splits_pp = -1;
@@ -1831,6 +1870,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     n_queued_tokens += n_tokens_all;
 
     output_swaps.clear();
+    embd_batch_idxs.clear();
 
     sched_reserve();
 
@@ -1970,6 +2010,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
+            GGML_ASSERT(t_logits->type == GGML_TYPE_F32);
 
             float * logits_out = logits.data + n_outputs_prev*n_vocab;
 
@@ -1984,6 +2025,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (embd.data && t_embd && n_outputs > 0) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
+            GGML_ASSERT(t_embd->type == GGML_TYPE_F32);
 
             switch (cparams.pooling_type) {
                 case LLAMA_POOLING_TYPE_NONE:
@@ -2040,7 +2082,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        // [TAG_EXTRACT_TARGET_EMBEDDINGS]
+        bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2058,7 +2101,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                extract_all_idxs = extract_all_idxs || !masked;
             }
+        }
+
+        if (extract_all_idxs) {
+            GGML_ASSERT(ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens);
+            GGML_ASSERT(embd_batch_idxs.size() == (size_t) n_tokens_prev);
+            const auto & batch_idxs = ubatch.data->batch_idxs;
+            embd_batch_idxs.insert(embd_batch_idxs.end(), batch_idxs.begin(), batch_idxs.end());
         }
 
         if (has_samplers) {
@@ -2297,7 +2348,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     return n_outputs_max;
 }
 
-void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens) {
+    bool extracted = false;
     for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
         if (!cparams.embeddings_layer_inp[il]) {
             continue;
@@ -2316,13 +2368,17 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
         GGML_ASSERT(nfloats % n_tokens == 0);
 
         const size_t row_floats = nfloats / n_tokens;
+        GGML_ASSERT(row_floats == model.hparams.n_embd);
         const size_t dst_offset = token_offset * row_floats;
         GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
         GGML_ASSERT(backend != nullptr);
+        // Tensor-split backends require a zero source offset.
         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+        extracted = true;
     }
+    return extracted;
 }
 
 void llama_context::output_reorder() {
@@ -2346,19 +2402,9 @@ void llama_context::output_reorder() {
             }
         }
 
-        if (embd_nextn.size > 0) {
+        if (embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
             for (uint64_t k = 0; k < n_embd_out; k++) {
                 std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
-            }
-        }
-
-        if (embd_layer_inp.size() > 0) {
-            for (int lid = 0; lid < (int) embd_layer_inp.size(); ++lid) {
-                if (embd_layer_inp[lid].size > 0) {
-                    for (uint64_t k = 0; k < n_embd; ++k) {
-                        std::swap(embd_layer_inp[lid].data[i0*n_embd + k], embd_layer_inp[lid].data[i1*n_embd + k]);
-                    }
-                }
             }
         }
 
@@ -2391,6 +2437,29 @@ void llama_context::output_reorder() {
     }
 
     output_swaps.clear();
+
+    // [TAG_EXTRACT_TARGET_EMBEDDINGS]
+    // Layer inputs and unmasked NextN embeddings contain all token rows, independent of logits selection.
+    for (size_t i = 0; i < embd_batch_idxs.size(); ++i) {
+        while (embd_batch_idxs[i] != (int32_t) i) {
+            const int32_t j = embd_batch_idxs[i];
+            GGML_ASSERT(j >= 0 && (size_t) j < embd_batch_idxs.size());
+            if (embd_nextn.has_data() && !cparams.embeddings_nextn_masked) {
+                for (size_t k = 0; k < n_embd_out; ++k) {
+                    std::swap(embd_nextn.data[i*n_embd_out + k], embd_nextn.data[j*n_embd_out + k]);
+                }
+            }
+            for (auto & layer : embd_layer_inp) {
+                if (layer.has_data()) {
+                    for (size_t k = 0; k < n_embd; ++k) {
+                        std::swap(layer.data[i*n_embd + k], layer.data[j*n_embd + k]);
+                    }
+                }
+            }
+            std::swap(embd_batch_idxs[i], embd_batch_idxs[j]);
+        }
+    }
+    embd_batch_idxs.clear();
 }
 
 //
@@ -2508,6 +2577,36 @@ static void ubatch_prepare_reserve(
     }
 }
 
+// not every backend implements every op with non-F32 activations: fail with the node instead of
+// leaving the scheduler without a backend for it
+static void llama_check_act_type_support(ggml_cgraph * gf, const std::vector<ggml_backend_t> & backends, ggml_type act_type) {
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+        switch (node->op) {
+            case GGML_OP_NONE:
+            case GGML_OP_VIEW:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_TRANSPOSE:
+                continue;
+            default:
+                break;
+        }
+
+        bool supported = false;
+        for (ggml_backend_t backend : backends) {
+            if (ggml_backend_supports_op(backend, node)) {
+                supported = true;
+                break;
+            }
+        }
+        if (!supported) {
+            throw std::runtime_error(format("activation type %s: no backend supports node '%s' (%s, type %s)",
+                    ggml_type_name(act_type), node->name, ggml_op_desc(node), ggml_type_name(node->type)));
+        }
+    }
+}
+
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
@@ -2543,6 +2642,10 @@ ggml_cgraph * llama_context::graph_reserve(
     auto * gf = model.build_graph(gparams);
 
     this->n_outputs = save_n_outputs;
+
+    if (cparams.act_type != GGML_TYPE_F32) {
+        llama_check_act_type_support(gf, backend_ptrs, cparams.act_type);
+    }
 
     // initialize scheduler with the specified graph
     if (split_only) {
@@ -3736,6 +3839,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.type_act                    =*/ GGML_TYPE_F32,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -3831,6 +3935,17 @@ llama_context * llama_init_from_model(
                 return nullptr;
             }
         }
+    }
+
+    if (params.type_act != GGML_TYPE_F32 && params.type_act != GGML_TYPE_F16) {
+        LLAMA_LOG_ERROR("%s: unsupported activation type %s (supported: f32, f16)\n", __func__, ggml_type_name(params.type_act));
+        return nullptr;
+    }
+
+    if (params.type_act != GGML_TYPE_F32 && !llama_arch_supports_act_f16(model->arch)) {
+        LLAMA_LOG_ERROR("%s: activation type %s is only supported for Qwen3-family architecture %s\n", __func__,
+                ggml_type_name(params.type_act), llm_arch_name(model->arch));
+        return nullptr;
     }
 
     if (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&

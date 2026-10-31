@@ -82,6 +82,9 @@ llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_par
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
+        // Expose layer inputs for speculative feature extraction.
+        res->t_layer_inp[il] = inpL;
+
         ggml_tensor * inpSA = inpL;
 
         // norm
@@ -124,8 +127,8 @@ llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_par
         }
 
         if (il == n_layer - 1 && inp_out_ids) {
-            cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
-            inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            cur   = build_out_rows(  cur, inp_out_ids);
+            inpSA = build_out_rows(inpSA, inp_out_ids);
         }
 
         ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
@@ -151,7 +154,7 @@ llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_par
         cb(cur, "l_out", il);
 
         if (il < (int) n_deepstack_layers) {
-            ggml_tensor * ds = ggml_view_2d(ctx0, res->t_inp_embd, n_embd, n_tokens, res->t_inp_embd->nb[1], (il + 1) * n_embd * sizeof(float));
+            ggml_tensor * ds = ggml_view_2d(ctx0, res->t_inp_embd, n_embd, n_tokens, res->t_inp_embd->nb[1], (il + 1) * n_embd * ggml_element_size(res->t_inp_embd));
             cur = ggml_add(ctx0, cur, ds);
             cb(cur, "deepstack_out", il);
         }
@@ -170,7 +173,7 @@ llama_model_qwen3vl::graph::graph(const llama_model & model, const llm_graph_par
     res->t_embd = cur;
 
     // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(model.output, cur, model.output_s, GGML_TYPE_F32);
 
     int64_t n_vocab_in  = model.tok_embd->ne[1];
     int64_t n_vocab_out = model.output->ne[1];

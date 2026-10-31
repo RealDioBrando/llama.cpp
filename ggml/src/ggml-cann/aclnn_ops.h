@@ -629,8 +629,7 @@ void ggml_cann_rope_cache_preload(ggml_backend_cann_context & ctx, ggml_tensor *
  * constants so their first use never happens under capture.
  */
 acl_tensor_ptr ggml_cann_warm_cache_acl_tensor(ggml_backend_cann_context & ctx,
-                                               void **                     buffer,
-                                               int64_t &                   cache_element,
+                                               ggml_cann_tensor_cache &    cache,
                                                int64_t *                   ne,
                                                size_t *                    nb,
                                                ggml_type                   dtype,

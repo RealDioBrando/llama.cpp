@@ -1283,8 +1283,7 @@ static void aclnn_fill_scalar(ggml_backend_cann_context & ctx, float scalar, acl
  * @return              A tensor smart pointer created from the cached buffer.
  */
 static acl_tensor_ptr get_cache_acl_tensor(ggml_backend_cann_context & ctx,
-                                           void **                     buffer,
-                                           int64_t &                   cache_element,
+                                           ggml_cann_tensor_cache &    cache,
                                            int64_t *                   ne,
                                            size_t *                    nb,
                                            ggml_type                   dtype,
@@ -1298,36 +1297,37 @@ static acl_tensor_ptr get_cache_acl_tensor(ggml_backend_cann_context & ctx,
     size_t size = n_element * ggml_type_size(dtype);
 
     // Allocate or expand cache if needed
-    if (cache_element < n_element) {
-        if (*buffer != nullptr) {
-            aclrtFree(*buffer);
-            *buffer = nullptr;
+    if (cache.size < n_element || cache.dtype != dtype) {
+        if (cache.cache != nullptr) {
+            aclrtFree(cache.cache);
+            cache.cache = nullptr;
         }
 
-        ACL_CHECK(aclrtMalloc(buffer, size, ACL_MEM_MALLOC_HUGE_FIRST));
-        cache_element = n_element;
+        ACL_CHECK(aclrtMalloc(&cache.cache, size, ACL_MEM_MALLOC_HUGE_FIRST));
+        cache.size = n_element;
 
         // Initialize cache
         int64_t        pool_ne[1] = { n_element };
         size_t         pool_nb[1] = { ggml_type_size(dtype) };
         acl_tensor_ptr acl_value =
-            ggml_cann_create_tensor(*buffer, ggml_cann_type_mapping(dtype), ggml_type_size(dtype), pool_ne, pool_nb, 1);
+            ggml_cann_create_tensor(cache.cache, ggml_cann_type_mapping(dtype), ggml_type_size(dtype), pool_ne, pool_nb, 1);
         aclnn_fill_scalar(ctx, value, acl_value.get());
     }
 
-    return ggml_cann_create_tensor(*buffer, ggml_cann_type_mapping(dtype), ggml_type_size(dtype), ne, nb, dims);
+    cache.dtype = dtype;
+
+    return ggml_cann_create_tensor(cache.cache, ggml_cann_type_mapping(dtype), ggml_type_size(dtype), ne, nb, dims);
 }
 
 // Non-static wrapper for the capture-time cache preload in ggml-cann.cpp. (rms_norm ones/zeros constants must exist BEFORE capture).
 acl_tensor_ptr ggml_cann_warm_cache_acl_tensor(ggml_backend_cann_context & ctx,
-                                               void **                     buffer,
-                                               int64_t &                   cache_element,
+                                               ggml_cann_tensor_cache &    cache,
                                                int64_t *                   ne,
                                                size_t *                    nb,
                                                ggml_type                   dtype,
                                                int64_t                     dims,
                                                float                       value) {
-    return get_cache_acl_tensor(ctx, buffer, cache_element, ne, nb, dtype, dims, value);
+    return get_cache_acl_tensor(ctx, cache, ne, nb, dtype, dims, value);
 }
 
 void ggml_cann_rms_norm(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
@@ -1368,7 +1368,7 @@ void ggml_cann_rms_norm(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         acl_gamma_nb[i] = acl_gamma_nb[i - 1] * src->ne[i - 1];
     }
     acl_tensor_ptr acl_gamma = get_cache_acl_tensor(
-        ctx, &ctx.rms_norm_one_tensor_cache.cache, ctx.rms_norm_one_tensor_cache.size, src->ne, acl_gamma_nb, dst->type,
+        ctx, ctx.rms_norm_one_tensor_cache, src->ne, acl_gamma_nb, dst->type,
         1,    // dims
         1.0f  // value
     );
@@ -1382,7 +1382,7 @@ void ggml_cann_rms_norm(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         acl_rstd_nb[i] = acl_rstd_nb[i - 1] * acl_rstd_ne[i - 1];
     }
     acl_tensor_ptr acl_rstd =
-        get_cache_acl_tensor(ctx, &ctx.rms_norm_zero_tensor_cache.cache, ctx.rms_norm_zero_tensor_cache.size,
+        get_cache_acl_tensor(ctx, ctx.rms_norm_zero_tensor_cache,
                              acl_rstd_ne, acl_rstd_nb, GGML_TYPE_F32, GGML_MAX_DIMS - 1,
                              0.0f  // value
         );
@@ -3224,7 +3224,8 @@ static void aclnn_rope_cache_init(ggml_backend_cann_context & ctx,
                     } else if (sector % 3 == 0 && sector < 3 * sections[0]) {
                         ctx.rope_cache.position_select_index_host[i] = 0;
                     } else {
-                        ctx.rope_cache.position_select_index_host[i] = 3;
+                        // Keep extra-axis routing only when a fourth section is configured.
+                        ctx.rope_cache.position_select_index_host[i] = sections[3] == 0 ? 0 : 3;
                     }
                 } else {
                     if (sector >= sections[0] && sector < sec_w) {
@@ -5350,7 +5351,7 @@ void ggml_cann_op_add_rms_norm_fused(ggml_backend_cann_context & ctx,
         acl_gamma_nb[i] = acl_gamma_nb[i - 1] * x1->ne[i - 1];
     }
     acl_tensor_ptr acl_gamma =
-        get_cache_acl_tensor(ctx, &ctx.rms_norm_one_tensor_cache.cache, ctx.rms_norm_one_tensor_cache.size, x1->ne,
+        get_cache_acl_tensor(ctx, ctx.rms_norm_one_tensor_cache, x1->ne,
                              acl_gamma_nb, rms_norm_node->type,
                              1,    // dims - only the last dimension
                              1.0f  // value
@@ -5365,7 +5366,7 @@ void ggml_cann_op_add_rms_norm_fused(ggml_backend_cann_context & ctx,
         acl_rstd_nb[i] = acl_rstd_nb[i - 1] * acl_rstd_ne[i - 1];
     }
     acl_tensor_ptr acl_rstd =
-        get_cache_acl_tensor(ctx, &ctx.rms_norm_zero_tensor_cache.cache, ctx.rms_norm_zero_tensor_cache.size,
+        get_cache_acl_tensor(ctx, ctx.rms_norm_zero_tensor_cache,
                              acl_rstd_ne, acl_rstd_nb, GGML_TYPE_F32, GGML_MAX_DIMS,
                              0.0f  // value
         );

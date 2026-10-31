@@ -662,6 +662,12 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
 
     curr_info.n_seq            = batch_size;
     curr_info.n_tokens         = total_tokens;
+    // Keep the block table shape fixed so ACL graph replay matches across
+    // decode steps. Invalid padding is ignored because context_lens bounds
+    // each sequence.
+    const int32_t block_table_capacity =
+            (int32_t) ((n_seq_max_ctx + block_size - 1) / block_size);
+    max_blocks                 = std::max(max_blocks, block_table_capacity);
     curr_info.n_blocks_per_seq = max_blocks;
 
     curr_info.write_slots   = new int32_t[total_tokens];
@@ -710,7 +716,7 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
         for (int block = 0; block < max_blocks; ++block) {
             int  flattened_id                   = (seq_id * max_blocks) + block;  // row-major
             bool need_padding                   = block >= curr_block_table_size;
-            curr_info.block_table[flattened_id] = need_padding ? 0 : group->block_table[block];
+            curr_info.block_table[flattened_id] = need_padding ? -1 : group->block_table[block];
         }
 
         curr_info.context_lens[seq_id]  = group->n_past + new_tokens;

@@ -1823,8 +1823,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kv_paged_watermark = params.kv_paged_watermark;
     cparams.paged_priority      = params.enable_priority;
 
-    cparams.type_k = params.cache_type_k;
-    cparams.type_v = params.cache_type_v;
+    cparams.type_k   = params.cache_type_k;
+    cparams.type_v   = params.cache_type_v;
+    cparams.type_act = params.act_type;
 
     return cparams;
 }

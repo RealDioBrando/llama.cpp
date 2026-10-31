@@ -6032,7 +6032,8 @@ static void ggml_mrope_cache_init(
             } else if (sector % 3 == 0 && sector < 3 * sections[0]) {
                 theta = theta_t;
             } else {
-                theta = theta_e;
+                // Keep extra-axis routing only when a fourth section is configured.
+                theta = sections[3] == 0 ? theta_t : theta_e;
             }
         } else {
             if (sector >= sections[0] && sector < sec_w) {

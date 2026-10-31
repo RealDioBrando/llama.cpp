@@ -342,7 +342,10 @@ llama_memory_context_ptr llama_kv_cache_paged::init_batch(llama_batch_allocr & b
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = balloc.split_simple(n_ubatch);
+            // Paged metadata requires one token count per sequence set.
+            // split_simple emits one pseudo-sequence per token and hides
+            // prefill from phase-sensitive backends.
+            auto ubatch = balloc.split_equal(n_ubatch, false, 0);
             if (ubatch.n_tokens == 0) {
                 break;
             }
@@ -389,10 +392,11 @@ llama_memory_context_ptr llama_kv_cache_paged::init_full() {
 }
 
 llama_memory_context_ptr llama_kv_cache_paged::init_update(llama_context * /*lctx*/, bool /*optimize*/) {
-    std::vector<llama_ubatch> dummy_ubatch = {};
-    auto                      ctx          = std::make_unique<llama_kv_cache_paged_context>(this, dummy_ubatch);
-    // TODO maybe confirm block counts or clean up stale pointers
-    return ctx;
+    // Paged KV has no host-side pending updates (apply is a no-op). Returning
+    // SUCCESS made the generic memory_update path reset the previous graph and
+    // rebuild the worst-case reserve graph on every decode step, which broke
+    // graph reuse and added ~4 ms/step host overhead.
+    return std::make_unique<llama_kv_cache_paged_context>(LLAMA_MEMORY_STATUS_NO_UPDATE);
 }
 
 struct ggml_tensor * llama_kv_cache_paged::get_k_tensor(int layer_idx) const {

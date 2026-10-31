@@ -2776,6 +2776,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 
+    llm->build_outputs_f32();
+
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
 
@@ -3063,9 +3065,8 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
             return LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_DFLASH:
-            // drafts for M-RoPE targets carry rope sections and follow the target's temporal dim
             if (const auto & s = model->hparams.rope_sections; s[0] || s[1] || s[2] || s[3]) {
-                return LLAMA_ROPE_TYPE_MROPE;
+                return model->hparams.mrope_interleaved ? LLAMA_ROPE_TYPE_IMROPE : LLAMA_ROPE_TYPE_MROPE;
             }
             // DSV4 DSpark drafters use DeepSeek-V4's normal RoPE; legacy DFlash backbones are NeoX
             return model->hparams.dsv4_hc_mult > 0 ? LLAMA_ROPE_TYPE_NORM : LLAMA_ROPE_TYPE_NEOX;
