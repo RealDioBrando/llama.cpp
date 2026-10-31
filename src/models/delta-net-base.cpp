@@ -469,6 +469,11 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     qkv_mixed = ggml_transpose(ctx0, qkv_mixed);
     cb(qkv_mixed, "qkv_mixed_transposed", il);
 
+    // Recurrent state is F32, so concat inputs must use the same type.
+    if (qkv_mixed->type != conv_states->type) {
+        qkv_mixed = ggml_cast(ctx0, qkv_mixed, conv_states->type);
+    }
+
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);
 
