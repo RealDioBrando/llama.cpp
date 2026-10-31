@@ -41,6 +41,7 @@
 #endif
 #include <stdarg.h>
 
+#include <cstdlib>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -3321,31 +3322,40 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     // graph fingerprint compares addresses, so this was causing re-capture
     // every step (see MATCH-FAIL diagnostics 8/27). The workspace is freed
     // on program exit instead (g_nz_workspaces is static).
-
     // calculate rope cache for fist layer in current device.
     cann_ctx->rope_cache.cached = false;
 
     bool graph_capture_required = false;
 #ifdef USE_ACL_GRAPH
-    bool use_cann_graph = true;
-
-    static bool prefill_use_graph = parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
-    if (!prefill_use_graph) {
-        // Do not use acl_graph for prefill.
-        // Detect prefill vs decode from the token (batch) count of any matmul:
-        // every split carries a matmul whose activation src[1] has ne[1] = m.
-        // Decode has m == 1; prefill has m > 1. This must not rely on finding
-        // an attention op, because GDN-layer splits route the fused delta-net
-        // node to the CPU, so those splits contain no FA/GDN node and would
-        // otherwise be (wrongly) treated as decode and graph-captured.
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            ggml_tensor * node = cgraph->nodes[i];
-            if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr) {
-                use_cann_graph = (node->src[1]->ne[1] == 1);
-                break;
+    // Paged metadata gives a backend-local phase signal: one token per
+    // sequence is decode, while chunked prefill has several tokens per seq.
+    // Keep the matmul fallback for graphs without paged attention.
+    auto graph_is_prefill = [&](const ggml_cgraph * graph) {
+        bool has_paged_attn = false;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            const ggml_tensor * node = graph->nodes[i];
+            if (node->op != GGML_OP_PAGED_ATTN) {
+                continue;
+            }
+            has_paged_attn = true;
+            if (node->src[6] && node->src[9] && node->src[9]->ne[0] > 0) {
+                return node->src[6]->ne[0] > node->src[9]->ne[0];
             }
         }
-    }
+        if (!has_paged_attn) {
+            for (int i = 0; i < graph->n_nodes; i++) {
+                ggml_tensor * node = graph->nodes[i];
+                if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr) {
+                    return node->src[1]->ne[1] > 1;
+                }
+            }
+        }
+        return false;
+    };
+
+    static bool prefill_use_graph_override =
+        parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
+    bool use_cann_graph = !graph_is_prefill(cgraph) || prefill_use_graph_override;
 
     if (!cann_ctx->acl_graph_mode) {
         use_cann_graph = false;
@@ -3354,8 +3364,9 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     if (use_cann_graph && !cann_ctx->piecewise_mode) {
         // LRU cache operations (skip when piecewise mode is on)
         // If no matching graph is found, the graph needs to be recaptured.
-            // Debug switch: force re-capture every step.
-            static const bool no_lru = []() {
+            // Debug switch: force re-capture every step. Read per call so
+            // scoped toggles (paged warmup) take effect.
+            const bool no_lru = []() {
                 const char * e = getenv("GGML_CANN_NO_LRU");
                 return e && e[0] == '1';
             }();
