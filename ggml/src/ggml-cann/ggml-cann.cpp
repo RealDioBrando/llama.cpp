@@ -4360,6 +4360,27 @@ ggml_backend_reg_t ggml_backend_cann_reg() {
 
 ggml_backend_t ggml_backend_cann_init(int32_t device) {
     aclInit(nullptr);
+
+    // aclnnMatmul is deterministic but not strongly consistent by default
+    // on Atlas inference products. CANN 9.1 accepts only the 0/1 mode.
+    static std::once_flag deterministic_once;
+    std::call_once(deterministic_once, []() {
+        static const bool deterministic =
+            parse_bool(get_env_as_lowercase("GGML_CANN_DETERMINISTIC").value_or("off"));
+        if (!deterministic) {
+            return;
+        }
+
+        int64_t before = 0;
+        ACL_CHECK(aclrtGetSysParamOpt(ACL_OPT_DETERMINISTIC, &before));
+        ACL_CHECK(aclrtSetSysParamOpt(ACL_OPT_DETERMINISTIC, 1));
+
+        int64_t after = 0;
+        ACL_CHECK(aclrtGetSysParamOpt(ACL_OPT_DETERMINISTIC, &after));
+        GGML_LOG_INFO("CANN deterministic mode: %lld -> %lld\n",
+                      (long long) before, (long long) after);
+    });
+
     if (device < 0 || device >= ggml_backend_cann_get_device_count()) {
         GGML_LOG_ERROR("%s: error: invalid device %d\n", __func__, device);
         return nullptr;
