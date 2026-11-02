@@ -5129,6 +5129,22 @@ struct test_mul_mat_id : public test_case {
 };
 
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
+struct test_mul_mat_id_down : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "as") == 0) {
+                ggml_set_name(t, "ffn_down_exps.weight");
+                break;
+            }
+        }
+        return out;
+    }
+};
+
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -10071,6 +10087,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F32, 16, 4, true, 64, 8, 64));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F32, 32, 2, true, 64, 4, 64));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F16, 32, 2, true, 64, 4, 64));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F16, 256, 8, true, 512, 1, 2048));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F32, 256, 8, true, 512, 1, 2048));
+    test_cases.emplace_back(new test_mul_mat_id_down(GGML_TYPE_W8A8, GGML_TYPE_F16, 256, 8, false, 2048, 1, 512));
+    test_cases.emplace_back(new test_mul_mat_id_down(GGML_TYPE_W8A8, GGML_TYPE_F32, 256, 8, false, 2048, 1, 512));
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 16,  3,  32,   {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 128, 1,  64,   {1, 1}, {1, 1}));

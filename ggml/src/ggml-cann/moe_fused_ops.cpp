@@ -740,7 +740,8 @@ void run_moe_gmm(ggml_backend_cann_context & ctx, const ggml_tensor * weight,
 bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
                                 const ggml_cgraph * graph, int node_idx,
                                 int * last_fused_node) {
-    static const bool enabled = env_enabled("GGML_CANN_MOE_ROUTER_FUSION", true);
+    // Router fusion is not valid for W8A8 grouped MoE on this CANN build.
+    const bool enabled = env_enabled("GGML_CANN_MOE_ROUTER_FUSION", !graph_has_w8a8_expert(graph));
     static const bool debug =
         env_enabled("GGML_CANN_MOE_FULL_DEBUG", false);
     static int debug_count = 0;

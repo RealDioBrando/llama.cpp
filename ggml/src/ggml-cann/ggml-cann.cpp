@@ -3737,6 +3737,11 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     return true;
 #ifdef ASCEND_310P
                 case GGML_TYPE_W8A8: {
+                    static const bool moe_cpu =
+                        parse_bool(get_env_as_lowercase("GGML_CANN_MOE_CPU").value_or("off"));
+                    if (moe_cpu) {
+                        return false;
+                    }
                     return ggml_cann_w8a8_is_expert(op->src[0]) &&
                            op->src[0]->ne[0] % 32 == 0 &&
                            op->src[0]->ne[1] % 16 == 0 &&
@@ -3830,6 +3835,13 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     return false;
                 }
 #ifdef ASCEND_310P
+                // CANN 310P IMROPE Q is unstable for one-token decode.
+                const int32_t * rope_params = (const int32_t *) op->op_params;
+                const int * sections = rope_params + 11;
+                if (rope_params[2] == GGML_ROPE_TYPE_IMROPE && sections[3] == 0 &&
+                    op->ne[1] > 4 && op->ne[2] == 1) {
+                    return false;
+                }
                 // Partial rope (n_dims < ne[0]) takes the
                 // RotaryPositionEmbedding path in ggml_cann_rope; only
                 // contiguous inputs are supported there.
