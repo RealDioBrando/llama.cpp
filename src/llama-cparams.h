@@ -58,6 +58,7 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool kv_paged;
+    bool paged_priority;     // order paged requests by priority instead of FCFS
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer

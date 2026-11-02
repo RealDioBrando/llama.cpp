@@ -307,7 +307,8 @@ llama_context::llama_context(
     cparams.n_gpu_blocks = params.n_gpu_blocks;
     cparams.n_cpu_blocks = params.n_cpu_blocks;
     cparams.kv_paged_watermark = params.kv_paged_watermark;
-    cparams.act_type       = params.type_act;
+    cparams.act_type           = params.type_act;
+    cparams.paged_priority     = params.paged_priority;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -877,6 +878,10 @@ uint32_t llama_context::n_seq_max() const {
 
 uint32_t llama_context::block_size() const {
     return cparams.block_size;
+}
+
+bool llama_context::paged_priority() const {
+    return cparams.paged_priority;
 }
 
 uint32_t llama_context::n_threads() const {
@@ -3848,6 +3853,7 @@ llama_context_params llama_context_default_params() {
         /*.n_gpu_blocks                =*/ 0,
         /*.n_cpu_blocks                =*/ 0,
         /*.kv_paged_watermark          =*/ 0.05,
+        /*.paged_priority              =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
