@@ -100,9 +100,9 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
 
         std::vector<uint8_t> dataq(ggml_row_size(tensor->type, nels));
         if (tensor->type == GGML_TYPE_W8A8) {
-            GGML_ASSERT(tensor->ne[2] == 1 && tensor->ne[3] == 1);
-            ggml_quantize_chunk(GGML_TYPE_W8A8, data.data(), dataq.data(), 0, tensor->ne[1], tensor->ne[0],
-                                nullptr);
+            GGML_ASSERT(tensor->ne[3] == 1);
+            const int64_t nrows = tensor->ne[1] * tensor->ne[2];
+            ggml_quantize_chunk(GGML_TYPE_W8A8, data.data(), dataq.data(), 0, nrows, tensor->ne[0], nullptr);
             ggml_backend_tensor_set(tensor, dataq.data(), 0, dataq.size());
             return;
         }
@@ -5077,6 +5077,9 @@ struct test_mul_mat_id : public test_case {
     double max_nmse_err(ggml_backend_t backend) override {
         // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) && backend_has_feature(backend, "BLACKWELL_NATIVE_FP4")) {
+            return 2e-2;
+        }
+        if (type_a == GGML_TYPE_W8A8) {
             return 2e-2;
         }
         return max_nmse_err();
@@ -10063,6 +10066,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
 
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F32, 8, 2, true, 32, 4, 32));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F16, 8, 2, true, 32, 4, 32));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F32, 16, 4, true, 64, 8, 64));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F32, 32, 2, true, 64, 4, 64));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_W8A8, GGML_TYPE_F16, 32, 2, true, 64, 4, 64));
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 16,  3,  32,   {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 128, 1,  64,   {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 256, 32, 128,  {1, 1}, {1, 1}));
@@ -10072,6 +10081,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W8A8, GGML_TYPE_F16, 16,  3,  32,  {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W8A8, GGML_TYPE_F16, 128, 1,  64,  {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W8A8, GGML_TYPE_F16, 256, 32, 128, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W8A8, GGML_TYPE_F16, 70000, 1, 32, {1, 1}, {1, 1}));
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {
@@ -11279,7 +11289,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
-    // Dense W8A8 comparison cases: F16 baseline vs W8A8/W8A16 weights.
+    // Dense W8A8 comparison cases: F16 baseline vs W8A8 weights.
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 16,  3,  32,  {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 128, 1,  64,  {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 256, 32, 128, {1, 1}, {1, 1}));

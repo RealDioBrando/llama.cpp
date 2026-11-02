@@ -58,6 +58,17 @@ bool is_down_weight(const ggml_tensor * weight) {
     return name != nullptr && strstr(name, "ffn_down_exps.weight") != nullptr;
 }
 
+bool graph_has_w8a8_expert(const ggml_cgraph * graph) {
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr &&
+                node->src[0]->type == GGML_TYPE_W8A8) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool is_view_like(const ggml_tensor * tensor) {
     return tensor->op == GGML_OP_RESHAPE || tensor->op == GGML_OP_VIEW ||
            tensor->op == GGML_OP_PERMUTE || tensor->op == GGML_OP_TRANSPOSE ||
@@ -870,8 +881,10 @@ bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
                                                         sizeof(float), topk_ne, topk32_nb, 2);
     GGML_CANN_CALL_ACLNN_OP(ctx, Div, acl_w32.get(), acl_sum.get(), acl_norm32.get());
 
-    static const bool full_fusion =
-        env_enabled("GGML_CANN_MOE_FULL_FUSION", true);
+    // Full fusion is numerically invalid for W8A8 expert weights on this CANN
+    // build, so bypass it automatically when grouped MoE A8 is selected.
+    const bool full_fusion =
+        env_enabled("GGML_CANN_MOE_FULL_FUSION", !graph_has_w8a8_expert(graph));
     if (full_fusion &&
             run_moe_full_fused(ctx, graph, node_idx, last, selected, weights,
                                &topk_ids, &norm32, last_fused_node)) {
@@ -897,8 +910,10 @@ bool ggml_cann_moe_gate_up_fused(ggml_backend_cann_context & ctx,
                                  const ggml_cgraph * graph, int node_idx,
                                  int * last_fused_node) {
     static const bool enabled = env_enabled("GGML_CANN_MOE_SWIGLU_FUSION", false);
-    static const bool full_fusion =
-        env_enabled("GGML_CANN_MOE_FULL_FUSION", true);
+    // Full fusion is numerically invalid for W8A8 expert weights on this CANN
+    // build, so bypass it automatically when grouped MoE A8 is selected.
+    const bool full_fusion =
+        env_enabled("GGML_CANN_MOE_FULL_FUSION", !graph_has_w8a8_expert(graph));
     static const bool debug =
         env_enabled("GGML_CANN_MOE_FULL_DEBUG", false);
     static int debug_count = 0;
