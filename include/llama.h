@@ -1665,6 +1665,17 @@ extern "C" {
     //
     // Paged inference
     //
+    // Lifecycle state of a paged request. SWAPPED means the KV blocks live in
+    // the CPU pool after an eviction; the scheduler brings the request back
+    // (swap in) as soon as the GPU pool has room.
+    typedef enum llama_paged_seq_status {
+        LLAMA_PAGED_SEQ_STATUS_UNKNOWN  = 0,
+        LLAMA_PAGED_SEQ_STATUS_WAITING  = 1,
+        LLAMA_PAGED_SEQ_STATUS_RUNNING  = 2,
+        LLAMA_PAGED_SEQ_STATUS_SWAPPED  = 3,
+        LLAMA_PAGED_SEQ_STATUS_FINISHED = 4,
+    } llama_paged_seq_status;
+
     struct llama_paged_seq_state {
         int32_t request_id;
         int32_t n_prompt;
@@ -1674,6 +1685,7 @@ extern "C" {
         int64_t t_arrival_us;
         int64_t t_first_token_us;
         int32_t priority;
+        llama_paged_seq_status status;
     };
 
     typedef void (*llama_paged_on_finish_cb)(int32_t             request_id,

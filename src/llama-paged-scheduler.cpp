@@ -208,6 +208,24 @@ LLAMA_API bool llama_paged_scheduler_get_seq_state(struct llama_paged_scheduler 
     out_state->t_arrival_us     = group->t_arrival_time;
     out_state->t_first_token_us = group->t_first_token_us;
     out_state->priority         = group->priority;
+
+    switch (group->status) {
+        case llama_sequence_group_status::PENDING:
+            out_state->status = LLAMA_PAGED_SEQ_STATUS_UNKNOWN;
+            break;
+        case llama_sequence_group_status::WAITING:
+            out_state->status = LLAMA_PAGED_SEQ_STATUS_WAITING;
+            break;
+        case llama_sequence_group_status::RUNNING:
+            out_state->status = LLAMA_PAGED_SEQ_STATUS_RUNNING;
+            break;
+        case llama_sequence_group_status::SWAPPED:
+            out_state->status = LLAMA_PAGED_SEQ_STATUS_SWAPPED;
+            break;
+        case llama_sequence_group_status::FINISHED:
+            out_state->status = LLAMA_PAGED_SEQ_STATUS_FINISHED;
+            break;
+    }
     return true;
 }
 
