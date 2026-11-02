@@ -193,3 +193,70 @@ def test_dflash_metadata_round_trip(dflash2_config, tmp_path):
     for key, value in expected.items():
         assert reader.fields[key].contents() == value
     assert "dflash.sample_from_anchor" not in reader.fields
+
+
+@pytest.mark.parametrize("model_class", [DFlashModel, DSparkModel])
+@pytest.mark.parametrize("layout", ["interleaved", "contiguous", "legacy", "text"])
+def test_vl_draft_vocab_and_rope_metadata(model_class, layout, monkeypatch, tmp_path):
+    """Preserve draft spatial metadata and resolve the target's nested text vocabulary."""
+    import conversion
+
+    draft, target = tmp_path / "draft", tmp_path / "target"
+    draft.mkdir()
+    target.mkdir()
+    rope = {"rope_theta": 5000000.0}
+    if layout in ("interleaved", "contiguous"):
+        rope.update(mrope_section=[24, 20, 20], mrope_interleaved=layout == "interleaved")
+    config = {
+        "architectures": ["DFlashDraftModel"], "num_hidden_layers": 1,
+        "hidden_size": 256, "intermediate_size": 384, "vocab_size": 32,
+        "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 128,
+        "rms_norm_eps": 1e-6, "max_position_embeddings": 512,
+        "rope_parameters": rope, "dflash_config": {"mask_token_id": 7, "target_layer_ids": [0]},
+    }
+    (draft / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    target_config = {"architectures": ["Qwen3ForCausalLM"]}
+    if layout != "text":
+        target_config = {
+            "architectures": ["Qwen3VLForConditionalGeneration"],
+            "text_config": {"architectures": ["Qwen3ForCausalLM"],
+                            "rope_parameters": {"mrope_section": [24, 20, 20]}},
+        }
+    (target / "config.json").write_text(json.dumps(target_config), encoding="utf-8")
+    seen = []
+    architectures = []
+    get_model_class = conversion.get_model_class
+
+    def resolve_class(architecture):
+        architectures.append(architecture)
+        return get_model_class(architecture)
+
+    def load_vocab(self):
+        seen.append(self.dir_model)
+        self.gguf_writer.add_token_list(["<unk>", "hello", "world"])
+
+    # Keep the real architecture resolver, constructor and GGUF writer.
+    monkeypatch.setattr(conversion, "get_model_class", resolve_class)
+    monkeypatch.setattr(Qwen3Model, "set_vocab", load_vocab)
+    output = tmp_path / "draft.gguf"
+    model = model_class(draft, gguf.LlamaFileType.MOSTLY_F16, output, target_model_dir=target)
+    model.set_vocab()
+    model.set_gguf_parameters()
+    assert architectures == ["Qwen3ForCausalLM"]
+    assert seen == [target] and model.dir_model == draft
+    writer = model.gguf_writer
+    writer.write_header_to_file(path=output)
+    writer.write_kv_data_to_file()
+    writer.close()
+    reader = gguf.GGUFReader(output)
+    assert reader.fields["tokenizer.ggml.tokens"].contents() == ["<unk>", "hello", "world"]
+    sections = reader.get_field("dflash.rope.dimension_sections")
+    interleaved = reader.get_field("dflash.rope.mrope_interleaved")
+    if layout == "text":
+        assert sections is None and interleaved is None
+    elif layout == "legacy":
+        assert sections is not None and sections.contents() == [64, 0, 0, 0]
+        assert interleaved is None
+    else:
+        assert sections is not None and sections.contents() == [24, 20, 20, 0]
+        assert interleaved is not None and interleaved.contents() == (layout == "interleaved")
