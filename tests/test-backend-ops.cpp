@@ -4600,6 +4600,15 @@ struct test_gated_delta_net : public test_case {
         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
     }
 
+    double max_nmse_err(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        // CANN runs a fp16 recurrent kernel (fp32 gating and accumulation) against the fp32 CPU reference
+        if (strcmp(ggml_backend_reg_name(reg), "CANN") == 0) {
+            return 1e-6;
+        }
+        return test_case::max_nmse_err();
+    }
+
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
             int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
@@ -11160,6 +11169,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
 
+    // 16h/D128 production shape (Qwen3.5-2B GDN layers). The harness
+    // l2-normalizes q/k like the production domain. GQA (v_repeat=2) stays on
+    // the CPU reference by the backend head-mapping check.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 128, 1));  // aligned prefill
+    // 142: equal odd heads, non-chunk-aligned length, and multi-sequence.
+    // Keep the existing CPU reference, state comparison and tolerances.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 3, 64, 65, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 63, 128, 2, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 3, 128, 65, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1, 1));    // 16h TG (decode)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64, 1));   // 16h PP-64
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1));  // 16h PP-512
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1024, 1)); // 16h PP-1024
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1)); // 16h PP-2048
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 64, 1, 2)); // GQA 8h->16v PP-64 (CPU)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 129, 1, 2)); // GQA 8h->16v PP-129 (cross-chunk; GQA falls back to the CPU reference by design)
+
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
     // exact-match cases (K == n_seq_tokens):
@@ -11670,6 +11696,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1));  // 4h PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
+    // 16h/D128 production decode shape (Qwen3.5-2B)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1, 1));   // 16h TG
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 64, 1));  // 16h PP-64
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1)); // 16h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
 
     // lightning_indexer
