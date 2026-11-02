@@ -147,37 +147,13 @@ void ggml_cann_mul_mat_id_grouped(ggml_backend_cann_context & ctx, ggml_tensor *
             routing_ids_data, ACL_INT32, sizeof(int32_t), ids_cont_ne, routing_ids_nb, 2);
         GGML_CANN_CALL_ACLNN_OP(ctx, InplaceCopy, acl_ids_dst.get(), acl_ids_src.get());
     }
-    ggml_cann_pool_alloc perm_alloc;
-    acl_tensor_ptr acl_expanded_ids;
-    ggml_cann_pool_alloc expanded_ids_alloc;
     if (is_down) {
-        // Flatten expert-major down input to rows. Expand token-major top-k ids
-        // to the same row order before routing with one expert per row.
-        std::vector<int32_t> perm(n_rows);
-        for (int64_t u = 0; u < n_used; ++u) {
-            for (int64_t t = 0; t < n_token; ++t) {
-                perm[u * n_token + t] = (int32_t) (t * n_used + u);
-            }
-        }
-
-        perm_alloc.alloc(ctx.pool(), n_rows * sizeof(int32_t));
-        expanded_ids_alloc.alloc(ctx.pool(), n_rows * sizeof(int32_t));
-        ACL_CHECK(aclrtMemcpy(perm_alloc.get(), n_rows * sizeof(int32_t), perm.data(),
-                              n_rows * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE));
-
-        int64_t flat_ne[1] = { n_rows };
-        size_t  flat_nb[1] = { sizeof(int32_t) };
-        acl_tensor_ptr acl_ids_flat = ggml_cann_create_tensor(routing_ids_data, ACL_INT32,
-                                                              sizeof(int32_t), flat_ne, flat_nb, 1);
-        acl_tensor_ptr acl_perm = ggml_cann_create_tensor(perm_alloc.get(), ACL_INT32,
-                                                          sizeof(int32_t), flat_ne, flat_nb, 1);
-        acl_tensor_ptr acl_ids_expanded = ggml_cann_create_tensor(expanded_ids_alloc.get(), ACL_INT32,
-                                                                  sizeof(int32_t), flat_ne, flat_nb, 1);
-        GGML_CANN_CALL_ACLNN_OP(ctx, GatherV2, acl_ids_flat.get(), 0, acl_perm.get(),
-                                acl_ids_expanded.get());
+        // The down input and routing IDs are both laid out token-major with
+        // expert as the inner dimension. Preserve that exact row order when
+        // presenting one expert per row to MoeInitRoutingV2.
         int64_t routing_ids_ne[2] = { 1, n_rows };
         size_t  routing_ids_nb[2] = { sizeof(int32_t), sizeof(int32_t) };
-        acl_routing_ids = ggml_cann_create_tensor(expanded_ids_alloc.get(), ACL_INT32,
+        acl_routing_ids = ggml_cann_create_tensor(routing_ids_data, ACL_INT32,
                                                   sizeof(int32_t), routing_ids_ne, routing_ids_nb, 2);
     } else {
         int64_t ids_ne[2] = { n_used, n_token };
