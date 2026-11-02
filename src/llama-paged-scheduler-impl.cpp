@@ -700,7 +700,7 @@ void llama_paged_scheduler_impl::process_swapped_list(llama_sequence_group_raw_l
 }
 
 void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_list & candidates,
-                                                      int32_t &                       row_budget) {
+                                                      int32_t                         row_budget) {
     GGML_ASSERT(kv_cache_manager && "kv_cache_manager is nullptr.");
     if (waiting->empty()) {
         return;
@@ -1096,10 +1096,10 @@ bool llama_paged_scheduler_impl::cancel(int32_t request_id) {
 
     llama_sequence_group_ptr group_ptr = take_from_list(running, request_id);
     if (!group_ptr) {
-        group_ptr = take_from_list(swapped, request_id);
+        group_ptr = waiting->take(request_id);
     }
     if (!group_ptr) {
-        group_ptr = take_from_list(waiting, request_id);
+        group_ptr = swapped->take(request_id);
     }
     if (!group_ptr) {
         return false;

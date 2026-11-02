@@ -65,7 +65,7 @@ class llama_paged_scheduler_impl {
     llama_sequence_group_ptr evict();
     void process_running_list(llama_sequence_group_raw_list & candidates, int32_t & row_budget);
     void process_swapped_list(llama_sequence_group_raw_list & candidates, int32_t & row_budget);
-    void process_waiting_list(llama_sequence_group_raw_list & candidates, int32_t & row_budget);
+    void process_waiting_list(llama_sequence_group_raw_list & candidates, int32_t row_budget);
 
     void swap_out_or_recompute(llama_sequence_group_ptr group_ptr);
 

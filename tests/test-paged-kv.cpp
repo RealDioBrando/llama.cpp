@@ -409,7 +409,8 @@ TEST(test_scheduler_single_request_decode) {
 
     std::vector<llama_token> sampled(1, 42);
     std::vector<int8_t>      stop(1, 0);
-    fixture.sched->update(batch, sampled, stop.data());
+    llama_paged_feedback     fb = { /*request_id=*/0, sampled.data(), (int32_t) sampled.size(), stop[0] };
+    fixture.sched->update(&batch, &fb, 1);
 
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
     EXPECT_EQ(batch.n_tokens, 1);
@@ -434,7 +435,8 @@ TEST(test_scheduler_multi_request_decode) {
 
     std::vector<llama_token> sampled0(1, 42);
     std::vector<int8_t>      stop0(1, 0);
-    fixture.sched->update(batch, sampled0, stop0.data());
+    llama_paged_feedback     fb0 = { /*request_id=*/0, sampled0.data(), (int32_t) sampled0.size(), stop0[0] };
+    fixture.sched->update(&batch, &fb0, 1);
 
     // The scheduler drains prefills one request at a time before decoding.
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
@@ -442,7 +444,8 @@ TEST(test_scheduler_multi_request_decode) {
 
     std::vector<llama_token> sampled1(1, 43);
     std::vector<int8_t>      stop1(1, 0);
-    fixture.sched->update(batch, sampled1, stop1.data());
+    llama_paged_feedback     fb1 = { /*request_id=*/1, sampled1.data(), (int32_t) sampled1.size(), stop1[0] };
+    fixture.sched->update(&batch, &fb1, 1);
 
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
     EXPECT_EQ(batch.n_tokens, 2);
