@@ -966,6 +966,7 @@ struct ggml_backend_cann_context {
 #ifdef USE_ACL_GRAPH
     /// Cached CANN ACL graph used for executing the current ggml computation graph.
     ggml_cann_graph_lru_cache graph_lru_cache;
+    const int *               graph_decode_mode = nullptr; // Borrowed from the owning llama_context.
     bool                      acl_graph_mode = true;
     bool                      piecewise_mode = false;
     bool                      capturing       = false;   /**< true between CaptureBegin/End. */

@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "src/llama-context.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -3671,14 +3672,21 @@ private:
         }
 
         bool has_output = false;
+        bool has_prompt = false;
+        bool has_decode = false;
         for (int i = off; i < off + batch_view.n_tokens; ++i) {
             has_output |= batch.tokens[i].output;
+            has_prompt |= batch.tokens[i].is_prompt;
+            has_decode |= !batch.tokens[i].is_prompt;
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            ctx_tgt->graph_decode_mode = has_prompt
+                ? (has_decode ? GGML_GRAPH_PHASE_MIXED : GGML_GRAPH_PHASE_PREFILL)
+                : GGML_GRAPH_PHASE_DECODE;
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
@@ -3744,6 +3752,12 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
+                struct reset_graph_mode {
+                    int & mode;
+                    ~reset_graph_mode() { mode = GGML_GRAPH_PHASE_UNSPECIFIED; }
+                } reset{ctx_tgt->graph_decode_mode};
+                // decode cleared the phase; expose it only while processing target features.
+                ctx_tgt->graph_decode_mode = has_prompt ? GGML_GRAPH_PHASE_UNSPECIFIED : GGML_GRAPH_PHASE_DECODE;
                 ok = common_speculative_process(spec.get(), batch_view);
             });
 
