@@ -147,7 +147,7 @@ atb::Operation * create_sa_op(int num_heads, int num_kv_heads, int head_dim, flo
     param.qScale               = 1.0f;
     param.qkScale              = scale;
     param.batchRunStatusEnable = false;
-    param.isTriuMask           = 0;
+    param.isTriuMask           = 1;
     param.inputLayout          = atb::infer::TYPE_BSND;
     param.mlaVHeadSize         = 0;
     param.windowSize           = 0;
