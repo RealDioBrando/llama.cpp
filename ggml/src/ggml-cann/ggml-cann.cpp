@@ -1769,17 +1769,13 @@ static void weight_format_to_nz(ggml_tensor * tensor, int device) {
     ggml_cann_weight_format_to_nz(tensor, device);
 }
 
-// Ask CANN for the exact device-side storage size of a 3D INT8 expert tensor.
-// The result can include backend padding, so E*N*K is not a safe substitute.
+// 310P INT8 FRACTAL_NZ stores each expert as [K/32, N/16, 16, 32].
 size_t ggml_cann_w8a8_expert_transformed_size(const ggml_tensor * tensor) {
     GGML_ASSERT(tensor->type == GGML_TYPE_W8A8);
     GGML_ASSERT(tensor->ne[3] == 1);
-    int64_t shape[3] = { tensor->ne[2], tensor->ne[1], tensor->ne[0] };
-    aclIntArray * shape_array = aclCreateIntArray(shape, 3);
-    uint64_t transformed_size = 0;
-    ACL_CHECK(aclnnCalculateMatmulWeightSizeV2(shape_array, ACL_INT8, &transformed_size));
-    ACL_CHECK(aclDestroyIntArray(shape_array));
-    return static_cast<size_t>(transformed_size);
+    const int64_t n_blocks = (tensor->ne[1] + 15) / 16;
+    const int64_t k_blocks = (tensor->ne[0] + 31) / 32;
+    return static_cast<size_t>(tensor->ne[2] * k_blocks * n_blocks * 16 * 32);
 }
 
 static void ggml_backend_cann_w8a8_upload_a8(ggml_tensor * tensor, const void * src,
@@ -1816,26 +1812,6 @@ static void ggml_backend_cann_w8a8_upload_a8(ggml_tensor * tensor, const void * 
             }
         }
 
-        ACL_CHECK(aclrtMemcpy(tensor->data, weights.size(), weights.data(), weights.size(),
-                              ACL_MEMCPY_HOST_TO_DEVICE));
-        ACL_CHECK(aclrtMemcpy((char *) tensor->data + scale_offset, scales.size() * sizeof(float),
-                              scales.data(), scales.size() * sizeof(float), ACL_MEMCPY_HOST_TO_DEVICE));
-        if (scale_offset > weights.size()) {
-            const size_t padding_size = scale_offset - weights.size();
-            ACL_CHECK(aclrtMemset((char *) tensor->data + weights.size(), padding_size, 0, padding_size));
-        }
-        // ND is the stable grouped layout. The NZ layout remains opt-in because
-        // the installed CANN build still has unresolved grouped-matmul issues.
-        const bool transform_expert_weight =
-            parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("off"));
-        if (transform_expert_weight) {
-        int64_t expert_weight_ne[3] = { expert_count, expert_n, expert_k };
-        int64_t expert_weight_nb[3] = { static_cast<int64_t>(expert_n * expert_k),
-                                        static_cast<int64_t>(expert_k), 1 };
-        int64_t expert_weight_storage = expert_count * expert_n * expert_k;
-        acl_tensor_ptr expert_weight(aclCreateTensor(expert_weight_ne, 3, ACL_INT8, expert_weight_nb, 0,
-                                                     ACL_FORMAT_ND, &expert_weight_storage, 1, tensor->data));
-
         if (tensor->extra != nullptr) {
             aclTensor * old = (aclTensor *) tensor->extra;
             ctx->w8a8_tensors.erase(old);
@@ -1843,23 +1819,58 @@ static void ggml_backend_cann_w8a8_upload_a8(ggml_tensor * tensor, const void * 
             tensor->extra = nullptr;
         }
 
-        uint64_t       workspace_size = 0;
-        aclOpExecutor *executor       = nullptr;
-        ACL_CHECK(aclnnTransMatmulWeightGetWorkspaceSize(expert_weight.get(), &workspace_size, &executor));
-        const int32_t device = g_current_cann_device;
-        aclrtStream stream = nullptr;
-        ACL_CHECK(aclrtCreateStream(&stream));
-        {
-            std::lock_guard<std::mutex> lock(g_nz_workspaces[device].mtx);
-            g_nz_workspaces[device].realloc(workspace_size);
-            ACL_CHECK(aclnnTransMatmulWeight(g_nz_workspaces[device].get(), workspace_size, executor, stream));
-        }
-        ACL_CHECK(aclrtSynchronizeStream(stream));
-        ACL_CHECK(aclrtDestroyStream(stream));
+        const bool use_nz =
+            parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("off"));
+        const size_t payload_size = ggml_cann_w8a8_expert_transformed_size(tensor);
+        if (use_nz) {
+            const int64_t n_blocks = (expert_n + 15) / 16;
+            const int64_t k_blocks = (expert_k + 31) / 32;
+            std::vector<int8_t> payload(payload_size, 0);
+            for (int64_t expert = 0; expert < expert_count; ++expert) {
+                for (int64_t kb = 0; kb < k_blocks; ++kb) {
+                    for (int64_t nb = 0; nb < n_blocks; ++nb) {
+                        for (int64_t ni = 0; ni < 16; ++ni) {
+                            const int64_t row = nb * 16 + ni;
+                            if (row >= expert_n) {
+                                continue;
+                            }
+                            for (int64_t ki = 0; ki < 32; ++ki) {
+                                const int64_t column = kb * 32 + ki;
+                                if (column >= expert_k) {
+                                    continue;
+                                }
+                                const size_t src_index = static_cast<size_t>(
+                                    (expert * expert_n + row) * expert_k + column);
+                                const size_t dst_index = static_cast<size_t>(
+                                    ((((expert * k_blocks + kb) * n_blocks + nb) * 16 + ni) * 32 + ki));
+                                payload[dst_index] = weights[src_index];
+                            }
+                        }
+                    }
+                }
+            }
+            ACL_CHECK(aclrtMemcpy(tensor->data, payload.size(), payload.data(), payload.size(),
+                                  ACL_MEMCPY_HOST_TO_DEVICE));
 
-        tensor->extra = expert_weight.release();
-        ctx->w8a8_tensors.insert((aclTensor *) tensor->extra);
+            int64_t logical_ne[3] = { expert_count, expert_n, expert_k };
+            int64_t logical_nb[3] = { expert_n * expert_k, expert_k, 1 };
+            int64_t storage_ne[5] = { expert_count, k_blocks, n_blocks, 16, 32 };
+            acl_tensor_ptr nz_weight(aclCreateTensor(logical_ne, 3, ACL_INT8, logical_nb, 0,
+                                                     ACL_FORMAT_FRACTAL_NZ, storage_ne, 5, tensor->data));
+            tensor->extra = nz_weight.release();
+            ctx->w8a8_tensors.insert((aclTensor *) tensor->extra);
+        } else {
+            ACL_CHECK(aclrtMemcpy(tensor->data, weights.size(), weights.data(), weights.size(),
+                                  ACL_MEMCPY_HOST_TO_DEVICE));
         }
+
+        ACL_CHECK(aclrtMemcpy((char *) tensor->data + scale_offset, scales.size() * sizeof(float),
+                              scales.data(), scales.size() * sizeof(float), ACL_MEMCPY_HOST_TO_DEVICE));
+        if (scale_offset > payload_size) {
+            const size_t padding_size = scale_offset - payload_size;
+            ACL_CHECK(aclrtMemset((char *) tensor->data + payload_size, padding_size, 0, padding_size));
+        }
+
         return;
     }
 
