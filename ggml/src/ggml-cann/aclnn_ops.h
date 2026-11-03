@@ -959,6 +959,7 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
  * Only an explicit absolute custom package in ASCEND_CUSTOM_OPP_PATH is used.
  */
 bool ggml_cann_gdn_available();
+bool ggml_cann_gdn_snapshots_supported(const ggml_tensor * dst);
 
 /**
  * @brief Preload the gated delta net index cache before graph capture.

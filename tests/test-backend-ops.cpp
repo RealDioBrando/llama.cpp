@@ -4633,16 +4633,25 @@ struct test_gated_delta_net : public test_case {
         ggml_set_name(beta,  "beta");
         ggml_set_name(state, "state");
         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
+        if (K > 1) {
+            sentinels.push_back(state); // Initial state is read-only, including continuation tests.
+        }
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
         ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        if (K > n_seq_tokens) {
+            ggml_set_name(out, "gdn_snapshots_guarded");
+        }
         return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
-            if (strcmp(t->name, "g") == 0) {
+            if (strcmp(t->name, "gdn_snapshots_guarded") == 0) {
+                std::vector<float> guard(ggml_nelements(t), 123.25f);
+                ggml_backend_tensor_set(t, guard.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "g") == 0) {
                 init_tensor_uniform(t, -20.0f, -1e-4f);
             } else if (strcmp(t->name, "beta") == 0) {
                 init_tensor_uniform(t, 0.0f, 1.0f);
@@ -8881,6 +8890,21 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    if (std::getenv("GGML_TEST_GDN_SNAPSHOTS")) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1, 1, 1, false, false, 1));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 5, 2, 1, false, false, 5));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 5, 32, 1, false, false, 5));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 65, 1, 1, false, false, 1));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 65, 2, 1, false, false, 5));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 68, 2, 1, false, false, 5));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 69, 2, 1, false, false, 5));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 69, 1, 1, false, false, 5));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 73, 2, 1, false, false, 5));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 1, false, false, 1));
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 2, 1, false, false, 5));
+        return test_cases;
+    }
+
     std::default_random_engine rng(0);
 
     // unary ops

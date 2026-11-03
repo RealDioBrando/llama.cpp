@@ -9,6 +9,7 @@
 
 #include <aclnnop/aclnn_cast.h>
 #include <aclnnop/aclnn_copy.h>
+#include <aclnnop/aclnn_prompt_flash_attention_v3.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -71,8 +72,6 @@ struct atb_paged_state {
     int64_t          sa_kv_heads = -1;
     int64_t          sa_head_dim = -1;
     float            sa_scale    = 0.0f;
-    void *           prefill_mask = nullptr;
-    int64_t          prefill_mask_len = -1;
     aclrtContext     saved_ctx  = nullptr;
     std::mutex       mtx;
 
@@ -90,7 +89,6 @@ struct atb_paged_state {
         if (ws_sa)  aclrtFree(ws_sa);
         if (ws_pa)  aclrtFree(ws_pa);
         if (ws_sf)  aclrtFree(ws_sf);
-        if (prefill_mask) aclrtFree(prefill_mask);
     }
 };
 
@@ -131,32 +129,6 @@ atb::Operation * create_pa_op(int num_heads, int num_kv_heads, int head_dim, boo
     return op;
 }
 
-atb::Operation * create_sa_op(int num_heads, int num_kv_heads, int head_dim, float scale) {
-    atb::infer::SelfAttentionParam param;
-    param.calcType             = atb::infer::SelfAttentionParam::PA_ENCODER;
-    param.kernelType           = atb::infer::SelfAttentionParam::KERNELTYPE_DEFAULT;
-    param.clampType            = atb::infer::SelfAttentionParam::CLAMP_TYPE_UNDEFINED;
-    param.maskType             = atb::infer::SelfAttentionParam::MASK_TYPE_NORM;
-    param.kvcacheCfg           = atb::infer::SelfAttentionParam::K_CACHE_V_CACHE;
-    param.scaleType            = atb::infer::SelfAttentionParam::SCALE_TYPE_TOR;
-    param.quantType            = atb::infer::SelfAttentionParam::TYPE_QUANT_UNDEFINED;
-    param.cacheType            = atb::infer::SelfAttentionParam::CACHE_TYPE_NORM;
-    param.outDataType          = ACL_DT_UNDEFINED;
-    param.headNum              = num_heads;
-    param.kvHeadNum            = num_kv_heads;
-    param.qScale               = 1.0f;
-    param.qkScale              = scale;
-    param.batchRunStatusEnable = false;
-    param.isTriuMask           = 0;
-    param.inputLayout          = atb::infer::TYPE_BSND;
-    param.mlaVHeadSize         = 0;
-    param.windowSize           = 0;
-
-    atb::Operation * op = nullptr;
-    ATB_CHECK(atb::CreateOperation(param, &op));
-    return op;
-}
-
 void setup_op(atb::Operation * op, const atb::VariantPack & vp, void ** ws, uint64_t * ws_sz,
               atb::Context * atb_ctx, aclrtStream stream) {
     uint64_t needed = 0;
@@ -181,45 +153,6 @@ void setup_op(atb::Operation * op, const atb::VariantPack & vp, void ** ws, uint
         ACL_CHECK(ret);
         *ws_sz = needed;
     }
-}
-
-// The full-prompt causal mask only depends on the padded prompt length, so it
-// can be reused by every layer and by later requests with the same length.
-void * get_prefill_causal_mask(int64_t max_len, aclrtStream stream) {
-    GGML_ASSERT(max_len > 0);
-    if (g_atb.prefill_mask && g_atb.prefill_mask_len == max_len) {
-        return g_atb.prefill_mask;
-    }
-
-    if (g_atb.prefill_mask) {
-        aclrtSynchronizeStream(stream);
-        ACL_CHECK(aclrtFree(g_atb.prefill_mask));
-        g_atb.prefill_mask     = nullptr;
-        g_atb.prefill_mask_len = -1;
-    }
-
-    const size_t mask_elems = (size_t) max_len * (size_t) max_len;
-    const size_t mask_bytes = mask_elems * sizeof(uint16_t);
-    void *       mask_dev   = nullptr;
-    ACL_CHECK(aclrtMalloc(&mask_dev, mask_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
-
-    std::vector<uint16_t> mask_host(mask_elems);
-    const float    neg_big = -10000.0f;
-    const ggml_fp16_t neg_fp16 = ggml_fp32_to_fp16(neg_big);
-    uint16_t neg_bits;
-    memcpy(&neg_bits, &neg_fp16, sizeof(neg_bits));
-    mask_host.assign(mask_elems, neg_bits);
-    for (int64_t row = 0; row < max_len; ++row) {
-        for (int64_t col = 0; col <= row; ++col) {
-            mask_host[(size_t) row * max_len + col] = 0;
-        }
-    }
-
-    ACL_CHECK(aclrtMemcpyAsync(mask_dev, mask_bytes, mask_host.data(), mask_bytes,
-                               ACL_MEMCPY_HOST_TO_DEVICE, stream));
-    g_atb.prefill_mask     = mask_dev;
-    g_atb.prefill_mask_len = max_len;
-    return mask_dev;
 }
 
 // Pool wrap: ggml K/V pool [num_blocks, n_heads_kv, block_size, head_dim] f16
@@ -263,107 +196,113 @@ void cast_back_to_dst(ggml_backend_cann_context & ctx, const void * src_buf, ggm
     GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_src.get(), ACL_FLOAT, acl_dst.get());
 }
 
+// ggml-order ne [D, heads, seq, B] -> ACL (B, seq, heads, D) contiguous BSND
+// descriptor (same convention as ggml_cann_flash_attn_ext_310p).
+static void pfa_bsnd(int64_t * ne, size_t * nb, int64_t d, int64_t h, int64_t s, int64_t b, size_t es) {
+    ne[0] = d; ne[1] = h; ne[2] = s; ne[3] = b;
+    nb[0] = es;
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        nb[i] = nb[i - 1] * ne[i - 1];
+    }
+}
+
+// One PromptFlashAttentionV3 prefill call for a single sequence whose q/k/v
+// live as row slabs of the packed [T, heads, dim] f16 buffers at token offset
+// tok_off (len rows). Mirrors the verified n_seqs==1 PFA contract: pad T to a
+// 16-aligned K, bool K*K causal attenMask, actualSeqLengths={K}.
+static void pfa_prefill_packed(ggml_backend_cann_context & ctx, const void * q_tnd, const void * k_tnd,
+                               const void * v_tnd, void * out_tnd, int64_t len, int64_t tok_off, int64_t n_heads,
+                               int64_t n_heads_kv, int64_t head_dim, float scale, aclrtStream stream) {
+    const int64_t q_size  = n_heads * head_dim;
+    const int64_t kv_size = n_heads_kv * head_dim;
+    const int64_t K       = ((len + 15) / 16) * 16;
+    const size_t  q_bytes  = (size_t) len * q_size * sizeof(uint16_t);
+    const size_t  kv_bytes = (size_t) len * kv_size * sizeof(uint16_t);
+
+    ggml_cann_pool_alloc q_alloc(ctx.pool(), (size_t) K * q_size * sizeof(uint16_t));
+    ggml_cann_pool_alloc k_alloc(ctx.pool(), (size_t) K * kv_size * sizeof(uint16_t));
+    ggml_cann_pool_alloc v_alloc(ctx.pool(), (size_t) K * kv_size * sizeof(uint16_t));
+    ggml_cann_pool_alloc o_alloc(ctx.pool(), (size_t) K * q_size * sizeof(uint16_t));
+    void * q_pad = q_alloc.get();
+    void * k_pad = k_alloc.get();
+    void * v_pad = v_alloc.get();
+    void * o_pad = o_alloc.get();
+    ACL_CHECK(aclrtMemsetAsync(q_pad, (size_t) K * q_size * 2, 0, (size_t) K * q_size * 2, stream));
+    ACL_CHECK(aclrtMemsetAsync(k_pad, (size_t) K * kv_size * 2, 0, (size_t) K * kv_size * 2, stream));
+    ACL_CHECK(aclrtMemsetAsync(v_pad, (size_t) K * kv_size * 2, 0, (size_t) K * kv_size * 2, stream));
+    ACL_CHECK(aclrtMemcpyAsync(q_pad, q_bytes, (const char *) q_tnd + tok_off * q_size * 2, q_bytes,
+                               ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
+    ACL_CHECK(aclrtMemcpyAsync(k_pad, kv_bytes, (const char *) k_tnd + tok_off * kv_size * 2, kv_bytes,
+                               ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
+    ACL_CHECK(aclrtMemcpyAsync(v_pad, kv_bytes, (const char *) v_tnd + tok_off * kv_size * 2, kv_bytes,
+                               ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
+
+    // bool causal attenMask (1,1,K,K): row r keeps cols 0..r, masks the rest
+    // (this also masks the zero-pad key columns len..K-1 for the real rows;
+    // the pad query rows are discarded after the slice-back).
+    const size_t mask_bytes = (size_t) K * K;
+    ggml_cann_pool_alloc mask_alloc(ctx.pool(), mask_bytes);
+    std::vector<uint8_t> mask_host(mask_bytes, 0);
+    for (int64_t r = 0; r < len; ++r) {
+        uint8_t * row = mask_host.data() + (size_t) r * K;
+        for (int64_t j = r + 1; j < K; ++j) {
+            row[j] = 1;
+        }
+    }
+    ACL_CHECK(aclrtMemcpyAsync(mask_alloc.get(), mask_bytes, mask_host.data(), mask_bytes,
+                               ACL_MEMCPY_HOST_TO_DEVICE, stream));
+
+    int64_t ne[GGML_MAX_DIMS];
+    size_t  nb[GGML_MAX_DIMS];
+    pfa_bsnd(ne, nb, head_dim, n_heads, K, 1, sizeof(uint16_t));
+    acl_tensor_ptr acl_q = ggml_cann_create_tensor(q_pad, ACL_FLOAT16, sizeof(uint16_t), ne, nb, GGML_MAX_DIMS);
+    pfa_bsnd(ne, nb, head_dim, n_heads_kv, K, 1, sizeof(uint16_t));
+    acl_tensor_ptr acl_k = ggml_cann_create_tensor(k_pad, ACL_FLOAT16, sizeof(uint16_t), ne, nb, GGML_MAX_DIMS);
+    acl_tensor_ptr acl_v = ggml_cann_create_tensor(v_pad, ACL_FLOAT16, sizeof(uint16_t), ne, nb, GGML_MAX_DIMS);
+    pfa_bsnd(ne, nb, K, K, 1, 1, 1);
+    acl_tensor_ptr acl_mask =
+        ggml_cann_create_tensor(mask_alloc.get(), ACL_BOOL, (size_t) 1, ne, nb, GGML_MAX_DIMS);
+    pfa_bsnd(ne, nb, head_dim, n_heads, K, 1, sizeof(uint16_t));
+    acl_tensor_ptr acl_out = ggml_cann_create_tensor(o_pad, ACL_FLOAT16, sizeof(uint16_t), ne, nb, GGML_MAX_DIMS);
+
+    int64_t            act = K;
+    acl_int_array_ptr  act_seq_lens = ggml_cann_create_int_array(&act, 1);
+    char               layout[]     = "BSND";
+
+    GGML_CANN_CALL_ACLNN_OP(ctx, PromptFlashAttentionV3, acl_q.get(), acl_k.get(), acl_v.get(),
+                            nullptr,                            // pseShift (unsupported on 310P)
+                            acl_mask.get(),                     // attenMask
+                            act_seq_lens.get(),                 // actualSeqLengths
+                            nullptr,                            // actualSeqLengthsKv
+                            nullptr, nullptr, nullptr, nullptr, nullptr,  // quant scales
+                            n_heads, (double) scale,
+                            (int64_t) 2147483647, (int64_t) 2147483647,  // preTokens, nextTokens
+                            layout, n_heads_kv,
+                            (int64_t) 0,                        // sparseMode
+                            (int64_t) 1,                        // innerPrecise
+                            acl_out.get());
+
+    ACL_CHECK(aclrtMemcpyAsync((char *) out_tnd + tok_off * q_size * 2, q_bytes, o_pad, q_bytes,
+                               ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
+}
+
 // ATB SelfAttention for uncached prompt chunks. Q/K/V are packed [T,N,D] and
 // 310P PA_ENCODER requires the packed token count to be 16-aligned.
 void self_attention_prefill(ggml_backend_cann_context & ctx, void * q_f16, void * k_f16, void * v_f16,
                             void * out_f16, const std::vector<int32_t> & lengths,
                             const std::vector<int32_t> & offsets, int64_t n_heads, int64_t n_heads_kv,
                             int64_t head_dim, float scale, aclrtStream stream) {
-    const int64_t q_size  = n_heads * head_dim;
-    const int64_t kv_size = n_heads_kv * head_dim;
-    const int64_t n_seq   = (int64_t) lengths.size();
-    GGML_ASSERT(n_seq > 0);
-
-    int64_t total = 0;
-    int64_t max_len = 0;
-    std::vector<int32_t> op_lengths(lengths);
-    for (int64_t len : op_lengths) {
-        total += len;
-        max_len = std::max(max_len, (int64_t) len);
-    }
-    const int64_t aligned = ((total + 15) / 16) * 16;
-    if (aligned != total) {
-        op_lengths.back() += (int32_t) (aligned - total);
-        max_len = std::max(max_len, (int64_t) op_lengths.back());
-    }
-
-    std::vector<int32_t> op_offsets(n_seq);
-    int32_t cursor = 0;
-    for (int64_t s = 0; s < n_seq; ++s) {
-        op_offsets[s] = cursor;
-        cursor += op_lengths[s];
-    }
-
-    void * q_attn = q_f16;
-    void * k_attn = k_f16;
-    void * v_attn = v_f16;
-    void * o_attn = out_f16;
-    ggml_cann_pool_alloc q_alloc(ctx.pool(), aligned * q_size * sizeof(uint16_t));
-    ggml_cann_pool_alloc k_alloc(ctx.pool(), aligned * kv_size * sizeof(uint16_t));
-    ggml_cann_pool_alloc v_alloc(ctx.pool(), aligned * kv_size * sizeof(uint16_t));
-    ggml_cann_pool_alloc o_alloc(ctx.pool(), aligned * q_size * sizeof(uint16_t));
-    const size_t q_pad_bytes  = aligned * q_size * sizeof(uint16_t);
-    const size_t kv_pad_bytes = aligned * kv_size * sizeof(uint16_t);
-    if (aligned != total) {
-        q_attn = q_alloc.get();
-        k_attn = k_alloc.get();
-        v_attn = v_alloc.get();
-        o_attn = o_alloc.get();
-        ACL_CHECK(aclrtMemsetAsync(q_attn, q_pad_bytes, 0, q_pad_bytes, stream));
-        ACL_CHECK(aclrtMemsetAsync(k_attn, kv_pad_bytes, 0, kv_pad_bytes, stream));
-        ACL_CHECK(aclrtMemsetAsync(v_attn, kv_pad_bytes, 0, kv_pad_bytes, stream));
-        for (int64_t s = 0; s < n_seq; ++s) {
-            const size_t q_bytes  = lengths[s] * q_size * sizeof(uint16_t);
-            const size_t kv_bytes = lengths[s] * kv_size * sizeof(uint16_t);
-            ACL_CHECK(aclrtMemcpyAsync((char *) q_attn + op_offsets[s] * q_size * sizeof(uint16_t), q_bytes,
-                                       (char *) q_f16 + offsets[s] * q_size * sizeof(uint16_t), q_bytes,
-                                       ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
-            ACL_CHECK(aclrtMemcpyAsync((char *) k_attn + op_offsets[s] * kv_size * sizeof(uint16_t), kv_bytes,
-                                       (char *) k_f16 + offsets[s] * kv_size * sizeof(uint16_t), kv_bytes,
-                                       ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
-            ACL_CHECK(aclrtMemcpyAsync((char *) v_attn + op_offsets[s] * kv_size * sizeof(uint16_t), kv_bytes,
-                                       (char *) v_f16 + offsets[s] * kv_size * sizeof(uint16_t), kv_bytes,
-                                       ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
-        }
-    }
-
-    void * mask_dev = get_prefill_causal_mask(max_len, stream);
-
-    bool sa_valid = g_atb.sa && g_atb.sa_heads == n_heads && g_atb.sa_kv_heads == n_heads_kv &&
-                    g_atb.sa_head_dim == head_dim && g_atb.sa_scale == scale;
-    if (!sa_valid) {
-        if (g_atb.sa) {
-            atb::DestroyOperation((atb::Operation *) g_atb.sa);
-            g_atb.sa = nullptr;
-        }
-        g_atb.sa = create_sa_op((int) n_heads, (int) n_heads_kv, (int) head_dim, scale);
-        g_atb.sa_heads    = n_heads;
-        g_atb.sa_kv_heads = n_heads_kv;
-        g_atb.sa_head_dim = head_dim;
-        g_atb.sa_scale    = scale;
-    }
-
-    atb::Tensor q_t  = atb_tensor_maker::make(q_attn, {aligned, n_heads, head_dim}, ACL_FLOAT16);
-    atb::Tensor k_t  = atb_tensor_maker::make(k_attn, {aligned, n_heads_kv, head_dim}, ACL_FLOAT16);
-    atb::Tensor v_t  = atb_tensor_maker::make(v_attn, {aligned, n_heads_kv, head_dim}, ACL_FLOAT16);
-    atb::Tensor mk_t = atb_tensor_maker::make(mask_dev, {1, max_len, max_len}, ACL_FLOAT16);
-    atb::Tensor sl_t = atb_tensor_maker::make(nullptr, {n_seq}, ACL_INT32, ACL_FORMAT_ND, op_lengths.data());
-    atb::Tensor o_t  = atb_tensor_maker::make(o_attn, {aligned, n_heads, head_dim}, ACL_FLOAT16);
-
-    atb::VariantPack vp;
-    vp.inTensors  = { q_t, k_t, v_t, mk_t, sl_t };
-    vp.outTensors = { o_t };
-    setup_op(g_atb.sa, vp, &g_atb.ws_sa, &g_atb.ws_sa_sz, (atb::Context *) g_atb.ctx, stream);
-    ATB_CHECK(((atb::Operation *) g_atb.sa)->Execute(vp, (uint8_t *) g_atb.ws_sa, g_atb.ws_sa_sz,
-                                                     (atb::Context *) g_atb.ctx));
-
-    if (aligned != total) {
-        for (int64_t s = 0; s < n_seq; ++s) {
-            const size_t out_bytes = lengths[s] * q_size * sizeof(uint16_t);
-            ACL_CHECK(aclrtMemcpyAsync((char *) out_f16 + offsets[s] * q_size * sizeof(uint16_t), out_bytes,
-                                       (char *) o_attn + op_offsets[s] * q_size * sizeof(uint16_t), out_bytes,
-                                       ACL_MEMCPY_DEVICE_TO_DEVICE, stream));
-        }
+    // FIX (multi-seq prefill pollution): the previous fused PA_ENCODER call
+    // (one packed TND batch + per-seq seq_lens + a shared max_len causal
+    // mask) mis-handles sequence boundaries on 310P with n_seqs >= 2 —
+    // attention bleeds across sequences and poisons every downstream state
+    // (llama-server multi-slot GSM8K collapse, llama-parallel N=2 repro).
+    // Issue one PromptFlashAttentionV3 call per sequence instead: that is the
+    // exact contract verified by the n_seqs==1 runs. The extra kernel
+    // launches are prefill-only and negligible against prefill compute.
+    for (size_t s = 0; s < lengths.size(); ++s) {
+        pfa_prefill_packed(ctx, q_f16, k_f16, v_f16, out_f16, lengths[s], offsets[s], n_heads, n_heads_kv,
+                           head_dim, scale, stream);
     }
 }
 
@@ -728,7 +667,6 @@ void ggml_cann_paged_attn_cleanup(ggml_backend_cann_context & cann_ctx) {
     if (g_atb.ws_sa)  ACL_CHECK(aclrtFree(g_atb.ws_sa));
     if (g_atb.ws_pa)  ACL_CHECK(aclrtFree(g_atb.ws_pa));
     if (g_atb.ws_sf)  ACL_CHECK(aclrtFree(g_atb.ws_sf));
-    if (g_atb.prefill_mask) ACL_CHECK(aclrtFree(g_atb.prefill_mask));
 
     g_atb.ctx       = nullptr;
     g_atb.rac       = nullptr;
@@ -748,8 +686,6 @@ void ggml_cann_paged_attn_cleanup(ggml_backend_cann_context & cann_ctx) {
     g_atb.sa_kv_heads = -1;
     g_atb.sa_head_dim = -1;
     g_atb.sa_scale    = 0.0f;
-    g_atb.prefill_mask = nullptr;
-    g_atb.prefill_mask_len = -1;
     g_atb.saved_ctx = nullptr;
 }
 
