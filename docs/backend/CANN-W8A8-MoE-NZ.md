@@ -78,5 +78,22 @@ Fixed 8192-byte sample, context 512, three chunks:
 | ND | 1.0317 +/- 0.00844 |
 | NZ | 1.0317 +/- 0.00844 |
 
+AISBench GSM8K, first 20 cases, temperature 0, thinking disabled:
+
+| Output cap | ND | NZ |
+|---|---:|---:|
+| 512 tokens | 19/20 | 18/20 |
+| Cases 8-12 rerun at 768 tokens | 4/5 | 4/5 |
+
+At 512 tokens, NZ case 8 stopped at the output limit before emitting an answer.
+Case 12 failed on both paths with the same incorrect answer (`12` instead of
+`13`). The 768-token rerun completed case 8 correctly on both paths, making the
+effective result 19/20 for both paths with a sufficient output budget.
+
+The model used for these runs has 256 routed experts, top-8 routing, hidden
+size 2048, and MoE intermediate size 512. The microbenchmark cases use a second
+shape with 128 experts, top-8 routing, hidden size 2048, and MoE intermediate
+size 768.
+
 The one-time NZ conversion added about 19 seconds to model load in this test
 (`27.59s` to tokenization for ND versus `46.94s` for NZ).
