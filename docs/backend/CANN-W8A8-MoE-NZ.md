@@ -61,13 +61,13 @@ Backend microbenchmark, Qwen3-30B-A3B-sized routed projections:
 | gate/up, 32 tokens | 8507.30 | 1210.75 | 7.03x |
 | down, 32 tokens | 6718.73 | 1606.79 | 4.18x |
 
-Real model, Qwen3.5-35B-A3B W8A8, `llama-bench`, two 310P devices,
-`-sm layer -ts 0.55,0.45`:
+Real model, Qwen3.5-35B-A3B W8A8, `llama-bench`, CANN1/CANN4,
+`-sm layer -ts 0.60,0.40`:
 
 | Metric | ND | NZ | Speedup |
 |---|---:|---:|---:|
-| pp512 tok/s | 199.64 | 340.60 | 1.71x |
-| tg128 tok/s | 4.57 | 8.80 | 1.93x |
+| pp512 tok/s | 192.98 | 335.66 | 1.74x |
+| tg128 tok/s | 4.53 | 9.04 | 2.00x |
 
 ## Accuracy
 
