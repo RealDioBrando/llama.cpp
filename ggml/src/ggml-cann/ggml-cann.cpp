@@ -3472,6 +3472,21 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
         use_cann_graph = false;
     }
 
+    if (use_cann_graph) {
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_MUL_MAT_ID &&
+                ggml_cann_mul_mat_id_grouped_uses_compact_groups(node)) {
+                static std::once_flag compact_moe_fallback_once;
+                std::call_once(compact_moe_fallback_once, []() {
+                    GGML_LOG_INFO("CANN graph: eager fallback for compact grouped W8A8\n");
+                });
+                use_cann_graph = false;
+                break;
+            }
+        }
+    }
+
     if (use_cann_graph && !cann_ctx->piecewise_mode) {
         // LRU cache operations (skip when piecewise mode is on)
         // If no matching graph is found, the graph needs to be recaptured.
