@@ -355,9 +355,11 @@ Phase-1 restrictions:
   request ends when its context is full.
 - Supported: `/completion`, `/v1/completions` and `/v1/chat/completions` (including tool
   calls and grammar), speculative decoding (`--spec-*`; the draft context always runs on
-  classic memory), and `n` / `n_cmpl > 1` parallel sampling. Multimodal inputs, infill,
-  embeddings, reranking, synthetic speculative acceptance, LoRA adapters, `--cache-ram` and
-  the `/slots` save/restore endpoints return an error or are rejected at startup.
+  classic memory), `n` / `n_cmpl > 1` parallel sampling, and multimodal inputs (media
+  segments are prefilled in order and encoded on demand when the scheduler pauses on
+  them). Infill, embeddings, reranking, synthetic speculative acceptance, LoRA adapters,
+  `--cache-ram` and the `/slots` save/restore endpoints return an error or are rejected
+  at startup.
 - Explicit `id_slot` requests are not supported.
 - SWA architectures (gemma3, llama4, etc.) are not yet supported; hybrid recurrent models
   (Qwen3.5) reserve a few sequence ids internally, reducing the effective slot count.

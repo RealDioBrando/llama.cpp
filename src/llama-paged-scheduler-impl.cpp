@@ -120,7 +120,7 @@ llama_scheduler_status llama_paged_scheduler_impl::step(llama_batch & batch) {
         candidates.push_back(best_prefill);
     }
 
-    // multimodal (12.4): an embd step (a media segment's rows fed as
+    // multimodal (9.4): an embd step (a media segment's rows fed as
     // batch.embd) runs exclusively - text and embd rows cannot share a batch
     auto media_it = std::find_if(candidates.begin(), candidates.end(), [](const llama_sequence_group * group) {
         if (!group) {
@@ -585,7 +585,7 @@ void llama_paged_scheduler_impl::process_running_list(llama_sequence_group_raw_l
             continue;
         }
 
-        // multimodal (12.4): a group waiting for the server to append a media
+        // multimodal (9.4): a group waiting for the server to append a media
         // segment's encoder output pauses here; excluded from candidates and
         // from the capacity accounting until append_segment resumes it
         if (group->paused_external || group->pending_media_at(group->n_past)) {
@@ -810,7 +810,7 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
 
     // Calculating required sizes. a group whose head segment is a media
     // segment contributes its remaining media rows as a pure-embd slice
-    // (12.4: text and embd rows cannot share a batch)
+    // (9.4: text and embd rows cannot share a batch)
     for (const auto & group : candidates) {
         GGML_ASSERT(group && "candidate request is nullptr.");
         const bool     is_prefill   = group->n_decoded == 0 && group->n_prompt > 0;
@@ -822,7 +822,7 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
             rows = std::min<int32_t>((int32_t)(seg->start_row + seg->n_tokens - group->n_past), n_batch);
         } else if (is_prefill) {
             rows = std::min<int32_t>((int32_t)(group->n_prompt_total - group->n_past), n_batch);
-            // text rows stop at the next media segment boundary (12.4)
+            // text rows stop at the next media segment boundary (9.4)
             if (seg && !seg->is_media) {
                 rows = std::min<int32_t>(rows, (int32_t)(seg->start_row + seg->n_tokens - group->n_past));
             }
@@ -882,7 +882,7 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
             new_tokens = std::min<int32_t>((int32_t)(seg->start_row + seg->n_tokens - group->n_past), n_batch);
         } else if (is_prefill) {
             new_tokens = std::min<int32_t>((int32_t)(group->n_prompt_total - group->n_past), n_batch);
-            // text rows stop at the next media segment boundary (12.4)
+            // text rows stop at the next media segment boundary (9.4)
             if (seg && !seg->is_media) {
                 new_tokens = std::min<int32_t>(new_tokens,
                         (int32_t)(seg->start_row + seg->n_tokens - group->n_past));
@@ -893,7 +893,7 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
 
         if (media_step) {
             // pure-embd slice: rows come from the server-owned encoder
-            // output; no token ids (12.4). null out the token array so the
+            // output; no token ids (9.4). null out the token array so the
             // batch allocr validation skips the placeholder ids (-1); the
             // init-allocated buffer is freed in clear_batch
             GGML_ASSERT(seg->embd != nullptr && "media step without encoder output");

@@ -101,7 +101,7 @@ class llama_paged_scheduler_impl {
     const uint32_t         n_seq_max_ctx;
     const uint32_t         block_size;
     const int32_t          n_batch;
-    const int32_t          n_pos_per_embd;  // 1, or 4 for mrope models (12.4)
+    const int32_t          n_pos_per_embd;  // 1, or 4 for mrope models (9.4)
     llama_kv_cache_paged * kv_cache_manager = nullptr;
     llama_memory_hybrid_paged * hybrid_memory_manager = nullptr;
     llama_paged_batch_info curr_info = {};

@@ -1,72 +1,62 @@
 # Paged Scheduler 对接 llama-server 集成设计
 
-状态:第一阶段与第二阶段已实现;310P 功能验收已完成,见第 11 节
+状态:第一阶段与第二阶段已实现,含多模态(9.4);310P 功能验收已完成,见 9.6;
 
-日期:2026-10-25
+日期:2026-10-25(最近刷新:2026-11-03,对齐优先级队列适配与多模态增量)
 
 ## 1. 背景与目标
 
-本仓库已在 llama 层实现完整的 paged KV cache 与 vLLM 风格连续批处理调度器
-(`llama_paged_scheduler_*`,见 `src/llama-paged-scheduler-impl.cpp`),并配有两个块级前缀缓存
-与 hybrid GDN checkpoint 的设计文档(`CANN-Hybrid-PagedAttention-Design.md`,
-`CANN-Hybrid-PagedAttention-PrefixCache-Design.md`)。目前该调度器仅被
-`examples/paged/paged.cpp` 与 `tests/test-paged-kv*.cpp` 使用,llama-server 仍走默认的
-静态 slot 调度(`get_available_slot` + `pre_decode/decode/post_decode`)。
+本仓库已在 llama 层实现完整的 paged KV cache 与 vLLM 风格连续批处理调度器(`llama_paged_scheduler_*`,见 `src/llama-paged-scheduler-impl.cpp`),并配有两个块级前缀缓存与 hybrid GDN checkpoint 的设计文档(`CANN-Hybrid-PagedAttention-Design.md`, `CANN-Hybrid-PagedAttention-PrefixCache-Design.md`)。
 
-本文档调研两侧现状,给出 paged_scheduler 对接 server 的集成方案:
+本文给出 paged_scheduler 对接 server 的集成方案:
 
 - 侵入式修改尽量少:通过策略接口 + 工厂把调度器做成可插拔组件,默认路径行为不变;
 - 做合理的抽象:接口边界与 server 现有解耦点(queue 回调、server_slot)对齐;
-- 第一阶段只提供采样的基础功能,工具调用、投机推理、结构化输出、多模态、
-  embedding、reranker 等拓展功能留到第二阶段设计。
+- 第一阶段只提供采样的基础功能; 第二阶段提供工具调用、投机推理、结构化输出、多模态等拓展功能; 遗留embedding、reranker 等拓展功能未设计。
 
 ## 2. 现状盘点
 
 ### 2.1 paged 调度器(llama 层)
 
-公共 C API(`include/llama.h:1660-1713`):
+公共 C API(`include/llama.h:1669-1836`):
 
 | API | 作用 |
 |---|---|
-| `llama_paged_scheduler_init(ctx)` | 从 ctx 取出 paged KV 内存,初始化调度器;非 paged ctx 返回 nullptr |
+| `llama_paged_scheduler_init(ctx)` | 从 ctx 取出 paged KV 内存,初始化调度器;非 paged ctx 返回 nullptr。模式由 `llama_context_params.paged_priority`(`--enable-priority`)在此时固定:FCFS 或按请求优先级 |
 | `llama_paged_scheduler_warmup(sched, ctx)` | 一次小批 + 一次图尺寸的合成 prefill/decode,预热后端与 ATB 内核 |
-| `llama_paged_scheduler_add_request(sched, tokens, n, request_id)` | 入队一个请求;request_id 即 llama seq_id |
+| `llama_paged_scheduler_add_request(sched, tokens, n, request_id, priority)` | 入队一个请求;request_id 即 llama seq_id。priority 数小者先服务(默认 0),仅在 paged_priority 模式生效,钳制到 `[-LLAMA_PAGED_PRIORITY_LIMIT, LLAMA_PAGED_PRIORITY_LIMIT]` |
+| `llama_paged_scheduler_add_request_segs(sched, segs, n_segs, request_id)` | 多模态分段入队(9.4):文本段带 token id,媒体段可 `embd = NULL` 只声明行数 |
+| `llama_paged_scheduler_append_segment(sched, request_id, seg)` | 补供媒体段的编码输出,请求从暂停态恢复 |
 | `llama_paged_scheduler_prepare_batch(sched, batch)` | 产出一个 `llama_batch`(调度器持有并复用);false 表示死锁/活锁,服务端对这类失败不做任何重试或自愈,直接把受影响的请求按错误路径收尾,而不是像默认调度路径那样尝试恢复 |
 | `llama_paged_scheduler_update(sched, batch, feedback, n_feedback)` | decode 后回填:每 seq 一条 `llama_paged_feedback`(request_id/tokens/n_tokens/stop),批内推进加批外记账 |
-| `llama_paged_scheduler_get_seq_state(sched, id, out)` | 查询 `n_prompt/n_prompt_total/n_decoded/n_past/t_arrival_us/t_first_token_us` |
+| `llama_paged_scheduler_fork_request(sched, src_id, dst_id)` | `n_cmpl > 1`:满块引用共享 + 尾块急拷贝 fork 已预填的请求(9.2) |
+| `llama_paged_scheduler_attach_draft(sched, id, draft, n_draft)` | 投机推理:下一步扩为 1 + n_draft 行(9.3) |
+| `llama_paged_scheduler_truncate(sched, id, n_past_new)` | 投机部分接受时位置级回滚(9.3) |
+| `llama_paged_scheduler_get_seq_state(sched, id, out)` | 查询 `n_prompt/n_prompt_total/n_decoded/n_past/paused/priority/t_arrival_us/t_first_token_us/status` |
 | `llama_paged_scheduler_get_batch_info(sched)` | 当前批的路由元数据(`n_seq/batch_offsets/batch_lens/...`),下次 prepare 前有效 |
 | `llama_paged_scheduler_set_on_finish(sched, cb, ud)` | 请求被回收时回调(主线程,prepare_batch 内部触发) |
+| `llama_paged_scheduler_cancel(sched, request_id)` | 取消排队/在途请求:waiting/running/swapped 一律同步回收并触发 on_finish |
+| `llama_paged_scheduler_max_request_id(sched)` | 可用 request_id 上限(hybrid 保留段感知) |
 
-调用契约(以 `examples/paged/paged.cpp` 为准;`update` 签名已按第 12.0 节改为 feedback 数组):
+调用契约(以 `examples/paged/paged.cpp` 为准;`update` 的反馈契约见 9.0,为 feedback 数组形式):
 
-- 调用方自己采样,调度器不做任何采样;每 seq 一条 `llama_paged_feedback`,批内 seq 先按批行数
-  推进 `n_past`,再以 feedback 的 token 列表为准推进,条目 token 数少于批行数即为隐式回滚,
-  批外条目仅做 token 记账(fork 子请求);
-- 仅在 decode 步(`batch_lens[i] == 1`)或 prefill 末块
-  (`batch_lens[i] > 1 && state.n_past + batch_lens[i] == n_prompt_total`)产生 logits
-  并采样,采样下标为 `batch_offsets[i] + batch_lens[i] - 1`;
-- feedback 的 `stop` 字段非 0 或 `n_past >= n_ctx` 时请求标记 FINISHED,下一次
-  `prepare_batch` 的 `step()` 内回收并触发 `on_finish`;
-- prefill 独占步:任一候选处于 prefill 时整批只保留该请求
-  (`llama-paged-scheduler-impl.cpp:90-107`),prefill 与 decode 不混批;
-- 内部三级队列 running/swapped/waiting:KV 块不足时先驱逐缓存块,再抢占最新运行请求
-  (换出到 CPU 块池,CPU 池满则释放重算);块级前缀缓存(链式哈希 + 块共享,
-  hybrid 模型另配 GDN checkpoint 槽)在入队时自动命中。
+- 调用方自己采样,调度器不做任何采样;每 seq 一条 `llama_paged_feedback`,批内 seq 先按批行数推进 `n_past`,再以 feedback 的 token 列表为准推进,条目 token 数少于批行数即为隐式回滚,批外条目仅做 token 记账(fork 子请求);
+- 仅在 decode 步(`batch_lens[i] == 1`)或 prefill 末块(`batch_lens[i] > 1 && state.n_past + batch_lens[i] == n_prompt_total`)产生 logits并采样,采样下标为 `batch_offsets[i] + batch_lens[i] - 1`;
+- feedback 的 `stop` 字段非 0 或 `n_past >= n_ctx` 时请求标记 FINISHED,下一次`prepare_batch` 的 `step()` 内回收并触发 `on_finish`;
+- prefill 独占步:任一候选处于 prefill 时整批只保留该请求(`llama-paged-scheduler-impl.cpp:90-107`),prefill 与 decode 不混批;
+- 内部三级队列 running/swapped/waiting:waiting/swapped 队列在 init 时按模式二选一(`src/llama-paged-queue.h`):FCFS 按到达序(deque + 按键插入),优先级模式为`group_precedes`(priority, t_arrival, seq)比较器的最小堆;两种实现均支持`take(request_id)` 定点摘除(cancel 依赖)。KV 块不足时先驱逐缓存块,再抢占运行请求(换出到 CPU 块池,CPU 池满则释放重算;牺牲者选择 FCFS 取最新到达、优先级模式取最低优先级,并带步内优先级反转保护);前缀缓存(链式哈希 + 块共享,hybrid 模型另配 GDN checkpoint 槽)在入队时自动命中;媒体组(has_media)不参与前缀缓存与重算,只能换出(9.4)。
 
 约束(第一阶段,`examples/paged/README.md:22-28`):
 
 - 必须单卡全量卸载(`validate_paged_kv_placement`,`src/llama-context.cpp:87-111`);
 - 纯注意力路径要求 `n_batch == n_ubatch`(`src/llama-paged-scheduler.cpp:42-44`);
 - 不支持 SWA;hybrid paged 目前仅 `LLM_ARCH_QWEN35/QWEN35MOE`;
-- `request_id` 必须小于 `n_seq_max`,且 hybrid 模型要避开 checkpoint 保留段
-  (`llama-paged-scheduler-impl.cpp:29-38,137-141`);
+- `request_id` 必须小于 `n_seq_max`,且 hybrid 模型要避开 checkpoint 保留段(`llama-paged-scheduler-impl.cpp:29-38,137-141`);
 - 单请求 prompt 长度必须小于 `n_ctx`(逐请求上限,而非总预算)。
 
 ### 2.2 server 现状
 
-文件布局:本 fork 已将 server 拆成约 13 个文件,核心是 `tools/server/server-context.cpp`
-(约 5558 行)+ `server-context.h`(pimpl,`server_context` 公开接口只暴露
-`load_model/start_loop/terminate/get_meta` 等)。
+文件布局:本 fork 已将 server 拆成约 13 个文件,核心是 `tools/server/server-context.cpp`(约 5558 行)+ `server-context.h`(pimpl,`server_context` 公开接口只暴露`load_model/start_loop/terminate/get_meta` 等)。
 
 请求主链路(均为 `server-context.cpp`):
 
@@ -88,9 +78,7 @@ HTTP handler (server_routes, 4257+)
   -> server_task_result_* -> queue_results -> SSE/JSON
 ```
 
-`llama_context`(全局唯一 `ctx_tgt`)在图中不可见,因为它不属于任务/槽链路:
-调度决策(`process_single_task`/`get_available_slot`)不碰计算,slot 只持有它的指针。
-真正消费它的是 `update_slots` 的三段:
+`llama_context`(全局唯一 `ctx_tgt`)在图中不可见,因为它不属于任务/槽链路:调度决策(`process_single_task`/`get_available_slot`)不碰计算,slot 只持有它的指针。真正消费它的是 `update_slots` 的三段:
 
 | 环节 | 消费点 | 作用 |
 |---|---|---|
@@ -98,28 +86,17 @@ HTTP handler (server_routes, 4257+)
 | decode | `llama_decode(ctx_tgt, batch)`(3681) | 唯一前向计算入口;批内 token 的 KV 按 `(seq_id = slot.id, pos)` 写入 ctx 的 KV 内存,`seq_id = {id_slot}` 由 `server_batch::render` 填入 |
 | post_decode | `common_sampler_sample(smpl, ctx_tgt, tok_idx)`(3856) | 从 ctx 的 logits 缓冲取分布采样;detokenize 也用 ctx 的 vocab |
 
-主循环之外还有零星消费:元数据查询(`llama_n_batch/n_ctx_seq`)、embeddings
-(`llama_set_embeddings`/`llama_get_embd_seq`)、后端采样开关(`llama_set_sampler`),
-以及投机推理的第二个 context `ctx_dft`。
+主循环之外还有零星消费:元数据查询(`llama_n_batch/n_ctx_seq`)、embeddings(`llama_set_embeddings`/`llama_get_embd_seq`)、后端采样开关(`llama_set_sampler`),以及投机推理的第二个 context `ctx_dft`。
 
-这也是集成的前提:slot 与请求状态不含任何自有计算上下文。paged 模式下仍是同一个
-`ctx_tgt` 走 `llama_decode`,变化的只是批由谁构建(`prepare_batch` 替代 server_batch)
-与 KV 写到哪里(路由元数据 `llama_paged_batch_info` 由调度器给出,在 `llama_decode`
-内部被 ctx 的 paged 内存消费,server 侧无感)。
+这也是集成的前提:slot 与请求状态不含任何自有计算上下文。paged 模式下仍是同一个`ctx_tgt` 走 `llama_decode`,变化的只是批由谁构建(`prepare_batch` 替代 server_batch)与 KV 写到哪里(路由元数据 `llama_paged_batch_info` 由调度器给出,在 `llama_decode`内部被 ctx 的 paged 内存消费,server 侧无感)。
 
 与本次集成相关的要点:
 - `n_parallel` 个 slot 即 `cparams.n_seq_max`(`common/common.cpp:1791`),
   slot 在 `load_model` 中创建(`server-context.cpp:1254-1314`);
-- 采样在 `post_decode` 用每槽独立 `common_sampler` 链
-  (含语法/结构化输出,`server-context.cpp:3856`);停止规则集中在
-  `process_token`(1833-1962:stop 串/antiprompt/EOG/n_predict/t_max/UTF-8 缓冲);
-- 所有 KV 操作走 `common_memory` 包装;上下文迁移(`seq_add`)、
-  `n_cmpl>1` 状态复制(`seq_cp`)、槽位存取与 RAM 提示缓存(`state_write/read`)
-  都依赖经典 KV 语义;
-- `server_queue` 通过 `std::function` 回调(`on_new_task/on_update_slots/
-  on_sleeping_state`,`server-queue.h:121-137`)与 impl 解耦,是现成的插件接缝;
-- server 内没有任何虚基类调度抽象;`common_speculative`(投机推理)以普通辅助结构 +
-  钩子函数的方式挂在 pre/decode/post 三段上,是"外挂策略"的先例。
+- 采样在 `post_decode` 用每槽独立 `common_sampler` 链(含语法/结构化输出,`server-context.cpp:3856`);停止规则集中在`process_token`(1833-1962:stop 串/antiprompt/EOG/n_predict/t_max/UTF-8 缓冲);
+- 所有 KV 操作走 `common_memory` 包装;上下文迁移(`seq_add`)、`n_cmpl>1` 状态复制(`seq_cp`)、槽位存取与 RAM 提示缓存(`state_write/read`)都依赖经典 KV 语义;
+- `server_queue` 通过 `std::function` 回调(`on_new_task/on_update_slots/on_sleeping_state`,`server-queue.h:121-137`)与 impl 解耦,是现成的插件接缝;
+- server 内没有任何虚基类调度抽象;`common_speculative`(投机推理)以普通辅助结构 + 钩子函数的方式挂在 pre/decode/post 三段上,是"外挂策略"的先例。
 
 ### 2.3 能力映射与冲突分析
 
@@ -142,25 +119,31 @@ HTTP handler (server_routes, 4257+)
 
 ### 3.1 设计原则
 
-1. 默认路径零行为变化:现有 `get_available_slot/launch_slot_with_task/update_slots`
-   原样保留,只被一层薄适配器包住;
-2. 调度器做成策略对象:新接口 `server_scheduler_interface` + 工厂,paged 实现放独立文件,
-   与 `server-context.cpp` 的耦合限定为若干已存在的 impl 成员函数;
-3. 每请求状态复用 `server_slot`:采样链、停止规则(`process_token`)、流式文本拼装
-   (`find_stopping_strings` 等)零重复实现;
-4. 分层排队:server 侧固定 slot 池负责请求级并发上限与溢出 defer(现有机制),
-   调度器内部 waiting/抢占负责 KV 块级动态调度。两层职责不重叠。
+1. 默认路径零行为变化:现有 `get_available_slot/launch_slot_with_task/update_slots` 原样内联保留,不包适配器;paged 调度器经 `if (scheduler)` 分支旁路接入(取舍见 3.2);
+2. 调度器做成策略对象:新接口 `server_scheduler_interface` + 工厂,paged 实现放独立文件, 与 `server-context.cpp` 的耦合限定为若干已存在的 impl 成员函数;
+3. 每请求状态复用 `server_slot`:采样链、停止规则(`process_token`)、流式文本拼装(`find_stopping_strings` 等)零重复实现;
+4. 分层排队:server 侧固定 slot 池负责请求级并发上限与溢出 defer(现有机制),调度器内部 waiting/抢占负责 KV 块级动态调度。两层职责不重叠。
 
 ### 3.2 组件与文件
 
 ```
 tools/server/
-  server-scheduler.h          (新) server_scheduler_interface 接口 + 工厂声明
+  server-scheduler.h          (新) server_context_port 接口(context 暴露给调度器的 port)+ server_scheduler_interface
+                                调度器接口 + 工厂声明
   server-scheduler-paged.h    (新) paged 实现声明
-  server-scheduler-paged.cpp  (新) paged 连续批处理主循环
-  server-slot.h               (新) server_slot 结构体(自 server-context.cpp 纯移动)
-  server-context.cpp           (改) 工厂接线、任务路由、默认适配器、功能门禁
+  server-scheduler-paged.cpp  (新) paged 连续批处理主循环:launch/cancel/update、多模态分段
+                                与编码预取、投机起草与验证、n_cmpl fork
+  server-slot.h               (新) server_slot + server_batch(自 server-context.cpp 纯移动)
+  server-context.cpp           (改) impl 继承实现 server_context_port、`if (scheduler)`
+                                任务路由、启动门禁、paged 模式跳过默认 warmup
 ```
+
+设计取舍:不设默认适配器。默认路径的推理任务分支含 `n_cmpl>1` 父子槽派生与
+`cache_idle_slots` 保存逻辑,包一层适配器就要把这两段搬进新文件,回归面覆盖全部任务
+类型,换来的只是形式上的策略统一;`if (scheduler)` 分支旁路即可达成可插拔,默认路径
+零移动。因此调度器接口只服务 paged 路径,工厂缺省返回 nullptr;paged 实现对 impl 的
+访问经 `server_context_port` 抽象基类(`server_context_impl` 继承实现)取得,
+不新建 friend 或内部头。
 
 结构:
 
@@ -169,20 +152,27 @@ HTTP handlers (server_routes)
         | server_task
         v
 server_queue ------> server_context_impl::process_single_task
-        ^                  |  推理类任务(COMPLETION/EMBEDDING/RERANK/INFILL)与 CANCEL
-        | on_update_slots  v
-        +------------- server_scheduler_interface          <-- 工厂: --kv-paged 开关
+        ^                  |  推理类任务(COMPLETION 等)与 CANCEL:
+        |                  |    if (scheduler) -> scheduler->launch / cancel
+        |                  |    else           -> 内联默认分支原样保留
+        | on_update_slots  |                     (get_available_slot / launch_slot_with_task)
+        +-------------- update 钩子: if (scheduler) scheduler->update();
+                                    else                update_slots();
                             |
-              +-------------+------------------+
-              v                                v
-   server_scheduler_default         server_scheduler_paged
-   (默认路径薄适配器,                (llama_paged_scheduler_*:
-    包装 get_available_slot /          add_request / prepare_batch /
-    launch_slot_with_task /            llama_decode / update)
-    update_slots 三段式)                    |
-              |                                |
-              +----- 共用每请求状态 -----> server_slot (server-slot.h)
-                                            采样链 / 停止规则 / 流式文本 / 统计
+                            v
+              server_scheduler_interface
+                            |      <-- 工厂 server_scheduler_create(port):
+                            v          --kv-paged -> server_scheduler_paged
+                   server_scheduler_paged   缺省 -> nullptr(默认路径不进调度器)
+                    (llama_paged_scheduler_*:
+                     add_request(_segs) / prepare_batch /
+                     llama_decode / update)
+                            |
+                            |  server_context 侧服务经 server_context_port 暴露(server_context_impl 继承实现):
+                            |    launch_slot_with_task / process_token / send_* / metrics_* /
+                            |    spec_ctx / mmctx / yield / post_next_response
+                            +----- 共用每请求状态 -----> server_slot (server-slot.h)
+                                                            采样链 / 停止规则 / 流式文本 / 统计
 ```
 
 ### 3.3 接口定义(草图)
@@ -212,58 +202,38 @@ struct server_scheduler_interface {
     // abort a queued or running task (CANCEL, client disconnect)
     virtual void cancel(int64_t id_task) = 0;
 
-    // one iteration: build batch, llama_decode, sample, emit results.
-    // return true while any request is in flight
-    virtual bool update() = 0;
+    // one iteration: build batch, llama_decode, sample, emit results
+    virtual void update() = 0;
 };
 
-// picks default or paged based on params_base.kv_paged
-std::unique_ptr<server_scheduler_interface> server_scheduler_create(server_context_impl & impl);
+// returns the paged scheduler when params.kv_paged is set, nullptr otherwise
+// (the default path stays inline in server-context.cpp)
+std::unique_ptr<server_scheduler_interface> server_scheduler_create(server_context_port & port);
 ```
 
 说明:
 
-- `launch` 返回 false 对应今天的"无空闲槽 -> defer",溢出排队完全复用现有
-  `queue_tasks_deferred` 机制,deferred 任务由槽释放回调
-  (`callback_on_release -> pop_deferred_task`,`server-context.cpp:1301-1304`)唤醒;
-- 非推理类任务(METRICS/CONTROL/SLOT_*/LoRA/tokenize 等)不经调度器,
-  保留在 `process_single_task` 原分支;
-- 默认适配器 `server_scheduler_default` 定义在 `server-context.cpp` 内
-  (需要访问 impl 私有成员),仅做转发:
-
-```cpp
-struct server_scheduler_default final : server_scheduler_interface {
-    server_context_impl & impl;
-
-    bool init() override;                 // no-op, 现有路径在 load_model 里已就绪
-    bool launch(server_task && t) override {
-        server_slot * slot = impl.get_available_slot(t);
-        if (!slot) return false;
-        impl.launch_slot_with_task(*slot, std::move(t));
-        return true;
-    }
-    void cancel(int64_t id) override;     // 现有 CANCEL 分支逻辑(2454-2462)移入
-    bool update() override { impl.update_slots(); return impl.any_slot_processing(); }
-};
-```
+- `launch` 返回 false 对应今天的"无空闲槽 -> defer",溢出排队完全复用现有`queue_tasks_deferred` 机制,deferred 任务由槽释放回调(`callback_on_release -> pop_deferred_task`,`server-context.cpp:1301-1304`)唤醒;
+- 非推理类任务(METRICS/CONTROL/SLOT_*/LoRA/tokenize 等)不经调度器,保留在 `process_single_task` 原分支;
+- 默认路径不进调度器接口:`process_single_task` 的推理任务与 CANCEL 分支、update 钩子均为 `if (scheduler)` 双分支,默认路径原样内联(取舍见 3.2);
+- paged 实现对 impl 的访问经 `server_context_port` 抽象基类(`server_context_impl` 继承实现,提供 `launch_slot_with_task/process_token/send_*/metrics_*/spec_ctx/mmctx/yield/post_next_response`):impl 原有同名方法直接满足接口,零包装成本;实际接口与服务面见 `tools/server/server-scheduler.h`。
 
 ### 3.4 paged 实现要点(`server-scheduler-paged.cpp`)
 
 持有:`llama_paged_scheduler * sched`、`std::vector<server_slot> & slots`(引用 impl 的
 slot 池)、`llama_context * ctx`。`server_scheduler_paged` 需要调用 impl 的
 `process_token/send_partial_response/send_final_response` 等既有成员,
-通过 `server-context.cpp` 内声明的一个内部访问头(或 friend)获得,不再新建抽象层。
+经 `server_context_port` 接口(`server_context_impl` 继承实现)获得,不再新建抽象层;
+实际类还含多模态编码/预取与投机、fork 路径,见 9.3/9.4。
 
 launch(task):
 
 1. 取空闲槽(paged 模式不做 LCP 匹配,任取 LRU 空闲槽);
-2. 初始化 `slot.smpl`(复用 `launch_slot_with_task` 的采样链构建逻辑,
-   `server-context.cpp:1781-1804`),空 prompt / `n_predict == 0` 走 legacy 同款短路;
-3. `llama_paged_scheduler_add_request(sched, task.tokens.data(), n, slot.id)`,
-   失败(prompt 超长、id 冲突)立即回错误结果并释放槽。
+2. 初始化 `slot.smpl`(复用 `launch_slot_with_task` 的采样链构建逻辑,`server-context.cpp:1781-1804`),空 prompt / `n_predict == 0` 走 legacy 同款短路;
+3. `llama_paged_scheduler_add_request(sched, task.tokens.data(), n, slot.id)`,失败(prompt 超长、id 冲突)立即回错误结果并释放槽。
 
-update() 主循环(对齐 `examples/paged/paged.cpp`;保留 phase-1 草案原貌,`update` 的签名已按
-第 12.0 节改为 feedback 数组形式):
+update() 主循环(对齐 `examples/paged/paged.cpp`;反馈契约见 9.0,`update()` 返回 void,
+保活由 port 侧重投递 NEXT_RESPONSE 承担(经 `post_next_response`),同默认路径):
 
 ```
 1. // 死锁/活锁检测在库内完成,结论经返回值暴露给调用方
@@ -271,16 +241,16 @@ update() 主循环(对齐 `examples/paged/paged.cpp`;保留 phase-1 草案原貌
        // 返回 false: 死锁/活锁,不可恢复,批内容不可用
        // 所有在途请求按错误收尾,不重试(槽位强制释放见下方 finish 处理)
        fail_all_running();
-       return false;
+       return;
    }
    if (batch.n_tokens == 0) {
-       return false;   // 调用成功但没有可运行的 seq: 空闲
+       return;   // 调用成功但没有可运行的 seq: 空闲(含义见下文)
    }
 
 2. if (llama_decode(ctx, batch) != 0) {
        // 批内所有 seq 对应槽按错误收尾并停止该请求(无"减半重试"语义)
        fail_batch_seq();
-       return false;
+       return;
    }
    llama_synchronize(ctx);
 
@@ -294,87 +264,51 @@ update() 主循环(对齐 `examples/paged/paged.cpp`;保留 phase-1 草案原貌
        common_sampler_accept(...)
        running = impl.process_token(text, slot)   // 复用: stop 串/EOG/n_predict/t_max/流式
        if (!running) { send_final_response(slot); slot.stopping = true; }
+       feedback.push({request_id, &sampled, 1, slot.stopping ? 1 : 0})
      }
-     tokens[i] = 采样结果或 LLAMA_TOKEN_NULL
-     stop_flags[i] = (slot.stopping || 槽被 CANCEL 标记)
 
-4. llama_paged_scheduler_update(sched, &batch, tokens, stop_flags)
+4. llama_paged_scheduler_update(sched, &batch, feedback.data(), feedback.size())
    // 调度器标记 FINISHED; 下一次 prepare_batch 的 step() 回收并触发 on_finish
-
-5. return true(仍有在途请求)
 ```
 
-空批的含义:`n_tokens == 0` 指本次调用成功但无可运行的 seq,正常情况等价于调度器内
-没有任何在途请求(running/swapped/waiting 全空),`update()` 返回 false 后队列循环挂回
-条件变量等待,与默认路径全部槽空闲时的行为一致,不耗 CPU。新到达的请求不会落在空批
-分支:launch 与 update 在同一循环迭代内(队列循环先处理任务、后调 update),请求经
-`add_request` 进入 waiting 后,running 为空时 `step()` 每步必接纳一个 waiting 请求,
-产出该请求的非空 prefill 批。仍在 server defer 队列里的请求不在调度器内,与空批无关;
-已入 waiting 但因 KV 块预算未接纳、且 running 为空的情形由库内 `check_deadlock` 拦截
-(prepare 返回 false,走致命路径),同样不表现为空批。
+空批的含义:`n_tokens == 0` 指本次调用成功但无可运行的 seq,正常情况等价于调度器内没有任何在途请求(running/swapped/waiting 全空),`update()` 返回后无在途请求,队列循环挂回条件变量等待,与默认路径全部槽空闲时的行为一致,不耗 CPU。新到达的请求不会落在空批分支:launch 与 update 在同一循环迭代内(队列循环先处理任务、后调 update),请求经`add_request` 进入 waiting 后,running 为空时 `step()` 每步必接纳一个 waiting 请求,产出该请求的非空 prefill 批。仍在 server defer 队列里的请求不在调度器内,与空批无关;已入 waiting 但因 KV 块预算未接纳、且 running 为空的情形由库内 `check_deadlock` 拦截(prepare 返回 false,走致命路径),同样不表现为空批。反常的"在途非空却连续空批"由连续 64 步兜底报错收尾。
 
 finish 处理与槽释放时序(关键细节):
 
 - 停止决定发生时立即 `send_final_response`(与 legacy 一致,客户端无感延迟);
-- 但 `slot.release()` 延迟到 `on_finish(request_id)` 回调里执行:请求被 `step()`
-  回收之前 `id_to_group` 仍持有该 id,此时同 id 重新 `add_request` 会失败;
-  `on_finish` 在主线程 `prepare_batch` 内触发,回调里 release -> `pop_deferred_task`,
-  时序安全。最坏延迟一个调度步;
-- 调度器侧 `n_past >= n_ctx` 自动结束(服务端未主动 stop)时同样经 `on_finish`:
-  映射为 `STOP_TYPE_LIMIT`(上下文满),补发 final response;
-- `prepare_batch` 返回 false(死锁)时,除报错外需兜底强制 release 批内槽,
-  避免依赖不再会触发的 `on_finish`。
+- 但 `slot.release()` 延迟到 `on_finish(request_id)` 回调里执行:请求被 `step()`回收之前 `id_to_group` 仍持有该 id,此时同 id 重新 `add_request` 会失败;`on_finish` 在主线程 `prepare_batch` 内触发,回调里 release -> `pop_deferred_task`,时序安全。最坏延迟一个调度步;
+- 调度器侧 `n_past >= n_ctx` 自动结束(服务端未主动 stop)时同样经 `on_finish`: 映射为 `STOP_TYPE_LIMIT`(上下文满),补发 final response;
+- `prepare_batch` 返回 false(死锁)时,除报错外需兜底强制 release 批内槽,避免依赖不再会触发的 `on_finish`。
 
 cancel(id_task):
 
 1. 任务还在 server defer 队列:由现有队列机制处理(不经调度器);
-2. 已 `add_request`:标记 `slot.stopping`,并调用新增的
-   `llama_paged_scheduler_cancel(sched, request_id)`(见 L1):waiting 中的请求立即
-   移除并触发 `on_finish`;running/swapped 中的请求保证在下一个 `update()` 步进回收,
-   避免"长期换出不上批、stop_flags 够不着"的悬挂请求。
+2. 已 `add_request`:标记 `slot.stopping`,并调用 `llama_paged_scheduler_cancel(sched, request_id)`:waiting/running/swapped 一律同步回收——`free_blocks` 同时释放 GPU 与 CPU 池块,换出中的请求无需先 swap-in,`finish()` 触发 `on_finish`,彻底消除"长期换出不上批、stop 够不着"的悬挂请求;未知 id(已结束或未入队)干净返回 false。
 
-warmup:kv_paged 模式下跳过 server 默认 warmup,改为
-`llama_paged_scheduler_warmup`(对齐 `paged.cpp` 的做法),避免默认 warmup 占用/扰动
-paged 块池。
+warmup:kv_paged 模式下跳过 server 默认 warmup,改为`llama_paged_scheduler_warmup`(对齐 `paged.cpp` 的做法),避免默认 warmup 占用/扰动paged 块池。
 
-指标:沿用 `impl.metrics_*` 喂桶接口;TTFT/e2e 取 `llama_paged_seq_state` 的
-`t_arrival_us/t_first_token_us`,`t_prompt_last` 在 final_prefill 步设置,
-`n_prompt_cached = n_prompt_total - 入队时剩余 n_prompt`(前缀命中量)。
+指标:沿用 `impl.metrics_*` 喂桶接口;TTFT/e2e 取 `llama_paged_seq_state` 的`t_arrival_us/t_first_token_us`,`t_prompt_last` 在 final_prefill 步设置,`n_prompt_cached = n_prompt_total - 入队时剩余 n_prompt`(前缀命中量)。
 
 ### 3.5 启用方式与启动校验
 
-不新增调度器参数:复用已有的 `--kv-paged`(L3 解封 server 例子)作为 paged 调度器的
-唯一开关。这与默认路径的现有模式一致:内存模式决定调度行为(`kv_unified` 才启用
-`try_clear_idle_slots`、`!can_shift` 自动关 ctx_shift 等先例)。开 `--kv-paged` ->
-工厂创建 paged 调度器;缺省 -> 默认调度器,行为不变。
-
-不引入独立 `--scheduler` 参数的理由:调度器与 paged KV 在库层硬绑定
-(`llama_paged_scheduler_init` 在非 paged ctx 上返回 nullptr),两个参数的有效组合
-只有一格,独立开关反而引入"paged KV 走默认调度器"这类劣化且不测试的配置矩阵。
-将来若出现第二个调度轴(如二阶段动态准入),再加参数即可:接口与工厂结构不变,
-只换工厂判据,向后兼容。
+不新增调度器参数:复用已有的 `--kv-paged`(L3 解封 server 例子)作为 paged 调度器的唯一开关。这与默认路径的现有模式一致:内存模式决定调度行为(`kv_unified` 才启用`try_clear_idle_slots`、`!can_shift` 自动关 ctx_shift 等先例)。开 `--kv-paged` ->工厂创建 paged 调度器;缺省 -> 工厂返回 nullptr,默认路径内联原样,行为不变。
 
 启动校验(fail-fast,给出可读错误与修复建议):
 
-- `--kv-paged` 与 `--kv-unified` 互斥,组合使用启动报错;
+- `--kv-paged` 与 `--kv-unified` 组合:强制关闭 kv_unified 并告警,而非报错。理由:kv_unified 在 paged 路径本就是 no-op,硬报错会挡住 `-np auto`(隐含 kv_unified)与 `--kv-paged` 的默认组合;
 - `-b == -ub`、单卡全卸载(库层 `validate_paged_kv_placement` 已有,错误信息透传);
-- `n_parallel` 收敛为可用 request_id 上限(见 L2;hybrid 模型 checkpoint 保留段占用
-  `n_seq_max` 尾部);
-- 功能互斥检查:`--kv-paged` 与 speculative/mtmd/`cache_ram`/`n_cache_reuse`/
-  ctx_shift/embeddings/rerank 组合时,启动期直接报错而非静默降级
-  (比默认路径"自动关闭"更严格,避免用户误配)。
+- `n_parallel` 收敛为可用 request_id 上限(`max_request_id`;hybrid 模型 checkpoint 保留段占用`n_seq_max` 尾部);
+- `--cache-ram`/embeddings/rerank 与 `--kv-paged` 组合:启动期直接报错而非静默降级(比默认路径"自动关闭"更严格,避免用户误配);synthetic speculative acceptance 同样启动期拒绝(部分接受回滚走 truncate,无 replay 语义);
+- speculative 与多模态输入放行(9.3/9.4:draft ctx 强制经典 KV;媒体分段预填);`n_cache_reuse` 与 ctx_shift 告警关闭(paged 下无 `seq_add`,上下文满即按 `n_ctx` 结束)。
 
-请求期门禁:EMBEDDING/RERANK/INFILL 任务与
-`n_cmpl > 1`、grammar、多模态输入在 paged 模式下回
-`server_task_result_error`(HTTP 501 语义,消息注明去掉 `--kv-paged` 即可用默认
-调度器),chat 端点第一阶段同样回未支持错误。
+请求期门禁:EMBEDDING/RERANK/INFILL 任务在 paged 模式下回`server_task_result_error`(HTTP 501 语义,消息注明去掉 `--kv-paged` 即可用默认调度器);chat、grammar、`n_cmpl > 1` 与多模态输入均已放行(9.1/9.2/9.4)。
 
 ## 4. 关键设计决策
 
 | 决策 | 选择与理由 |
 |---|---|
 | 启用开关 | 复用 `--kv-paged` 单开关,不新增 `--scheduler`:调度器与 paged KV 库层硬绑定,独立参数的有效组合只有一格;将来出现第二个调度轴再加,工厂只换判据 |
-| 抽象层级 | 接口只覆盖"launch/cancel/update"三动作,不试图抽象批构建/KV 操作。默认路径包一层即可,paged 路径整体另写,避免为统一而过度设计 |
+| 抽象层级 | 接口只覆盖"launch/cancel/update"三动作,不试图抽象批构建/KV 操作。默认路径保持内联,paged 路径整体另写,避免为统一而过度设计 |
 | 排队模型 | server slot 池(n_parallel,溢出 defer)+ 调度器 waiting/抢占两层。slot 池给请求级背压与取消锚点;块级动态性交给调度器。第二阶段可评估"全量直入调度器 waiting"的 vLLM 式模型 |
 | request_id 映射 | request_id = slot.id = llama seq_id,天然落在 `[0, n_seq_max)` 内,与批内 `seq_id` 反查 O(1) |
 | 停止条件归属 | 服务端计算 stop_flags(复用 process_token 全部规则),调度器只执行。库层不新增任何停止语义 |
@@ -384,120 +318,61 @@ paged 块池。
 | 前缀复用 | 不做槽亲和;调度器块级前缀缓存负责跨请求命中,语义更强(块粒度 vs 整段前缀) |
 | 失败语义 | `prepare_batch` false 或 decode 失败不做任何重试或自愈:批内请求全部按错误路径收尾,不做默认路径的 n_batch 减半重试(块不足应由调度器抢占规避) |
 
-## 5. 第一阶段功能范围与降级清单
+## 5. 功能范围与降级清单(当前状态)
 
-范围(验收):`/completion` 与 `/v1/completions`,含采样参数、流式 SSE、
-stop/antiprompt、EOG、`n_predict`、`t_max_predict_ms`、并发与排队、取消、`/metrics`。
+第一阶段验收范围曾是 `/completion` 与 `/v1/completions` 基础链路;第二阶段(含多模态)落地后,paged 模式当前支持:
+
+- `/completion`、`/v1/completions`、`/v1/chat/completions`(含工具调用、grammar、reasoning 解析、`logprobs`),采样参数、流式 SSE、stop/antiprompt、EOG、`n_predict`;
+- 并发与排队、取消、`/metrics`;
+- `n_cmpl > 1` 并行采样(块引用 fork,9.2);
+- 投机推理 `--spec-*`(draft ctx 保持经典 KV;synthetic acceptance 在 paged 下启动期拒绝;媒体请求跳过起草,9.3/9.4);
+- 多模态输入(分段预填 + 暂停边界按需编码,9.4);
+- 请求优先级调度(`--enable-priority` 打开调度器优先级模式;server 侧暂未接每请求优先级,见 9.7)。
 
 paged 模式下禁用清单:
 
 | 功能 | 处理 |
 |---|---|
-| `/v1/chat/completions`、`/infill` 端点 | 请求期 501 风格错误(第二阶段开启) |
-| embeddings / rerank 端点 | 请求期错误(需要 paged 图上池化支持,第二阶段) |
-| 工具调用、结构化输出(grammar) | 请求期错误(技术上随采样链可用,但验收放第二阶段) |
-| 投机推理(`--spec-*`) | 启动期互斥报错 |
-| 多模态(mtmd 输入) | 启动期互斥报错 |
-| RAM 提示缓存/`--cache-ram`、`/slots/{save,restore}` | 启动期/请求期错误(需块级 state 序列化,第二阶段) |
-| `n_cmpl > 1` 并行采样 | 请求期错误(需 seq_cp 或块引用 fork,第二阶段) |
+| `/infill` 端点 | 请求期 501 风格错误 |
+| embeddings / rerank 端点 | 启动期报错(需要 paged 图上池化支持,未设计) |
+| synthetic speculative acceptance | 启动期拒绝(部分接受回滚走 truncate,无 replay) |
+| RAM 提示缓存/`--cache-ram`、`/slots/{save,restore}` | 启动期/请求期错误(需块级 state 序列化,未设计) |
 | 上下文迁移 ctx_shift、`n_cache_reuse` | 启动期关闭并告警(paged 下无 `seq_add`;上下文满即按 `n_ctx` 结束) |
-| LoRA | 第一阶段 paged 模式禁用(批内混 LoRA 集合的约束暂不处理) |
+| LoRA | paged 模式禁用(批内混 LoRA 集合的约束暂不处理) |
+| 显式 `id_slot` 请求 | 请求期错误(槽亲和无意义,任取空闲槽) |
+| SWA 架构(gemma3、llama4 等) | 不支持;hybrid 保留段使有效槽数少于 `n_parallel` |
 
 `/slots`(只读)、`/props`、`/tokenize` 等非推理端点保留可用。
 
-## 6. 子任务分解与工作量估算
 
-### 6.1 llama 层
+## 6. 第二阶段扩展预览
 
-| 编号 | 内容 | 文件 | 类型 | 行数 |
-|---|---|---|---|---|
-| L1 | `llama_paged_scheduler_cancel(sched, request_id)`:waiting 立即移除并 on_finish;running/swapped 标记停止,下一步回收 | `include/llama.h`、`src/llama-paged-scheduler.cpp`、`src/llama-paged-scheduler-impl.{h,cpp}` | 新增 | ~100-120 |
-| L2 | `llama_paged_scheduler_max_request_id(sched)`:返回可用 request_id 上限(hybrid 保留段感知) | 同上四文件 | 新增 | ~25-30 |
-| L3 | paged 参数解封(`--kv-paged` 即 paged 调度器开关):`-kvp/-ngpub/-ncpub/-kvbls/--kv-paged-watermark` 的 `set_examples` 加 `LLAMA_EXAMPLE_SERVER` | `common/arg.cpp` | 修改 | ~10 |
-| L4(可选) | `common_fit_paged_kv_blocks` 允许 server 例子按空闲显存自适应块数 | `common/common.cpp` | 修改 | ~15 |
-| L5 | e2e 测试补 cancel 用例(复用现有测试文件,不新建) | `tests/test-paged-kv-e2e.cpp` | 修改 | ~40 |
-
-llama 层合计:约 150-215 行(L4/L5 可选)。
-
-### 6.2 server 层
-
-| 编号 | 内容 | 文件 | 类型 | 行数 |
-|---|---|---|---|---|
-| S1 | `server_scheduler_interface` 接口 + 工厂 | `tools/server/server-scheduler.h` | 新增 | ~80-110 |
-| S2 | 抽取 `server_slot`(含 `slot_state` 枚举与内联方法)到独立头;`server_batch` 留在原处 | `tools/server/server-slot.h`(新)、`server-context.cpp` | 移动 | ~500(纯移动,零语义变化) |
-| S3 | paged 调度器实现:init/warmup/on_finish、launch、cancel、update 主循环、finish 与错误路径、指标 | `tools/server/server-scheduler-paged.{h,cpp}` | 新增 | ~650-850 |
-| S4 | 工厂接线与任务路由(`process_single_task` 推理类/CANCEL 分支改经调度器)、默认适配器、启动校验与功能门禁、warmup 分支、`prompt_clear` 的 paged 分支 | `tools/server/server-context.cpp` | 修改+新增 | ~230-300 |
-| S5 | 用户文档:`--kv-paged` 在 server 的语义、第一阶段限制、降级清单 | `tools/server/README.md` | 修改 | ~30-40(文档行) |
-
-server 层合计:新增约 975-1300 行(其中 S2 为 ~500 行纯移动,新逻辑约 475-800),
-修改约 240-340 行。
-
-### 6.3 汇总
-
-- 去除纯移动部分,预计净新增/修改约 870-1170 行(llama 层 ~150-215,server 层 ~725-970);
-- S2 + S4 是仅有的两处触碰现有代码的任务,其余全部为新增文件;
-- 建议实施顺序:L3 -> L2 -> S2 -> S1 -> S4(默认路径回归)-> L1 -> S3 -> L4/L5 -> S5。
-  其中 S2 合入后先跑全量 server 回归,确认纯移动无回归再继续。
-
-## 7. 第二阶段扩展预览
-
-| 功能 | 预估路径 |
+| 功能 | 路径与状态 |
 |---|---|
-| chat/工具调用 | HTTP 层已就绪(`task_result_state` 流式解析),开启端点验收即可,调度器零改动(已细化,见 12.1) |
-| 结构化输出(grammar) | 已随每槽采样链存在,补验收测试即可(随 12.1 一并放开) |
-| embedding/rerank | 需验证 `llama_set_embeddings` + 池化在 paged 图上的支持(llama 层) |
-| `n_cmpl>1` 并行采样 | 基于块引用共享实现调度器侧 fork(复制 block_table 引用),替代 seq_cp(已细化,见 12.2) |
-| 槽位存取/RAM 提示缓存 | paged 内存的块级 `state_write/read` 序列化 |
-| 投机推理 | 目标侧验证经调度器,draft 上下文保持经典 KV;需变长反馈与位置级回滚(已细化,见 12.3) |
-| 多模态 | 分段入队 + embd 批 + prefill 中途编码暂停态(已细化,见 12.4) |
-| 动态准入 | 评估去掉 server slot 池、请求全量入调度器 waiting 的 vLLM 式模型(需 request 注册表与取消重构) |
+| chat/工具调用 | **已实现**:HTTP 层已就绪(`task_result_state` 流式解析),调度器零改动(见 9.1) |
+| 结构化输出(grammar) | **已实现**:随每槽采样链存在(随 9.1 一并放开) |
+| embedding/rerank | 未设计:需验证 `llama_set_embeddings` + 池化在 paged 图上的支持(llama 层) |
+| `n_cmpl>1` 并行采样 | **已实现**:块引用共享 fork(复制 block_table 引用),替代 seq_cp(见 9.2) |
+| 槽位存取/RAM 提示缓存 | 未设计:paged 内存的块级 `state_write/read` 序列化 |
+| 投机推理 | **已实现**:目标侧验证经调度器,draft 上下文保持经典 KV;变长反馈与位置级回滚(见 9.3) |
+| 多模态 | **已实现**:分段入队 + embd 批 + prefill 中途编码暂停态(见 9.4) |
+| 动态准入 | 未设计:评估去掉 server slot 池、请求全量入调度器 waiting 的 vLLM 式模型(需 request 注册表与取消重构) |
 
-> 注:12.3 的早期预判"draft 上下文 paged 化"已修正——draft 是独立 context,保持经典 KV
+> 注:9.3 的早期预判"draft 上下文 paged 化"已修正——draft 是独立 context,保持经典 KV
 > 即可,复杂度集中在目标侧验证与回滚。
 
-## 8. 风险与开放问题
+## 7. 风险与开放问题
 
-1. prefill 独占步:长 prompt 分块期间,在跑请求的 decode 被推迟,TPOT 出现毛刺;
-   每步 token 数受 `n_batch` 预算约束,毛刺上界可控,但与默认路径 join-batching
-   的行为差异需要在验收时量化(`scripts/perf-paged-vs-unified.py` 可复用)。
-2. 抢占/重算毛刺:KV 块满时换出或重算带来尾延迟;`--kv-paged-watermark`(默认 0.05)
-   与 CPU 块数是主要调参项。
-3. 空批衔接:正常情况"批空 <=> 无在途请求"(含义见 3.4),返回 false 挂起等待即可。
-   风险在反常情况:在途请求非空却产出空批,属 `check_deadlock`/`check_livelock`
-   两道检测缝隙里的理论残留(实现 bug、边界竞争)。此时 `update()` 因在途非空返回
-   true,循环立即重投递再调 `update()` 又得空批,形成无 sleep 的忙轮询(烧满一核但
-   不做任何 decode)。兜底:连续 N 次空批且在途非空时记告警,必要时把受影响请求按
-   错误收尾。
-4. `on_finish` 依赖:`prepare_batch` 返回 false(死锁)后回调不再触发,必须走强制
-   释放兜底(见 3.4);另一路径是库层提供显式 reap,作为备选。
-5. hybrid 模型 checkpoint 保留段使可用 slot 数少于 `n_parallel`,启动校验需以 L2
-   的返回值为准裁剪槽池。
-6. `n_ctx` 语义变化(总预算 -> 单请求上限):`--kv-unified-per-slot` 等参数互斥报错,
-   文档明确说明;上下文满即结束(无 ctx_shift),依赖超长上下文的客户端会观察到行为差异。
-7. 空 prompt / `n_predict == 0` / 请求 id 复用窗口(停止到 on_finish 之间)等边界,
-   已在 3.4 设计,实现时需要专项用例覆盖。
-8. 默认路径回归面:S4 虽小,但 `process_single_task` 分支重构影响所有任务类型,
-   S2 的纯移动需要全量 server 测试佐证(见 9)。
+1. prefill 独占步:长 prompt 分块期间,在跑请求的 decode 被推迟,TPOT 出现毛刺;每步 token 数受 `n_batch` 预算约束,毛刺上界可控,但与默认路径 join-batching的行为差异需要在验收时量化(`scripts/perf-paged-vs-unified.py` 可复用)。
+2. 抢占/重算毛刺:KV 块满时换出或重算带来尾延迟;`--kv-paged-watermark`(默认 0.05)与 CPU 块数是主要调参项。
+3. 空批衔接:正常情况"批空 <=> 无在途请求"(含义见 3.4),无在途时挂起等待即可。风险在反常情况:在途请求非空却产出空批,属 `check_deadlock`/`check_livelock`两道检测缝隙里的理论残留(实现 bug、边界竞争)。此时在途非空使循环重投递,再调 `update()` 又得空批,形成无 sleep 的忙轮询(烧满一核但不做任何 decode)。兜底:连续 64 步空批且在途非空时把受影响请求按错误收尾。
+4. `on_finish` 依赖:`prepare_batch` 返回 false(死锁)后回调不再触发,必须走强制释放兜底(见 3.4);另一路径是库层提供显式 reap,作为备选。
+5. hybrid 模型 checkpoint 保留段使可用 slot 数少于 `n_parallel`,启动校验需以 `llama_paged_scheduler_max_request_id` 的返回值为准裁剪槽池。
+6. `n_ctx` 语义变化(总预算 -> 单请求上限):`--kv-unified-per-slot` 等参数互斥报错,文档明确说明;上下文满即结束(无 ctx_shift),依赖超长上下文的客户端会观察到行为差异。
+7. 空 prompt / `n_predict == 0` / 请求 id 复用窗口(停止到 on_finish 之间)等边界,已在 3.4 设计,实现时需要专项用例覆盖。
+8. 默认路径回归面:`process_single_task` 的路由分支重构影响所有任务类型,`server_slot`/`server_batch` 的纯移动需要全量 server 测试佐证;已回归通过(见 9.6)。
 
-## 9. 验证计划
-
-- 库层:复用 `tests/test-paged-kv.cpp` / `test-paged-kv-e2e.cpp`,L1 落地时补 cancel
-  用例;不新增测试文件(遵循仓库贡献约定)。
-- 默认路径回归:S2/S4 合入后跑现有 server 全量测试,确认行为不变。
-- server 手测清单(`--kv-paged`):
-  - `/completion` 非流式 + 流式 SSE;`/v1/completions`;
-  - 采样参数(smoothing/temperature/penalties)、stop 串、antiprompt、`n_predict`、EOG;
-  - 并发压到 2x 槽位:超额排队与释放后续跑;
-  - 取消:流式中断(client disconnect)与 CANCEL 任务,确认槽位与 KV 块回收
-    (`/metrics` 的 `n_cache_tokens` 类指标);
-  - 前缀缓存命中:相同前缀二次请求 TTFT 下降;
-  - 降级端点逐一确认返回明确错误;
-  - 启动校验:`-b != -ub`、多卡分布、`--kv-paged` 与 `--kv-unified` 互斥、
-    hybrid 保留段等组合的报错信息。
-- 性能:复用 `scripts/perf-paged-vs-unified.py` 思路,补 server 场景
-  (并发 10 请求,对比 default 与 paged 的 TTFT/TPOT)。
-
-## 10. 实施记录(第一阶段)
+## 8. 实施记录(第一阶段)
 
 实际改动(`git diff`,不含设计文档与 README 表格微调):
 
@@ -509,16 +384,16 @@ server 层合计:新增约 975-1300 行(其中 S2 为 ~500 行纯移动,新逻�
 | llama | `common/arg.cpp` | paged 参数解封 LLAMA_EXAMPLE_SERVER |
 | llama | `tests/test-paged-kv-e2e.cpp` | +109:cancel 用例(waiting/running 取消、未知 id、id 复用、max_request_id) |
 | server | `tools/server/server-slot.h`(新) | 648 行纯移动(slot_state + server_batch + server_slot) |
-| server | `tools/server/server-scheduler.h`(新) | 79 行:宿主接口 + 调度器接口 + 工厂声明 |
+| server | `tools/server/server-scheduler.h`(新) | 79 行:port 接口(server_context_port)+ 调度器接口 + 工厂声明 |
 | server | `tools/server/server-scheduler-paged.{h,cpp}`(新) | 415 行:launch/cancel/update/init/on_finish/错误路径/指标 |
-| server | `tools/server/server-context.cpp` | +113 / -641(删除部分为纯移动):启动门禁、任务路由、宿主实现块、warmup 跳过 |
+| server | `tools/server/server-context.cpp` | +113 / -641(删除部分为纯移动):启动门禁、任务路由、port 实现块、warmup 跳过 |
 | server | `tools/server/CMakeLists.txt`、`README.md` | 构建列表、参数表与 Paged KV cache 章节 |
 
-与设计文档的偏差(均为实现期确认后的改进):
+与最初草案的偏差(实现期确认后已并入上文设计,此处留档):
 
 1. `server_batch` 随 `server_slot` 一并移入 `server-slot.h`:`handle_last_sampled_token(server_batch&)` 依赖完整定义,不移动则纯移动不成立;仍为零语义变化。
 2. 未引入 `server_scheduler_default` 适配器:默认路径的推理任务分支含 `n_cmpl>1` 父子槽与 `cache_idle_slots` 保存逻辑,搬进适配器会放大回归面,与"默认路径零行为变化"冲突。改为 `process_single_task` 内一个 `if (scheduler)` 分支,默认路径原样保留;接口与工厂仅服务 paged 路径。
-3. 宿主访问采用 `server_scheduler_host` 抽象基类(impl 继承实现),替代文中"内部访问头或 friend";原有同名方法(process_token/send_*/metrics_*)直接满足接口。
+3. 调度器对 impl 的访问采用 `server_context_port` 抽象基类(impl 继承实现,类名描述 impl 扮演的角色:server_context 上暴露服务的 port),替代文中"内部访问头或 friend";原有同名方法(process_token/send_*/metrics_*)直接满足接口。
 4. `update()` 返回 void:实际队列循环的保活机制是重投递 NEXT_RESPONSE(默认路径同款),接口返回"是否在途"无处消费;空批 + 在途非空的忙轮询用"连续 64 步兜底报错"实现。
 5. cancel 对三种状态(waiting/running/swapped)一律同步回收:`free_blocks` 同时释放 GPU 与 CPU 池块,换出中的请求无需先 swap-in,彻底消除"悬挂请求";`finish()` 触发 on_finish,时序与文中一致。
 6. `queue_request` 增加重复 request_id 拒绝(槽位复用窗口与 cancel 幂等性依赖它干净失败)。
@@ -526,101 +401,17 @@ server 层合计:新增约 975-1300 行(其中 S2 为 ~500 行纯移动,新逻�
 8. L4 无需改码:`fit_params` 默认开启,`common_init_from_params` 已对 kv_paged 自动适配块数。
 9. paged warmup 失败降级为告警(默认 warmup 失败同样非致命)。
 
-## 11. 调试与验收记录:310P + CANN 9.1.0
-
-运行时功能验收只在 310P 上进行。910B 的 ATB PagedAttention 内核适配(NZ cache 维度解释
-不同)是独立的内核层工作,不在本特性范围内。
-
-### 11.1 环境与构建
-
-- Atlas 300I Pro(310P3)单卡(`ASCEND_RT_VISIBLE_DEVICES=1`),CANN 9.1.0,GCC 11.4,
-  aarch64 容器 `quay.io/ascend/vllm-ascend:v0.23.0-310p`;代码 `27e9d15e1`(phase 2);
-- `-DGGML_CANN=ON -DCMAKE_BUILD_TYPE=Release` 下 llama-server 与 test-paged-kv-e2e 构建
-  通过;server 侧功能测试复用 pytest 基础设施(`tools/server/tests`);
-- 模型 Qwen3-1.7B F16 GGUF(head_dim=128,满足 310P 约束),由本地 safetensors 经
-  `convert_hf_to_gguf.py` 转换;
-- 服务命令:`llama-server -m <model> --kv-paged --cache-ram 0 -b 2048 -ub 2048 -ngl 99
-  -c 4096 -np 4`。注意 `--cache-ram` 默认 8192M 会被门禁拒绝,须显式置 0。
-
-构建期修复(上游 bug):`ggml-cann.cpp` 的 `transform_kq` 定义在 `#ifdef ASCEND_310P` 内
-而调用点未加保护,已按文件既有模式把 `if (is_kq)` 块包进同一宏。
-
-### 11.2 验收结果(2026-10-26)
-
-| 组 | 项目 | 结果 |
-|---|---|---|
-| 阶段一 | /completion 非流式 + 流式 SSE、/v1/completions、stop 串、n_predict、EOG、采样参数、温度 0 确定性 | 全部通过 |
-| 阶段一 | 并发 8 请求 / 4 槽:超额排队与释放续跑 | 通过 |
-| 阶段一 | 块级前缀缓存:451 token 前缀二次请求 cache_n=448,prompt 时延 195.9ms -> 51.7ms | 通过 |
-| 阶段一 | 客户端断连取消:槽位与 KV 回收,后续请求正常 | 通过 |
-| 阶段一 | /metrics(需 `--metrics`)、/props、/tokenize、/slots | 通过 |
-| 阶段二 | /v1/chat/completions 非流式 + 流式(reasoning_content) | 通过 |
-| 阶段二 | 工具调用:get_weather({"city": "Paris"}),finish_reason=tool_calls | 通过 |
-| 阶段二 | n_cmpl>1:n=2 返回 2 choices | 通过 |
-| 阶段二 | json_schema 严格约束输出 | 通过 |
-| 阶段二 | 投机推理:启动放行,运行时输出错误 | 未通过,见 11.3 缺陷 2 |
-| 门禁 | -b != -ub 报错;--kv-paged + --kv-unified 告警关闭;双卡报错附修复建议;--embeddings / --reranking / --cache-ram 启动报错;--cache-reuse 告警关闭;/infill 请求期 501;embeddings / rerank 端点 501;图像输入明确报错 | 全部符合设计 |
-| 对比 | 同 prompt 贪婪 16 token,paged 与 default 逐字一致 | 通过 |
-
-### 11.3 缺陷与修复
-
-1. (已修复,server +1 行)`--kv-paged` + 投机推理启动崩溃:draft ctx 继承
-   `kv_paged=true`,load_model 对 ctx_dft 的探测式 `common_context_can_seq_rm` 在无路由
-   元数据的 paged ctx 上触发 `llama-kv-cache-paged.cpp:375` 断言(目标 ctx 在
-   server-context.cpp 已有同款特判,draft 漏了)。修复:`params_dft.kv_paged = false`,
-   对齐 12.3"draft 保持经典 KV"。
-2. (已修复 4 处)投机推理在 paged 路径的账本缺陷:update post 循环的 verify 门位于
-   sample_now 判断之后,verify 批(len = 1 + n_draft)被当作 prefill 中途块跳过,
-   verify_slot 不可达;attach 重复推入 pending token(plain 路径已推);truncate 在
-   调度器 update 之前执行,被 "cannot truncate" 静默拒绝;truncate 的 n_keep_blocks
-   向下取整,把承载有效 KV 的部分块整个释放,块表轮换后旧位置全部读空。修复后
-   paged+spec 全深度贪婪等价:n_max 2/3/4/6/8 的 128 token 输出与无投机基线逐 token
-   一致(2026-10-28 复测);此前深度 >= 3 观察到的毒化系上述缺陷所致,见 11.4。
-3. (已澄清)test-paged-kv-e2e 曾在 310P 失败:CANN paged 图必须先经
-   `llama_paged_scheduler_warmup` 预热,否则 decode 步采样到陈旧 logits(server 有预热
-   而 e2e 没有)。已在 e2e 补预热;残余 token 级漂移属在线/两遍 softmax 的 F16 数值差,
-   同 prompt 下 server paged 与 default 逐字一致,top-5 重合 5/5。
-4. (已修复,server +5/-3 行)`--mmproj` 进程退出时 CANN abort(`rtFree invalid
-   value` + `ctx is NULL`):`destroy()` 先 `llama_init.reset()` 释放主 backend
-   并 `aclrtResetDevice` 销毁设备上下文,其后的 `mtmd_free` 在上下文销毁后释放
-   clip 的 CANN 缓冲。310P 实测修复前 paged+mmproj 8/8 次退出 abort(default 路径
-   同序但 8/8 干净),启动阶段两路径 8/8 均正常,即问题仅在进程退出阶段出现。修复将
-   `mtmd_free` 前移至 `destroy()` 开头(设备上下文存活时释放);修复后 paged 与
-   default 各 8/8 启停无 abort,mm 请求 sanity 与 13 用例回归(--noconftest 串行)通过。
-
-观察:`t_max_predict_ms` 在 default 与 paged 路径均未按预期截断(fork 级问题,非 paged
-回归)。
-
-### 11.4 遗留项
-
-- ATB SF op(CALC_TYPE_SPEC)排查记录:深度 >= 3 的毒化曾疑其多行写路径问题,排查已
-  排除调度器/服务端账本、ReshapeCache 跨块写入、ACL graph;独立探针(atb_probe.cpp)
-  在共享多租户设备上算子静默无效;vllm-ascend 310P 投机(torch_npu
-  rejection_sampler.py + attention_v1.py)掩码/布局语义逐项比对一致。缺陷 2 修复后
-  毒化消失,该怀疑解除;若更换内核或驱动后再现,循 server 进程内探针 + 向华为获取
-  CALC_TYPE_SPEC 张量契约重查;
-- e2e 的 N_COMPARE=4 等价窗口是否按平台/模型放宽,由 owner 决定;
-- 910B 内核适配若立项,另开文档。
-
-## 12. 第二阶段设计:四个明确支持的特性
+## 9. 第二阶段设计:四个明确支持的特性
 
 范围:a) 投机推理、b) 多模态、c) `n_cmpl > 1` 并行采样、d) `/v1/chat/completions`。
 共性前提:默认路径行为不变;所有扩展只作用于 `--kv-paged` 分支;运行时验收以 310P
-为准(见第 11 节)。
+为准。
 
-### 12.0 前置小修与统一反馈契约
+### 9.0 前置小修与统一反馈契约
 
-**P0,必须先做**:phase-1 的 paged launch 未检查 `task.tokens.has_mtmd`,多模态请求会被
-`get_text_tokens()` 静默丢掉媒体内容,位置在 `server-scheduler-paged.cpp:124`。补一道闸,
-使媒体请求在 b) 落地前明确返回未支持错误。约 10 行。
+**P0(过渡闸,已随 9.4 移除)**:phase-1 的 paged launch 未检查 `task.tokens.has_mtmd`,多模态请求会被`get_text_tokens()` 静默丢掉媒体内容,位置在 `server-scheduler-paged.cpp:124`。在 b) 落地前补一道闸,使媒体请求明确返回未支持错误;9.4 分段启动落地后,该闸随 `has_mtmd` 分流一并移除。过渡期一个版本,无残留逻辑。
 
-**统一反馈契约,一次设计到位**:由于 c) 需要 fork 出的子请求的批外反馈,a) 需要投机验证
-一次接受多个 token 的每 seq 变长 token 列表,直接将 `llama_paged_scheduler_update` 的
-签名改为 feedback 数组形式,不引入 `_v2` 新符号。理由:该 API 的调用方全部在树内且仅
-4 处,即 examples/paged、tests/test-paged-kv-e2e、shim 内 warmup、server-scheduler-paged,
-一次机械迁移即可;本 fork 新增 API 无外部消费者;llama.cpp 惯例是原位演进 C API 签名,
-`_ext` 类后缀仅在两种能力需长期并存时使用,而新形式是严格超集,旧语义等价于每项
-n_tokens = 1,无并存价值:
+**统一反馈契约,一次设计到位**:由于 c) 需要 fork 出的子请求的批外反馈,a) 需要投机验证一次接受多个 token 的每 seq 变长 token 列表,直接将 `llama_paged_scheduler_update` 的签名改为 feedback 数组形式,不引入 `_v2` 新符号。理由:该 API 的调用方全部在树内且仅4 处,即 examples/paged、tests/test-paged-kv-e2e、shim 内 warmup、server-scheduler-paged,一次机械迁移即可;本 fork 新增 API 无外部消费者;llama.cpp 惯例是原位演进 C API 签名,`_ext` 类后缀仅在两种能力需长期并存时使用,而新形式是严格超集,旧语义等价于每项n_tokens = 1,无并存价值:
 
 ```c
 struct llama_paged_feedback {
@@ -642,7 +433,7 @@ LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler * sched
 fork 子请求只做 token 追加与状态推进。4 处旧调用点原为两个并行数组的用法,随签名一并
 迁移,各约 5-10 行,计入 c) 的工作量。
 
-### 12.1 d) /v1/chat/completions,含工具调用
+### 9.1 d) /v1/chat/completions,含工具调用
 
 **结论:调度器层零结构改动,纯放闸 + 验收。**
 
@@ -665,7 +456,7 @@ fork 子请求只做 token 追加与状态推进。4 处旧调用点原为两个
 风险:低。验收矩阵:chat 流式与非流式、工具调用含流式 tool_call 增量、reasoning 解析、
 `logprobs`,以及 grammar 与 n_predict/stop 的组合。llama 层 0 行,server 层约 15-25 行。
 
-### 12.2 c) `n_cmpl > 1` 并行采样
+### 9.2 c) `n_cmpl > 1` 并行采样
 
 默认路径:父槽加 N-1 个子槽,由 `add_child` 派生并递增种子;子槽处于 WAIT_OTHER 状态等待
 父槽 DONE_PROMPT,`decode()` 内 `copy_state_to` 通过 `mem.seq_cp` 整段复制父 prompt KV,
@@ -682,37 +473,11 @@ LLAMA_API bool llama_paged_scheduler_fork_request(struct llama_paged_scheduler *
                                                    int32_t src_id, int32_t dst_id);
 ```
 
-- 实现要点:校验 src 已完成 prefill;复制 group,包括 `block_table` 引用与
-  `add_ref_blocks`、`logical_seq` 截到 `n_prompt_total`、`n_past` 继承、`n_decoded = 0`,
-  状态置 RUNNING 并按到达时间插入 running 列表;hybrid 模型补
-  `hybrid_memory_manager->seq_cp`,与 GDN checkpoint fork 同机制,
-  `llama-paged-scheduler-impl.cpp:215` 已有先例;重复 id 复用 `queue_request` 的拒绝逻辑;
-- 尾块处理:若 `n_past` 不在块边界上,部分填充的尾块是多写者冲突点,因为父请求与全部
-  子请求的下一个 decode 都要往该尾块的同一位置写入各自的 token。处理方式为**整块共享 +
-  尾块急拷贝**:满块按引用共享,部分填充的尾块为每个子序列即时复制一份,父请求保留原尾块
-  所有权;需要在 `llama_kv_cache_paged` 增加块内容拷贝入口,复用 swap 路径 `do_block_copy`
-  的设备内拷贝,每个子请求只多一次单块拷贝。不选 vLLM 式 copy-on-write,因为调度器没有
-  懒拷贝基础设施;也不选把 `n_past` 回退到块边界让子请求重 prefill 尾部,因为那会推迟
-  同批首 token 采样;
-- 子请求首 token:fork 发生在父槽 final_prefill 的同一 `update()` 迭代内,采样前 logits
-  仍在 ctx 缓冲,所以子槽直接用父槽的末行下标采样,即
-  `common_sampler_sample(child.smpl, ctx, tok_idx)`,经 `process_token` 后以批外 feedback
-  回填。语义等价于默认路径的 `i_batch` 继承。
+- 实现要点:校验 src 已完成 prefill;复制 group,包括 `block_table` 引用与`add_ref_blocks`、`logical_seq` 截到 `n_prompt_total`、`n_past` 继承、`n_decoded = 0`,状态置 RUNNING 并按到达时间插入 running 列表;hybrid 模型补`hybrid_memory_manager->seq_cp`,与 GDN checkpoint fork 同机制,`llama-paged-scheduler-impl.cpp:215` 已有先例;重复 id 复用 `queue_request` 的拒绝逻辑;
+- 尾块处理:若 `n_past` 不在块边界上,部分填充的尾块是多写者冲突点,因为父请求与全部子请求的下一个 decode 都要往该尾块的同一位置写入各自的 token。处理方式为**整块共享 +尾块急拷贝**:满块按引用共享,部分填充的尾块为每个子序列即时复制一份,父请求保留原尾块所有权;需要在 `llama_kv_cache_paged` 增加块内容拷贝入口,复用 swap 路径 `do_block_copy`的设备内拷贝,每个子请求只多一次单块拷贝。不选 vLLM 式 copy-on-write,因为调度器没有懒拷贝基础设施;也不选把 `n_past` 回退到块边界让子请求重 prefill 尾部,因为那会推迟同批首 token 采样;
+- 子请求首 token:fork 发生在父槽 final_prefill 的同一 `update()` 迭代内,采样前 logits仍在 ctx 缓冲,所以子槽直接用父槽的末行下标采样,即`common_sampler_sample(child.smpl, ctx, tok_idx)`,经 `process_token` 后以批外 feedback回填。语义等价于默认路径的 `i_batch` 继承。
 
-| 层 | 位置 | 内容 | 行数 |
-|---|---|---|---|
-| llama | `-impl.{h,cpp}` + shim + `llama.h` | `fork_request`,含 `llama_kv_cache_paged` 的块拷贝入口 | ~125-175 |
-| llama | 同上 | 批外反馈路径,与 12.0 共享 | ~60-80 |
-| server | `server-scheduler-paged.cpp` | launch:父任务需同时容纳全部子槽,空闲槽不足则整体 defer,对齐 `launch_slots_with_parent_task`;子槽 WAIT_OTHER 且不 `add_request` | ~80-110 |
-| server | 同上 | update:父 final_prefill 时 fork + 子槽同批首采样 + stats/prompt 继承 + 批外 feedback | ~90-130 |
-| server | 同上 | 释放与取消路径,子槽 finish 时块引用自然减引用;门禁移除 | ~30-40 |
-
-合计约 385-535 行。风险:中。hybrid GDN fork 的 recurrent seq_cp 有现成机制;子槽首 token
-依赖 logits 在同迭代内有效,该前提成立,因为下一次 decode 才会覆盖 logits;尾块急拷贝走
-设备内单块复制,与 swap 同路径;finish 时父与子的尾块各自独立释放,无引用纠缠;n_parallel
-需大于等于 n_cmpl,与默认路径一致,schema 层已限制。
-
-### 12.3 a) 投机推理
+### 9.3 a) 投机推理
 
 默认路径结构:draft 是独立 context,使用经典 KV,与 paged 目标正交;`common_speculative_draft`
 产 draft,验证批含已采样 token 加 draft 且每行都要 logits,由 `handle_last_sampled_token`
@@ -737,40 +502,14 @@ LLAMA_API bool llama_paged_scheduler_truncate(struct llama_paged_scheduler * sch
                                                int32_t request_id, int32_t n_past_new);
 ```
 
-- `attach_draft`:draft 暂存于 group,`populate_batch_from` 对该 seq 产出 `1 + n_draft` 行,
-  块预算按 `allocate(n_draft + 1)` 预留,`batch.logits` 全 1,行位置为 `n_past + i`;行下标
-  由 `batch_info` 的 offsets/lens 推导,等价默认路径的 `spec_i_batch`;
-- 验证与回滚,在 server 侧 `update()` 内:先以 `common_sampler_clone` 备份,再用
-  `sample_and_accept_n` 验证;`n_rollback > 0` 时执行
-  `truncate(sched, id, n_past_before + accepted.size())`,并以 `common_sampler_copy` 恢复
-  采样器、`prompt.tokens.keep_first` 收缩 prompt。由于 paged 支持位置级 seq_rm 加块收缩,
-  无需 checkpoint,对齐默认路径 PART 分支;最后 update 反馈携带 accepted 列表;
-- `update()` 内 draft 生成:上一轮采样后,按 `get_n_draft_max` 与 `spec_draft` 是否为空
-  组装 `common_speculative_get_draft_params`,并经 host yield 钩子调
-  `common_speculative_draft`;draft ctx 解码期间让 queue 保持响应,对齐默认路径
-  `yield_to_queue`;
-- `common_speculative_process(spec, batch)`:直接喂 paged 产出的验证批,seq_id 即槽位 id,
-  与 draft ctx 的 n_seq_max 约定一致,无需改动;
-- `common_context_can_seq_rm` 特判:由于探测式分类会对 paged ctx 断言失败,探测 decode 缺
-  `set_paged_batch_info`,在 `common.cpp` 对 `kv_paged` 直接返回
-  `COMMON_CONTEXT_SEQ_RM_TYPE_PART`;paged 支持范围 seq_rm,走最简单的无 checkpoint 回滚;
-- 统计:`n_accepted_per_pos`、`spec_is_replay` 与 draft 计数全部沿用槽位字段,与默认路径
-  同构。
+- `attach_draft`:draft 暂存于 group,`populate_batch_from` 对该 seq 产出 `1 + n_draft` 行,块预算按 `allocate(n_draft + 1)` 预留,`batch.logits` 全 1,行位置为 `n_past + i`;行下标由 `batch_info` 的 offsets/lens 推导,等价默认路径的 `spec_i_batch`;
+- 验证与回滚,在 server 侧 `update()` 内:先以 `common_sampler_clone` 备份,再用`sample_and_accept_n` 验证;`n_rollback > 0` 时执行`truncate(sched, id, n_past_before + accepted.size())`,并以 `common_sampler_copy` 恢复采样器、`prompt.tokens.keep_first` 收缩 prompt。由于 paged 支持位置级 seq_rm 加块收缩,无需 checkpoint,对齐默认路径 PART 分支;最后 update 反馈携带 accepted 列表;
+- `update()` 内 draft 生成:上一轮采样后,按 `get_n_draft_max` 与 `spec_draft` 是否为空组装 `common_speculative_get_draft_params`,并经 port 的 yield 钩子调`common_speculative_draft`;draft ctx 解码期间让 queue 保持响应,对齐默认路径`yield_to_queue`;
+- `common_speculative_process(spec, batch)`:直接喂 paged 产出的验证批,seq_id 即槽位 id,与 draft ctx 的 n_seq_max 约定一致,无需改动;
+- `common_context_can_seq_rm` 特判:由于探测式分类会对 paged ctx 断言失败,探测 decode 缺`set_paged_batch_info`,在 `common.cpp` 对 `kv_paged` 直接返回`COMMON_CONTEXT_SEQ_RM_TYPE_PART`;paged 支持范围 seq_rm,走最简单的无 checkpoint 回滚;
+- 统计:`n_accepted_per_pos`、`spec_is_replay` 与 draft 计数全部沿用槽位字段,与默认路径同构。
 
-| 层 | 内容 | 行数 |
-|---|---|---|
-| llama | `attach_draft` + populate 草稿行/全行 logits/块预算 | ~150-200 |
-| llama | update 变长反馈语义,与 12.0 共享,含隐式回滚 | ~100-140 |
-| llama | `truncate`:位置级 seq_rm + 块表收缩释放,需对齐块边界 | ~80-110 |
-| llama | `can_seq_rm` paged 特判 | ~20-30 |
-| server | 启动门禁放开,spec 加 kv_paged 允许;draft ctx 强制非 paged;n_outputs 预算沿用 `server_output_limits` | ~40-60 |
-| server | update:draft 生成与 yield、验证、部分接受回滚、replay、逐位置统计 | ~250-350 |
-
-合计约 600-890 行,四项中复杂度最高。风险:update 契约重构依赖 12.0 先行;块部分释放需
-对齐 block_size 边界;`spec_is_replay` 语义迁移;draft ctx 与 paged 目标的流同步。
-spec 加多模态的组合第一版禁用,默认路径支持,paged 侧两个特性都落地后再开。
-
-### 12.4 b) 多模态:prefill 中途编码,对齐默认路径
+### 9.4 b) 多模态:prefill 中途编码,对齐默认路径
 
 默认路径:媒体块在 `server_tokens` 里是 `LLAMA_TOKEN_NULL` 哨兵行,index 与 position 不
 相等,`n_tokens != n_pos`;prefill 遇哨兵即暂停 token 装批,经 `process_mtmd_chunk` 编码
@@ -806,7 +545,10 @@ pre_decode 装批 -> decode -> post_decode 采样;paged 路径进入
 内部:装批归属不同,默认路径由 server 构建 `server_batch`,paged 路径由调度器
 prepare_batch 构建、server 不接触批内容;媒体编码时点基本等价,两条路径的编码都落在
 迭代 A 的 decode 与迭代 B 的 decode 之间,默认路径发生在 B 的 pre_decode 开头,paged
-路径发生在 A 的迭代尾部,墙钟顺序几乎相同;真正多付的一个调度步来自媒体行的解码方式:
+路径发生在 B 的 update() 开头(prepare_batch 之前),同为两轮 decode 之间的同一段
+墙钟;机制差异在于默认路径经 yield_to_queue 在装批内部插入媒体处理,paged 在 update
+入口轮询 seq_state.paused 后直接内联编码,媒体 decode 与调度步同线程,少一次线程
+交接。真正多付的一个调度步来自媒体行的解码方式:
 默认路径的媒体行由 helper 在 B 的 pre_decode 内私有 `llama_decode` 写 KV,不占共享批,
 B 的共享 decode 直接装 text2,请求两轮迭代走完 prefill;paged 路径的媒体行必须作为
 纯 embd 切片经 prepare_batch 进共享 decode,而文本行与 embd 行不能混批,embd 切片
@@ -838,25 +580,27 @@ queue 循环迭代 B -> on_update_slots -> update_slots
   +-- post_decode: 末行 logits -> 采样
 ```
 
-paged 方案:分段入队加外部暂停态。请求以分段骨架入队,媒体段先声明规模,编码前
-`n_tokens/n_pos` 已知,编码数据后补;调度器把 embd 行当普通逻辑行调度,批构建时产出纯
+paged 方案:分段入队加外部暂停态。请求以分段骨架入队,媒体段先声明行数,编码前
+`n_tokens` 已知,编码数据后补;调度器把 embd 行当普通逻辑行调度,批构建时产出纯
 embd 切片:
 
 ```c
 struct llama_paged_segment {
-    const llama_token * tokens;  // text segment: n_tokens ids
-    const float *       embd;    // media segment: n_tokens rows x n_embd; NULL = pending
-    int32_t             n_tokens;
-    int32_t             n_pos;   // positions spanned; 0 = same as n_tokens (text)
+    const llama_token * tokens;      // text segment rows; NULL for media
+    const float *       embd;        // media segment rows [n_tokens x embd_stride]; NULL = pending encode
+    int32_t             n_tokens;    // rows in this segment
+    int32_t             embd_stride; // media: floats per embd row (n_embd_inp); 0 for text
+    const llama_pos *   pos;         // media mrope positions [n_tokens x 4] row-major; NULL for text
 };
 
 // media segments may pass embd = NULL (declared size only): the request pauses
 // at that boundary until append_segment supplies the encoder output
-LLAMA_API bool llama_paged_scheduler_add_request_segs(struct llama_paged_scheduler * sched,
+LLAMA_API bool llama_paged_scheduler_add_request_segs(struct llama_paged_scheduler *      sched,
                                                        const struct llama_paged_segment * segs,
-                                                       int32_t n_segs, int32_t request_id);
-LLAMA_API bool llama_paged_scheduler_append_segment(struct llama_paged_scheduler * sched,
-                                                     int32_t request_id,
+                                                       int32_t                             n_segs,
+                                                       int32_t                             request_id);
+LLAMA_API bool llama_paged_scheduler_append_segment(struct llama_paged_scheduler *      sched,
+                                                     int32_t                             request_id,
                                                      const struct llama_paged_segment * seg);
 ```
 
@@ -866,8 +610,11 @@ paged 路径流程,同一 [text1][img][text2] 请求,与默认路径逐迭代对
 launch
   -> add_request_segs
        text1 段:tokens 实数据
-       img 段:  embd = NULL,仅声明 n_tokens/n_pos          pending 声明
+       img 段:  embd = NULL,仅声明 n_tokens              pending 声明
        text2 段:tokens 实数据
+  -> start_mm_prefetch: worker 线程预取首个媒体 chunk 的
+       clip 编码,与调度步重叠(mm_encode_mutex 串行化
+       共享 mmproj 上的编码;失败由消费方回退内联编码)
 
 queue 循环迭代 A -> on_update_slots -> server_scheduler_paged::update
   +-- prepare_batch: 装批,调度器拥有批构建
@@ -877,11 +624,14 @@ queue 循环迭代 A -> on_update_slots -> server_scheduler_paged::update
   |       其余请求照常组批,互不阻塞
   +-- decode: llama_decode(本批切片)                     text1 段行
   +-- 采样/反馈: text1 为中途 prefill 块,无 logits、无反馈
-  +-- 迭代尾部: server 查 seq_state,发现该请求 PAUSED_EXTERNAL
-        经 host yield 钩子编码:mtmd_batch_encode -> mtmd_batch_get_output_embd
-        append_segment(id, embd):拷入调度器自有缓冲,请求回 RUNNING
 
 queue 循环迭代 B -> on_update_slots -> update
+  +-- update 开头: 轮询 seq_state 发现该请求 paused
+  |     join 预取 worker(通常已编完)或内联编码:
+  |       mtmd_batch_encode -> mtmd_batch_get_output_embd
+  |     append_segment(id, embd):embd 为借用指针,
+  |       由槽持有的 mbatch 保活,请求回 RUNNING
+  |     再启动下一个媒体 chunk 的预取 worker
   +-- prepare_batch: 为 img 段产出纯 embd 切片
   |     batch.token = NULL,batch.embd 指向段缓冲
   |     write_slots 按每行位置数组路由,KV 写入块池
@@ -899,10 +649,11 @@ queue 循环迭代 C -> on_update_slots -> update
 - 计算量不变:目标模型的 decode 调用两边都是三次(text1、embd 行、text2),KV 计算与
   写入完全相同,多的只是循环边界的组织方式;
 - 单请求场景:额外开销仅为一轮循环边界的主机侧工作(prepare_batch 调度与反馈记账,
-  亚毫秒级),相对图片编码的几十到几百毫秒可忽略;
+  亚毫秒级),相对图片编码的几十到几百毫秒可忽略;且编码由预取 worker 与调度步重叠
+  (launch 即开编),通常不在关键路径,内联编码仅作回退;
 - 编码批处理两路径等价:mtmd_batch_encode 在 vision 上下文执行,默认路径会把同请求
-  后续图片贪婪攒入一个 encoder 批;paged 的迭代尾部编码复用同一逻辑,同样可一次编完
-  该请求全部 pending 媒体段,编码次数与耗时相同,与节拍延迟无关;
+  后续图片贪婪攒入一个 encoder 批;paged 的 update() 开头编码复用同一逻辑,同样可
+  一次编完该请求全部 pending 媒体段,编码次数与耗时相同,与节拍延迟无关;
 - 并发场景:循环节拍由在跑 decode 的批决定,媒体请求的 TTFT 约延后一个节拍,即系统
   当前 TPOT,典型 10-50ms 量级;相对编码与 prefill 总耗时通常为个位数百分比;
 - "n 张图累积 n 个节拍"仅指**单请求、n 张图被文本隔开**的场景(如
@@ -928,82 +679,160 @@ queue 循环迭代 C -> on_update_slots -> update
   混合 ubatch,第一版不做。
 
 - 序列模型:`llama_sequence_group` 增加分段描述与每行位置数组,打破现有"序号等于位置"的
-  假设,`pos = n_past + token_idx` 改为查表;`write_slots` 按位置算块,天然兼容;
+  假设,`pos = n_past + token_idx` 改为查表;`write_slots` 按位置算块,天然兼容;媒体行
+  携带 [t][y][x][z] 的 mrope 位置数组——M-RoPE 模型正是多模态主力,直接支持而非按架构
+  闸掉(多序列并发曾出批位置错乱,已修复,见 9.6 第 8 条);媒体组(has_media)不参与
+  前缀缓存与重算:媒体行无 token id(逻辑序以 LLAMA_TOKEN_NULL 占位),块哈希链与
+  重算均以 token id 为前提,抢占只能换出;
 - PAUSED_EXTERNAL 调度态:到达 pending 段边界即暂停,不进候选、不计入死锁/活锁检测,
-  `check_deadlock` 分母排除;`append_segment` 供给 embd 后回到 WAITING/RUNNING,embd 拷入
-  调度器自有缓冲以规避 mbatch 生命周期;`llama_paged_seq_state` 增加状态枚举供 server
-  检测暂停;
+  `check_deadlock` 分母排除;`append_segment` 供给 embd 后回到 RUNNING。对外经
+  `seq_state.paused` 标志而非并入生命周期枚举:暂停与 WAITING/RUNNING/SWAPPED 正交
+  (等媒体可发生在任一阶段),独立标志避免状态组合枚举膨胀;
+- 缓冲所有权:embd 按借用指针挂段,编码输出由槽持有的 mbatch 保活——段消费必然先于
+  请求 finish/槽释放(update 内编码 -> append -> 后续步消费的顺序保证),借用安全,
+  免一次整段拷贝(典型图 700 行 x 2048 维 float 约 5.7MB);pos 数组每行 4 个
+  llama_pos,体量小,拷贝进段;
 - 批构建:同段同型才可同批,因为文本 token 与 embd 行不混批,`build_inp_embd` 只在
   `ubatch.token == nullptr` 时走 embd 路径;embd 切片中 `batch.token = nullptr`、
   `batch.embd` 指向段缓冲;logits 仍只在最终段末行;
-- server 侧:`update()` 每轮迭代检查暂停请求,经 host yield 钩子编码,mtmd vision 上下文
-  独立,期间其余请求照常跑批,然后 `append_segment` 恢复;`prompt.tokens` 以 placeholder
-  记账,`pos_next()` 仍是位置权威;embedding/rerank 依旧禁用,`need_embd` 与 paged 池化
-  问题相互独立。
+- server 侧:`update()` 开头轮询暂停槽,内联编码(mtmd vision 上下文独立,期间其余
+  请求照常跑批)后 `append_segment` 恢复;launch 与每次 append 后由 worker 线程预取
+  下一个媒体 chunk 的编码,与调度步重叠;媒体请求跳过 spec 起草(b + a 组合不报错,
+  退化为无草稿,见 9.5);`prompt.tokens` 以 placeholder 记账,`pos_next()` 仍是
+  位置权威;embedding/rerank 依旧禁用,`need_embd` 与 paged 池化问题相互独立。
 
-| 层 | 内容 | 行数 |
-|---|---|---|
-| llama | 序列分段模型 + 每行位置数组 | ~120-160 |
-| llama | `add_request_segs` / `append_segment`,含 pending 声明与 embd 缓冲 | ~80-110 |
-| llama | PAUSED_EXTERNAL 状态机 + seq_state 状态枚举 + 死锁排除 | ~60-90 |
-| llama | populate 纯 embd 切片 + 段边界不混批 + logits 规则 | ~120-170 |
-| server | host yield 钩子 | ~15 |
-| server | launch:分段骨架入队,复用 `find_chunk` 遍历 | ~50-70 |
-| server | update:暂停检测 -> 编码 -> 恢复,复用 `process_mtmd_chunk` 编码半段 | ~130-180 |
-| server | placeholder 记账 + 释放路径 | ~60-80 |
-
-合计约 535-875 行,风险最高。风险点:paged 图的 embd 输入分支,`build_inp_embd` 选择逻辑
-内核侧待验证;M-RoPE 每行多位置,第一版可按架构闸掉,仅支持单位置媒体;编码期间调度空转
-的边界,其余请求全部空闲且唯一请求暂停时,update 返回空闲并由编码驱动唤醒。
-
-### 12.5 特性交互与实施顺序
+### 9.5 特性交互与实施顺序
 
 | 组合 | 默认路径 | paged 第二阶段 |
 |---|---|---|
 | d + 任意 | - | 无冲突 |
 | c + a,n_cmpl 加投机 | 支持,fork 不复制 spec 状态,子槽独立起草 | 支持,fork 同理只复制 prompt 段 |
-| b + a,多模态加投机 | 支持 | 第一版禁,因为 draft prompt 的媒体段文本化有问题,后开 |
+| b + a,多模态加投机 | 支持 | 组合放行:媒体请求跳过 spec 起草(spec 退化为无草稿),由此绕开 draft prompt 媒体段文本化问题 |
 | b + c | 支持 | 支持,fork 含媒体段,块引用共享不受段型影响 |
 
 实施顺序:P0 -> d,放闸即刻可用 -> c,fork 基础设施与契约重构 -> a,复用新契约,工作量
-最大 -> b,独立、可与 a 并行开发,运行时验收依赖内核 embd 支持。12.0 的契约重构必须先于
+最大 -> b,独立、可与 a 并行开发,运行时验收依赖内核 embd 支持。9.0 的契约重构必须先于
 c/a 落地。
 
-### 12.6 工作量汇总
+### 9.6 第二阶段实施记录
 
-| 特性 | llama 层 | server 层 | 合计 | 风险 |
-|---|---|---|---|---|
-| P0 + d) chat/工具调用 | 0 | ~25-35 | ~25-35 | 低 |
-| c) n_cmpl>1 | ~185-255 | ~200-280 | ~385-535 | 中 |
-| a) 投机推理 | ~350-480 | ~290-410 | ~600-890 | 高 |
-| b) 多模态 | ~380-530 | ~255-345 | ~535-875 | 最高 |
-| **合计** | **~915-1265** | **~770-1070** | **~1545-2335** | - |
+以下为落地时的关键实现事实;9.0-9.4 正文即最终方案,与实现一致:
 
-验收沿用第 9 节框架,按特性补矩阵:chat 工具调用流式增量、n_cmpl 多路种子一致性,
-与默认路径同 prompt 对比;投机接受率与无投机等价性,top-k 对比复用 `test-paged-kv-e2e`
-思路;多模态图文混合 prompt 与默认路径逐 token 等价。
-
-### 12.7 第二阶段实施记录
-
-范围:P0 + 12.1 + 12.2 + 12.3;12.4 多模态按计划暂缓。
-
-实现与设计偏差:
-
-1. `update` 契约按 12.0 修订原位改签名,4 处树内调用点(examples/paged、e2e 测试两处、
-   shim 内 warmup)随签名迁移。
-2. `can_seq_rm` 的 paged 特判落在 `server-context.cpp` 的 `ctx_tgt_seq_rm_type` 赋值处
-   (以 `params_base.kv_paged` 判 PART),而非 `common.cpp`:common 层只有 C API,看不到
-   cparams,server 侧判断零成本且避免新增公共接口。该特判同时修复了一个 phase-1 隐患:
-   探测式分类会对 paged ctx 断言失败,此前 server 带 `--kv-paged` 启动会在 load 阶段崩溃。
-3. 投机推理走 PART 语义:部分接受经 `prompt.tokens.keep_first + insert` 修复后直接
-   `truncate` 到新的验证末尾,无 checkpoint、无 replay(`spec_is_replay` 恒为 false),
-   与默认路径 PART 分支同构;synthetic acceptance 在 `--kv-paged` 下启动期拒绝。
+1. `update` 契约按 9.0 修订原位改签名,4 处树内调用点(examples/paged、e2e 测试两处、shim 内 warmup)随签名迁移。
+2. `can_seq_rm` 的 paged 特判落在 `server-context.cpp` 的 `ctx_tgt_seq_rm_type` 赋值处(以 `params_base.kv_paged` 判 PART),而非 `common.cpp`:common 层只有 C API,看不到cparams,server 侧判断零成本且避免新增公共接口。该特判同时修复了一个 phase-1 隐患:探测式分类会对 paged ctx 断言失败,此前 server 带 `--kv-paged` 启动会在 load 阶段崩溃。
+3. 投机推理走 PART 语义:部分接受经 `prompt.tokens.keep_first + insert` 修复后直接`truncate` 到新的验证末尾,无 checkpoint、无 replay(`spec_is_replay` 恒为 false),与默认路径 PART 分支同构;synthetic acceptance 在 `--kv-paged` 下启动期拒绝。
 4. 验证采样复用 `common_sampler_sample_and_accept_n`,不在 server 侧重写逐行采样。
-5. fork 的尾块急拷贝:满块 `add_ref_blocks` 引用共享,`n_past % block_size != 0` 时为
-   子请求分配私有块并经新增的 `copy_block_content`(同池直拷/跨池走 `do_block_copy`)
-   复制父尾块;`truncate` 释放块时调用新增的 `prefix_cache.drop_block` 撤销已释放块的
-   前缀缓存登记,避免 LRU 驱逐命中陈旧块号。
+5. fork 的尾块急拷贝:满块 `add_ref_blocks` 引用共享,`n_past % block_size != 0` 时为子请求分配私有块并经新增的 `copy_block_content`(同池直拷/跨池走 `do_block_copy`)复制父尾块;`truncate` 释放块时调用新增的 `prefix_cache.drop_block` 撤销已释放块的前缀缓存登记,避免 LRU 驱逐命中陈旧块号。
+6. 多模态按 9.4 方案落地(正文即实现方案)。实现期附带修复与规避:qwen3vl / qwen3vlmoe 图构建改 `build_attn_inp_kv_auto`(统一缓存的 cpy_k 未接入 paged 分派,此前 paged 路径加载即段错误);llama-kv-cache-paged 的 init_batch 增加分割失败诊断日志;paged 路径跳过 mmproj fit 显存测量,规避 310P CANN buffer 释放缺陷;
+7. 图文 TTFT 优化(`79d9eb6c0`):launch 与每次 append 之后在 worker 线程预取下一个媒体 chunk 的 clip 编码,与调度步重叠;`mm_encode_mutex` 串行化共享 mmproj 上的编码,消费方 join 后复用结果,失败或过期回退内联编码;slot reset 先 join 再释放task;init 时 `mm_warmup` 用合成图预热 clip 图,消除首图请求的首次编译开销。310P 实测(Qwen3-VL-4B F16):首图 TTFT 497ms -> 317ms,热图 392ms -> 312ms,与 default 路径热态差距从 124ms 缩至约 45ms;
+8. M-RoPE 多序列批位置修复(`3121b0ef4`):`populate_batch_from` 对 `n_pos_per_embd > 1`的模型曾按 [section][本序列行数] 平铺覆盖写 `populate_pos`,未加批内偏移且基数错,第二个序列起覆盖前序序列的位置。修复后平铺写仅用于媒体(embd)行且基数改为批内总行数并加 token 偏移,文本行只写每 token 单值。310P 实测:修复前 4 并发 2/4 失败,修复后 4/4 与 2/3 并发全通过,总吞吐 56.5 tok/s(单流 3.55 倍),13 用例回归通过。
 
 验证:CANN aarch64 编译通过(llama-server + test-paged-kv-e2e)。默认调度回归通过
 (/completion、/v1/completions、/v1/chat/completions 含工具调用、n=2 并行)。paged 路径
-的运行时功能验收已在 310P 完成,见第 11 节。
+的运行时功能验收已在 310P 完成:图文请求贪婪输出与默认路径逐 token 一致,
+`test_paged_server_mm.py` 3 用例(逐 token 等价、图像后文本携带图像上下文、prompt token
+记账)与 10 个 paged server pytest 用例通过;此前记录的投机推理缺陷(verify 门位、attach
+重复推入、truncate 时序、n_keep_blocks 向下取整)修复后,n_max 2/3/4/6/8 的 128 token
+输出与无投机基线逐 token 一致(2026-10-28 复测);`--mmproj` 进程退出 abort 已修复
+(`mtmd_free` 前移至 `destroy()` 开头),paged 与 default 各 8/8 启停无 abort。
+
+### 9.7 develop 优先级架构适配与 sdk-demo(2026-10-29 至 2026-11-02)
+
+rebase 到含请求优先级调度(!23/!29)的 origin/develop 后的增量适配:
+
+1. 队列抽象与定点摘除(`98d97d995`):waiting/swapped 改经 `llama_paged_queue` 接口
+   (`src/llama-paged-queue.h`),FCFS 实现(按到达序 deque)与优先级实现
+   (`group_precedes` 最小堆)均支持 `take(request_id)`(FCFS 线性扫描,优先级队列
+   弹出重建);cancel 经队列 take 摘除组(running 仍为到达序链表);
+2. `process_waiting_list` 预算参数改传值:prefill 独占步使用全新预算,头部准入语义
+   保留;抢占牺牲者选择与换入次序按模式分化(`eviction_precedes`:FCFS 牺牲最新
+   到达,优先级模式牺牲最低优先级),并保留步内优先级反转保护;
+3. 模式与参数:`--enable-priority`(`common_params.enable_priority`)经
+   `common_init_from_params` 映射为 `llama_context_params.paged_priority`,
+   在 `llama_paged_scheduler_init` 时固定;`add_request` 增加 `priority` 实参
+   (钳制到 `[-LLAMA_PAGED_PRIORITY_LIMIT, LLAMA_PAGED_PRIORITY_LIMIT]`,
+   非 priority 模式记录并忽略);`llama_paged_seq_state` 增加 `priority` 字段;
+4. server 侧暂未接每请求优先级:`server_scheduler_paged` 的 `add_request` 仍以默认
+   0 入队(每请求优先级需从 server 任务层透传,后续增量);库层行为已由
+   `examples/paged`(priority 池)与 `tests/req_priority`(单测 + e2e,含换入/换出
+   优先级)覆盖;
+5. 测试迁移:`test-paged-kv` 与 req_priority 测试的 update 调用迁至 feedback 契约,
+   并补 `n_pos_per_embd = 1` 构造(纯文本合成 fixture,多模态提交给 impl 构造函数
+   加参导致的接口漂移,`718566a3d` 修复);mid-prefill chunk 仅推进 KV 不带 feedback
+   token,避免块状预填被误计为解码;
+6. llama-sdk-demo(`0fc96a6b5`):新增 `tools/server/sdk-demo.cpp`,进程内(无 HTTP)
+   经 `server_context` + `server_response_reader` 提交任务与收取结果,paged 调度器下
+   10 路并发推理验证通过;cli 输入经 `tokenize_cli_input` 在服务侧分词(vocab/mmproj
+   不外露)。附带修复:defer 后重新处理的 cli 任务会以已清空的 cli_prompt 再次分词,
+   覆盖首次分词结果导致空响应(tokenize_cli_input 跳过已分词任务)。
+
+
+## 10. 调试与验收记录:310P + CANN 9.1.0
+
+运行时功能验收只在 310P 上进行。
+
+### 10.1 环境与构建
+
+- Atlas 300I Pro(310P3)单卡(`ASCEND_RT_VISIBLE_DEVICES=1`),CANN 9.1.0,GCC 11.4;
+- `-DGGML_CANN=ON -DCMAKE_BUILD_TYPE=Release` 下 llama-server 与 test-paged-kv-e2e 构建通过;server 侧功能测试复用 pytest 基础设施(`tools/server/tests`);
+- 模型 Qwen3-1.7B F16 GGUF(head_dim=128,满足 310P 约束),由本地 safetensors 经`convert_hf_to_gguf.py` 转换;
+- 服务命令:`llama-server -m <model> --kv-paged --cache-ram 0 -b 2048 -ub 2048 -ngl 99 -c 4096 -np 4`。注意 `--cache-ram` 默认 8192M 会被门禁拒绝,须显式置 0。
+
+### 10.2 验收结果(2026-10-26)
+
+| 组 | 项目 | 结果 |
+|---|---|---|
+| 阶段一 | /completion 非流式 + 流式 SSE、/v1/completions、stop 串、n_predict、EOG、采样参数、温度 0 确定性 | 全部通过 |
+| 阶段一 | 并发 8 请求 / 4 槽:超额排队与释放续跑 | 通过 |
+| 阶段一 | 块级前缀缓存:451 token 前缀二次请求 cache_n=448,prompt 时延 195.9ms -> 51.7ms | 通过 |
+| 阶段一 | 客户端断连取消:槽位与 KV 回收,后续请求正常 | 通过 |
+| 阶段一 | /metrics(需 `--metrics`)、/props、/tokenize、/slots | 通过 |
+| 阶段二 | /v1/chat/completions 非流式 + 流式(reasoning_content) | 通过 |
+| 阶段二 | 工具调用:get_weather({"city": "Paris"}),finish_reason=tool_calls | 通过 |
+| 阶段二 | n_cmpl>1:n=2 返回 2 choices | 通过 |
+| 阶段二 | json_schema 严格约束输出 | 通过 |
+| 阶段二 | 投机推理:启动放行,运行时输出错误 | 未通过,见 11.3 缺陷 2 |
+| 门禁 | -b != -ub 报错;--kv-paged + --kv-unified 告警关闭;双卡报错附修复建议;--embeddings / --reranking / --cache-ram 启动报错;--cache-reuse 告警关闭;/infill 请求期 501;embeddings / rerank 端点 501;图像输入明确报错 | 全部符合设计 |
+| 对比 | 同 prompt 贪婪 16 token,paged 与 default 逐字一致 | 通过 |
+
+### 10.3 缺陷与修复
+
+1. (已修复,server +1 行)`--kv-paged` + 投机推理启动崩溃:draft ctx 继承
+   `kv_paged=true`,load_model 对 ctx_dft 的探测式 `common_context_can_seq_rm` 在无路由
+   元数据的 paged ctx 上触发 `llama-kv-cache-paged.cpp:375` 断言(目标 ctx 在
+   server-context.cpp 已有同款特判,draft 漏了)。修复:`params_dft.kv_paged = false`,
+   对齐 12.3"draft 保持经典 KV"。
+2. (已修复 4 处)投机推理在 paged 路径的账本缺陷:update post 循环的 verify 门位于
+   sample_now 判断之后,verify 批(len = 1 + n_draft)被当作 prefill 中途块跳过,
+   verify_slot 不可达;attach 重复推入 pending token(plain 路径已推);truncate 在
+   调度器 update 之前执行,被 "cannot truncate" 静默拒绝;truncate 的 n_keep_blocks
+   向下取整,把承载有效 KV 的部分块整个释放,块表轮换后旧位置全部读空。修复后
+   paged+spec 全深度贪婪等价:n_max 2/3/4/6/8 的 128 token 输出与无投机基线逐 token
+   一致(2026-10-28 复测);此前深度 >= 3 观察到的毒化系上述缺陷所致,见 10.4。
+3. (已澄清)test-paged-kv-e2e 曾在 310P 失败:CANN paged 图必须先经
+   `llama_paged_scheduler_warmup` 预热,否则 decode 步采样到陈旧 logits(server 有预热
+   而 e2e 没有)。已在 e2e 补预热;残余 token 级漂移属在线/两遍 softmax 的 F16 数值差,
+   同 prompt 下 server paged 与 default 逐字一致,top-5 重合 5/5。
+4. (已修复,server +5/-3 行)`--mmproj` 进程退出时 CANN abort(`rtFree invalid
+   value` + `ctx is NULL`):`destroy()` 先 `llama_init.reset()` 释放主 backend
+   并 `aclrtResetDevice` 销毁设备上下文,其后的 `mtmd_free` 在上下文销毁后释放
+   clip 的 CANN 缓冲。310P 实测修复前 paged+mmproj 8/8 次退出 abort(default 路径
+   同序但 8/8 干净),启动阶段两路径 8/8 均正常,即问题仅在进程退出阶段出现。修复将
+   `mtmd_free` 前移至 `destroy()` 开头(设备上下文存活时释放);修复后 paged 与
+   default 各 8/8 启停无 abort,mm 请求 sanity 与 13 用例回归(--noconftest 串行)通过。
+
+观察:`t_max_predict_ms` 在 default 与 paged 路径均未按预期截断(fork 级问题,非 paged
+回归)。
+
+### 10.4 遗留项
+
+- ATB SF op(CALC_TYPE_SPEC)排查记录:深度 >= 3 的毒化曾疑其多行写路径问题,排查已
+  排除调度器/服务端账本、ReshapeCache 跨块写入、ACL graph;独立探针(atb_probe.cpp)
+  在共享多租户设备上算子静默无效;vllm-ascend 310P 投机(torch_npu
+  rejection_sampler.py + attention_v1.py)掩码/布局语义逐项比对一致。缺陷 2 修复后
+  毒化消失,该怀疑解除;若更换内核或驱动后再现,循 server 进程内探针 + 向华为获取
+  CALC_TYPE_SPEC 张量契约重查;
+- e2e 的 N_COMPARE=4 等价窗口是否按平台/模型放宽,由 owner 决定;
+- 910B 内核适配若立项,另开文档。
+
+## 12. 第二阶段设计:四个明确支持的特性

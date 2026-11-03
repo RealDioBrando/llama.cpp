@@ -13,7 +13,7 @@ struct mtmd_input_chunk;
 
 class server_scheduler_paged final : public server_scheduler_interface {
   public:
-    explicit server_scheduler_paged(server_scheduler_host & host) : host(host) {}
+    explicit server_scheduler_paged(server_context_port & port) : port(port) {}
     ~server_scheduler_paged() override;
 
     bool init() override;
@@ -25,15 +25,15 @@ class server_scheduler_paged final : public server_scheduler_interface {
     server_slot * pick_idle_slot();
     bool launch_multimodal(server_task && task);
 
-    // multimodal (12.4): the pending media chunk of a slot, in order; returns
+    // multimodal (9.4): the pending media chunk of a slot, in order; returns
     // nullptr when all chunks are already appended
     const mtmd_input_chunk * find_media_chunk(server_slot & slot, size_t * idx);
 
-    // multimodal (12.4): encode the next pending media chunk on a worker
+    // multimodal (9.4): encode the next pending media chunk on a worker
     // thread so the clip run overlaps the scheduler steps
     void start_mm_prefetch(server_slot & slot);
 
-    // multimodal (12.4): warm the clip encoder with one synthetic image so
+    // multimodal (9.4): warm the clip encoder with one synthetic image so
     // the first real image request does not pay the clip first-compile cost
     void mm_warmup();
 
@@ -60,7 +60,7 @@ class server_scheduler_paged final : public server_scheduler_interface {
     bool verify_slot(server_slot & slot, int32_t off, int32_t len,
                      std::vector<llama_token> & fb_tok, std::vector<llama_paged_feedback> & fb);
 
-    server_scheduler_host & host;
+    server_context_port & port;
 
     llama_paged_scheduler * sched = nullptr;
 

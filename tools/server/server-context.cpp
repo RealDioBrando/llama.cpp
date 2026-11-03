@@ -194,7 +194,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 // server_context_impl (private implementation)
 //
 
-struct server_context_impl : server_scheduler_host {
+struct server_context_impl : server_context_port {
     friend struct server_context;
 
 public:
@@ -422,7 +422,7 @@ private:
                 return false;
             }
             if (has_mmproj) {
-                // multimodal (12.4): media chunks are launched as pending
+                // multimodal (9.4): media chunks are launched as pending
                 // segments and encoded on demand when the scheduler pauses
                 SRV_INF("%s", "multimodal inputs enabled with the paged scheduler\n");
             }
@@ -3617,7 +3617,7 @@ private:
     }
 
     //
-    // server_scheduler_host interface (--kv-paged)
+    // server_context_port interface (--kv-paged)
     //
     // note: process_token, populate_token_probs, launch_slot_with_task and
     // the send_* / metrics_* hooks satisfy the interface directly

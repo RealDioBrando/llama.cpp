@@ -18,7 +18,7 @@ enum class llama_sequence_group_status {
 
 using llama_block_ids = std::vector<uint32_t>;
 
-// multimodal (12.4): one ordered piece of a request's prompt. text rows carry
+// multimodal (9.4): one ordered piece of a request's prompt. text rows carry
 // token ids in logical_seq; media rows occupy one KV position each but their
 // input embeddings come from the vision encoder (server-owned buffer), and
 // each media row carries n_pos_per_embd mrope positions instead of one.
@@ -58,7 +58,7 @@ struct llama_sequence_group {
     // consumed (cleared) by populate_batch_from
     std::vector<llama_token> pending_draft;
 
-    // multimodal (12.4): ordered segmentation covering all rows; empty for
+    // multimodal (9.4): ordered segmentation covering all rows; empty for
     // legacy text-only requests. media segments are appended with their
     // encoder output by the server when the scheduler pauses on them.
     std::vector<llama_seq_segment> segments;
