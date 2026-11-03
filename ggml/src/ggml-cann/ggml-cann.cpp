@@ -1772,6 +1772,8 @@ static void weight_format_to_nz(ggml_tensor * tensor, int device) {
 // 310P INT8 FRACTAL_NZ stores each expert as [K/32, N/16, 16, 32].
 size_t ggml_cann_w8a8_expert_transformed_size(const ggml_tensor * tensor) {
     GGML_ASSERT(tensor->type == GGML_TYPE_W8A8);
+    GGML_ASSERT(tensor->ne[0] % 32 == 0);
+    GGML_ASSERT(tensor->ne[1] % 16 == 0);
     GGML_ASSERT(tensor->ne[3] == 1);
     const int64_t n_blocks = (tensor->ne[1] + 15) / 16;
     const int64_t k_blocks = (tensor->ne[0] + 31) / 32;
@@ -1789,6 +1791,7 @@ static void ggml_backend_cann_w8a8_upload_a8(ggml_tensor * tensor, const void * 
         const int64_t expert_k = tensor->ne[0];
         const int64_t expert_n = tensor->ne[1];
         const int64_t expert_count = tensor->ne[2];
+        GGML_ASSERT(expert_n % 16 == 0);
         const int64_t blocks_per_row = expert_k / QK_W8A8;
         const size_t scale_offset = ggml_cann_w8a8_expert_scale_offset(tensor);
 
@@ -1825,26 +1828,17 @@ static void ggml_backend_cann_w8a8_upload_a8(ggml_tensor * tensor, const void * 
         if (use_nz) {
             const int64_t n_blocks = (expert_n + 15) / 16;
             const int64_t k_blocks = (expert_k + 31) / 32;
-            std::vector<int8_t> payload(payload_size, 0);
+            std::vector<int8_t> payload(payload_size);
             for (int64_t expert = 0; expert < expert_count; ++expert) {
                 for (int64_t kb = 0; kb < k_blocks; ++kb) {
                     for (int64_t nb = 0; nb < n_blocks; ++nb) {
                         for (int64_t ni = 0; ni < 16; ++ni) {
                             const int64_t row = nb * 16 + ni;
-                            if (row >= expert_n) {
-                                continue;
-                            }
-                            for (int64_t ki = 0; ki < 32; ++ki) {
-                                const int64_t column = kb * 32 + ki;
-                                if (column >= expert_k) {
-                                    continue;
-                                }
-                                const size_t src_index = static_cast<size_t>(
-                                    (expert * expert_n + row) * expert_k + column);
-                                const size_t dst_index = static_cast<size_t>(
-                                    ((((expert * k_blocks + kb) * n_blocks + nb) * 16 + ni) * 32 + ki));
-                                payload[dst_index] = weights[src_index];
-                            }
+                            const size_t src_index = static_cast<size_t>(
+                                (expert * expert_n + row) * expert_k + kb * 32);
+                            const size_t dst_index = static_cast<size_t>(
+                                ((((expert * k_blocks + kb) * n_blocks + nb) * 16 + ni) * 32));
+                            memcpy(payload.data() + dst_index, weights.data() + src_index, 32);
                         }
                     }
                 }
@@ -1955,8 +1949,34 @@ static void ggml_backend_cann_w8a8_get_tensor(const ggml_tensor * tensor, void *
 
         std::vector<int8_t> weights(static_cast<size_t>(expert_count * expert_n * expert_k));
         std::vector<float> scales(static_cast<size_t>(expert_count * expert_n));
-        ACL_CHECK(aclrtMemcpy(weights.data(), weights.size(), tensor->data, weights.size(),
-                              ACL_MEMCPY_DEVICE_TO_HOST));
+        const bool use_nz =
+            parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("off"));
+        if (use_nz) {
+            // Reverse the private FRACTAL_NZ payload so callers always observe
+            // the public 34-byte W8A8 block representation.
+            std::vector<int8_t> payload(weights.size());
+            ACL_CHECK(aclrtMemcpy(payload.data(), payload.size(), tensor->data, payload.size(),
+                                  ACL_MEMCPY_DEVICE_TO_HOST));
+            const int64_t n_blocks = expert_n / 16;
+            const int64_t k_blocks = expert_k / 32;
+            for (int64_t expert = 0; expert < expert_count; ++expert) {
+                for (int64_t kb = 0; kb < k_blocks; ++kb) {
+                    for (int64_t nb = 0; nb < n_blocks; ++nb) {
+                        for (int64_t ni = 0; ni < 16; ++ni) {
+                            const int64_t row = nb * 16 + ni;
+                            const size_t src_index = static_cast<size_t>(
+                                ((((expert * k_blocks + kb) * n_blocks + nb) * 16 + ni) * 32));
+                            const size_t dst_index = static_cast<size_t>(
+                                (expert * expert_n + row) * expert_k + kb * 32);
+                            memcpy(weights.data() + dst_index, payload.data() + src_index, 32);
+                        }
+                    }
+                }
+            }
+        } else {
+            ACL_CHECK(aclrtMemcpy(weights.data(), weights.size(), tensor->data, weights.size(),
+                                  ACL_MEMCPY_DEVICE_TO_HOST));
+        }
         ACL_CHECK(aclrtMemcpy(scales.data(), scales.size() * sizeof(float),
                               (const char *) tensor->data + scale_offset, scales.size() * sizeof(float),
                               ACL_MEMCPY_DEVICE_TO_HOST));

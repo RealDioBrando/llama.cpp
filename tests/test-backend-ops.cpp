@@ -11003,6 +11003,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W8A8, GGML_TYPE_F32, 4096, 1,   4096, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_W8A8, GGML_TYPE_F32, 4096, 512, 4096, {1, 1}, {1, 1}));
 
+    // W8A8 MoE cases matching Qwen3-30B-A3B gate/up and down projections.
+    for (int64_t n_tokens : {1, 32}) {
+        test_cases.emplace_back(new test_mul_mat_id(
+            GGML_TYPE_W8A8, GGML_TYPE_F32, 128, 8, true, 768, n_tokens, 2048));
+        test_cases.emplace_back(new test_mul_mat_id_down(
+            GGML_TYPE_W8A8, GGML_TYPE_F32, 128, 8, false, 2048, n_tokens, 768));
+    }
+
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
