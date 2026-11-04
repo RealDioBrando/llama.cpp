@@ -401,7 +401,7 @@ private:
                 SRV_ERR("%s", "--kv-paged does not support embeddings yet\n");
                 return false;
             }
-            if (params_base.cache_ram_mib > 0) {
+            if (params_base.cache_ram_mib != 0) {
                 SRV_ERR("%s", "--kv-paged does not support --cache-ram\n");
                 return false;
             }
