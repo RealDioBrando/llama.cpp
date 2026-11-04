@@ -9,6 +9,7 @@
 #include <clocale>
 #include <cstdlib>
 #include <chrono>
+#include <map>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -40,6 +41,7 @@ static const size_t k_n_prompts = 20;
 
 struct request_result {
     int32_t     request_id = -1;
+    int32_t     priority   = 0;
     int32_t     n_prompt   = 0;
     int32_t     n_decoded  = 0;
     float       ttft_ms    = 0.f;  // time to first token
@@ -52,7 +54,8 @@ struct request_result {
 static void add_request_from_pool(struct llama_paged_scheduler * scheduler,
                                   llama_context *                ctx,
                                   size_t                         pool_index,
-                                  int                            seq_id) {
+                                  int                            seq_id,
+                                  int32_t                        priority) {
     // LLAMA_PAGED_SAME_PROMPT=1 makes every sequence use prompt 0, which
     // is the workload to exercise the prefix cache.
     static const bool   same_prompt   = getenv("LLAMA_PAGED_SAME_PROMPT") && atoi(getenv("LLAMA_PAGED_SAME_PROMPT")) != 0;
@@ -82,11 +85,12 @@ static void add_request_from_pool(struct llama_paged_scheduler * scheduler,
         }
     }
 
-    bool success = llama_paged_scheduler_add_request(scheduler, tokens.data(), tokens.size(), seq_id);
+    bool success = llama_paged_scheduler_add_request(scheduler, tokens.data(), tokens.size(), seq_id, priority);
     if (!success) {
         LOG_ERR("Failed to add request %ld from pool\n", pool_index);
     }
-    LOG_INF("%s: Successfully added request %ld: %s\n", __func__, pool_index, input_prompt.c_str());
+    LOG_INF("%s: Successfully added request %ld (priority %d): %s\n", __func__, pool_index, priority,
+            input_prompt.c_str());
 }
 
 struct callback_context {
@@ -185,11 +189,34 @@ int main(int argc, char ** argv) {
     }
     int32_t next_request = 0;
 
+    // LLAMA_PAGED_PRIORITY / LLAMA_PAGED_PRIORITY_STEP: per-request priority.
+    // priority = base - seq_id * step (step > 0 makes later arrivals higher
+    // priority). Only applied when priority scheduling is enabled; otherwise
+    // requests are queued with the default priority 0 (plain FCFS).
+    int32_t priority_base = 0;
+    int32_t priority_step = 0;
+    if (params.enable_priority) {
+        if (const char * env = getenv("LLAMA_PAGED_PRIORITY")) {
+            priority_base = atoi(env);
+        }
+        if (const char * env = getenv("LLAMA_PAGED_PRIORITY_STEP")) {
+            priority_step = atoi(env);
+        }
+    }
+    auto request_priority = [&](int seq_id) -> int32_t {
+        if (!params.enable_priority) {
+            return 0;
+        }
+        const int64_t p = (int64_t) priority_base - (int64_t) seq_id * priority_step;
+        return (int32_t) std::clamp<int64_t>(p, -LLAMA_PAGED_PRIORITY_LIMIT, LLAMA_PAGED_PRIORITY_LIMIT);
+    };
+
     while (true) {
         while (next_request < params.n_sequences &&
                (seq_delay_ms <= 0 ||
                 ggml_time_us() - t_start_us >= (int64_t) next_request * seq_delay_ms * 1000)) {
-            add_request_from_pool(scheduler, ctx, (size_t) next_request, next_request);
+            add_request_from_pool(scheduler, ctx, (size_t) next_request, next_request,
+                                  request_priority(next_request));
             samplers[next_request] = common_sampler_init(model, params.sampling);
             ++next_request;
         }
@@ -264,6 +291,7 @@ int main(int argc, char ** argv) {
 
                 request_result r;
                 r.request_id = request_id;
+                r.priority   = state.priority;
                 r.n_prompt   = state.n_prompt;
                 r.n_decoded  = state.n_decoded;
                 r.ttft_ms    = (state.t_first_token_us - state.t_arrival_us) / 1000.0f;
@@ -297,7 +325,7 @@ int main(int argc, char ** argv) {
 
     LOG_INF("%s: Paged KV cache outputs:\n", __func__);
     for (const auto & res : results) {
-        LOG_INF("Request Id: %d:<s>%s<\\s>\n", res.request_id, res.response.c_str());
+        LOG_INF("Request Id: %d (priority %d):<s>%s<\\s>\n", res.request_id, res.priority, res.response.c_str());
     }
 
     // Summary
@@ -352,6 +380,21 @@ int main(int argc, char ** argv) {
     LOG_INF("  tpot  avg             : %.1f ms/token\n", avg_tpot_ms);
     LOG_INF("  e2e   avg             : %.1f ms\n", avg_e2e_ms);
     LOG_INF("  tps   min / max       : %.1f / %.1f tokens/s\n", min_tps, max_tps);
+
+    if (params.enable_priority) {
+        // Group TTFT by priority so the effect of the ordering is visible.
+        std::map<int32_t, std::pair<int32_t, float>> by_priority;  // priority -> (count, sum ttft)
+        for (const auto & r : results) {
+            auto & entry = by_priority[r.priority];
+            entry.first  += 1;
+            entry.second += r.ttft_ms;
+        }
+        LOG_INF("  --- ttft avg by priority ---\n");
+        for (const auto & [priority, entry] : by_priority) {
+            LOG_INF("  priority %6d      : %.1f ms (%d requests)\n", priority,
+                    entry.first > 0 ? entry.second / entry.first : 0.f, entry.first);
+        }
+    }
     LOG_INF("==============================\n");
 
     // Clean-up

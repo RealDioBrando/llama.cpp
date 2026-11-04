@@ -67,12 +67,6 @@ static bool can_reuse_kq_mask(
     return res;
 }
 
-// debug helper: env LLAMA_DEBUG_REUSE=1 prints why graph reuse fails
-static bool llama_debug_reuse() {
-    static const bool enabled = getenv("LLAMA_DEBUG_REUSE") != nullptr;
-    return enabled;
-}
-
 // impl
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
@@ -1203,14 +1197,6 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
 
-    if (!res && llama_debug_reuse()) {
-        fprintf(stderr, "[REUSE-FAIL] hybrid: k_idxs=%d mask=%d s_copy=%d head=%d->%d\n",
-            (int)(inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens),
-            (int)can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams),
-            (int)(inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs()),
-            (int)inp_rs->head, (int)mctx->get_recr()->get_head());
-    }
-
     return res;
 }
 
@@ -1505,10 +1491,6 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
         }
-        if (llama_debug_reuse()) {
-            fprintf(stderr, "[REUSE-FAIL] allow_reuse: n_tokens %d->%d\n",
-                (int)this->params.ubatch.n_tokens, (int)params.ubatch.n_tokens);
-        }
         return false;
     }
 
@@ -1518,16 +1500,9 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
     bool res = true;
 
-    int inp_idx = 0;
     for (auto & input : inputs) {
         const bool cur = input->can_reuse(params);
-
-        if (!cur && llama_debug_reuse()) {
-            fprintf(stderr, "[REUSE-FAIL] input[%d] can_reuse=false\n", inp_idx);
-        }
-
         res = res && cur;
-        inp_idx++;
     }
 
     if (debug > 0) {
@@ -1616,8 +1591,9 @@ ggml_tensor * llm_graph_context::build_cvec(
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
-          ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+          ggml_tensor * w_s,
+            ggml_type   type) const {
+    ggml_tensor * res = ggml_mul_mat_cast(ctx0, w, cur, type == GGML_TYPE_COUNT ? cparams.act_type : type);
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
@@ -1632,6 +1608,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const float adapter_scale = lora.second;
         const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
 
+        // the adapter delta stays F32 and is added into res of either type
         ggml_tensor * ab_cur = ggml_mul_mat(
                 ctx0, lw->b,
                 ggml_mul_mat(ctx0, lw->a, cur)
@@ -2025,7 +2002,7 @@ ggml_tensor * llm_graph_context::build_ffn(
     }
 
     if (down) {
-        cur = build_lora_mm(down, cur);
+        cur = build_lora_mm(down, cur, nullptr, type_res);
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
             ggml_prec_set_acc(cur, GGML_PREC_F32);
@@ -2535,6 +2512,12 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         cur = ggml_scale(ctx0, cur, hparams.f_embedding_scale);
     }
 
+    // all three paths produce F32 (the mixed path set_rows the token rows into the
+    // F32 embd rows), so a context with F16 activations converts once, here
+    if (cur->type != cparams.act_type) {
+        cur = ggml_cast(ctx0, cur, cparams.act_type);
+    }
+
     cb(cur, "embd", -1);
 
     res->add_input(std::move(inp));
@@ -2572,6 +2555,10 @@ ggml_tensor * llm_graph_context::build_inp_attn_scale() const {
     res->add_input(std::move(inp));
 
     return cur;
+}
+
+ggml_tensor * llm_graph_context::build_out_rows(ggml_tensor * cur, ggml_tensor * inp_out_ids) const {
+    return ggml_get_rows_cast(ctx0, cur, inp_out_ids, cur->type);
 }
 
 ggml_tensor * llm_graph_context::build_inp_out_ids() const {
@@ -2761,8 +2748,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
-                                  hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        cur = ggml_flash_attn_ext_cast(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+                                       hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f, cparams.act_type);
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
@@ -2833,12 +2820,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cb(v, "v_cont", il);
         }
 
-        ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+        // kq and the soft_max stay F32, the attention result is stored as cparams.act_type
+        ggml_tensor * kqv = ggml_mul_mat_cast(ctx0, v, kq, v_mla ? GGML_TYPE_F32 : cparams.act_type);
         cb(kqv, "kqv", il);
 
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {
-            kqv = ggml_mul_mat(ctx0, v_mla, kqv);
+            kqv = ggml_mul_mat_cast(ctx0, v_mla, kqv, cparams.act_type);
             cb(kqv, "kqv_mla", il);
         }
 
@@ -2921,7 +2909,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     if (wo) {
-        cur = build_lora_mm(wo, cur, wo_s);
+        cur = build_lora_mm(wo, cur, wo_s, type_res);
     }
 
     if (wo_b) {
@@ -3026,13 +3014,13 @@ ggml_tensor * llm_graph_context::build_attn(
     if (wo) {
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
             // GLM4, GLM4_MOE, and JAIS2 seem to have numerical issues with half-precision accumulators
-            cur = build_lora_mm(wo, cur);
+            cur = build_lora_mm(wo, cur, nullptr, type_res);
             ggml_prec_set_acc(cur, GGML_PREC_F32);
             if (wo_s) {
                 cur = ggml_mul(ctx0, cur, wo_s);
             }
         } else {
-            cur = build_lora_mm(wo, cur, wo_s);
+            cur = build_lora_mm(wo, cur, wo_s, type_res);
         }
     }
 
@@ -3155,13 +3143,13 @@ ggml_tensor * llm_graph_context::build_attn(
     if (wo) {
         if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE) {
             // GLM4 and GLM4_MOE seem to have numerical issues with half-precision accumulators
-            cur = build_lora_mm(wo, cur);
+            cur = build_lora_mm(wo, cur, nullptr, type_res);
             ggml_prec_set_acc(cur, GGML_PREC_F32);
             if (wo_s) {
                 cur = ggml_mul(ctx0, cur, wo_s);
             }
         } else {
-            cur = build_lora_mm(wo, cur, wo_s);
+            cur = build_lora_mm(wo, cur, wo_s, type_res);
         }
     }
 
@@ -3238,7 +3226,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     if (wo) {
-        cur = build_lora_mm(wo, cur, wo_s);
+        cur = build_lora_mm(wo, cur, wo_s, type_res);
     }
 
     if (wo_b) {
@@ -3321,7 +3309,7 @@ ggml_tensor * llm_graph_context::build_attn(
     }
 
     if (wo) {
-        cur = build_lora_mm(wo, cur, wo_s);
+        cur = build_lora_mm(wo, cur, wo_s, type_res);
     }
 
     if (wo_b) {
@@ -3497,7 +3485,7 @@ ggml_tensor * llm_graph_context::build_attn(
     cb(cur, "kqv_out", il);
 
     if (wo) {
-        cur = build_lora_mm(wo, cur, wo_s);
+        cur = build_lora_mm(wo, cur, wo_s, type_res);
     }
 
     if (wo_b) {
@@ -4013,6 +4001,35 @@ void llm_graph_context::build_pooling(
     res->t_embd_pooled = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+void llm_graph_context::build_outputs_f32() const {
+    if (cparams.act_type == GGML_TYPE_F32) {
+        return;
+    }
+
+    if (res->t_logits && res->t_logits->type != GGML_TYPE_F32) {
+        res->t_logits = ggml_cast(ctx0, res->t_logits, GGML_TYPE_F32);
+        ggml_build_forward_expand(gf, res->t_logits);
+    }
+
+    if (cparams.embeddings && res->t_embd && res->t_embd->type != GGML_TYPE_F32) {
+        res->t_embd = ggml_cast(ctx0, res->t_embd, GGML_TYPE_F32);
+        ggml_build_forward_expand(gf, res->t_embd);
+    }
+
+    if (cparams.embeddings_nextn && res->t_h_nextn && res->t_h_nextn->type != GGML_TYPE_F32) {
+        res->t_h_nextn = ggml_cast(ctx0, res->t_h_nextn, GGML_TYPE_F32);
+        ggml_build_forward_expand(gf, res->t_h_nextn);
+    }
+
+    for (size_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+        ggml_tensor *& t = res->t_layer_inp[il];
+        if (cparams.embeddings_layer_inp[il] && t && t->type != GGML_TYPE_F32) {
+            t = ggml_cast(ctx0, t, GGML_TYPE_F32);
+            ggml_build_forward_expand(gf, t);
+        }
+    }
 }
 
 void llm_graph_context::build_sampling() const {

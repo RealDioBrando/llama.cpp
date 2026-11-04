@@ -11,8 +11,8 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     hparams.f_final_logit_softcapping = 0.0f;
     ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     hparams.f_final_logit_softcapping, false);
 
-    // drafts for M-RoPE targets carry degenerate sections [n_rot/2, 0, 0, 0]
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, false);
+    ml.get_key(LLM_KV_ROPE_MROPE_INTERLEAVED, hparams.mrope_interleaved, false);
 
     ml.get_key(LLM_KV_DFLASH_BLOCK_SIZE,       hparams.dflash_block_size,       false);
     ml.get_key(LLM_KV_DFLASH_CONV_KERNEL_SIZE, hparams.dflash_conv_kernel_size, false);
@@ -588,12 +588,11 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
 
-    // drafts for M-RoPE targets use degenerate sections (temporal dim only)
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
     auto build_rope = [&](ggml_tensor * cur, ggml_tensor * pos) {
-        return rope_type == GGML_ROPE_TYPE_MROPE
+        return rope_type == GGML_ROPE_TYPE_MROPE || rope_type == GGML_ROPE_TYPE_IMROPE
             ? ggml_rope_multi(ctx0, cur, pos, nullptr,
                     n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow)

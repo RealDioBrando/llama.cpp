@@ -44,6 +44,23 @@ static int64_t acl_tensor_first_dim(const aclTensor * tensor) {
     return dims[0];
 }
 
+bool ggml_cann_mul_mat_id_grouped_uses_compact_groups(const ggml_tensor * dst) {
+    if (dst == nullptr || dst->op != GGML_OP_MUL_MAT_ID || dst->src[0] == nullptr ||
+        dst->src[1] == nullptr || dst->src[2] == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * weight = dst->src[0];
+    const ggml_tensor * ids    = dst->src[2];
+    if (weight->type != GGML_TYPE_W8A8 || !ggml_cann_mul_mat_id_grouped_supported(dst)) {
+        return false;
+    }
+
+    const bool use_nz = parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("off"));
+    const int64_t n_rows = ids->ne[0] * ids->ne[1];
+    return !use_nz && n_rows < weight->ne[2];
+}
+
 bool ggml_cann_mul_mat_id_grouped_supported(const ggml_tensor * dst) {
     const ggml_tensor * weight = dst->src[0];
     const ggml_tensor * input  = dst->src[1];
@@ -96,7 +113,7 @@ void ggml_cann_mul_mat_id_grouped(ggml_backend_cann_context & ctx, ggml_tensor *
         parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("off"));
     // CANN 9.1.0 can return incorrect results when most expert groups are empty.
     // Compact only the ND path, because the NZ operator consumes all experts.
-    const bool compact_groups = weight->type == GGML_TYPE_W8A8 && !use_nz && n_rows < n_exp;
+    const bool compact_groups = ggml_cann_mul_mat_id_grouped_uses_compact_groups(dst);
 
     ggml_cann_pool_alloc input_f16_alloc;
     void * input_f16_data = input->data;

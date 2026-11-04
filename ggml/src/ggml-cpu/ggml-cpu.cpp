@@ -429,6 +429,30 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    // F16 activations are CANN-only; prevent accidental CPU fallback.
+    if (op->type == GGML_TYPE_F16) {
+        switch (op->op) {
+            case GGML_OP_ADD:
+            case GGML_OP_SUB:
+            case GGML_OP_MUL:
+            case GGML_OP_DIV:
+            case GGML_OP_UNARY:
+            case GGML_OP_MUL_MAT:
+            case GGML_OP_MUL_MAT_ID:
+            case GGML_OP_GET_ROWS:
+            case GGML_OP_FLASH_ATTN_EXT:
+            case GGML_OP_RMS_NORM:
+            case GGML_OP_NORM:
+            case GGML_OP_SCALE:
+            case GGML_OP_SUM_ROWS:
+            case GGML_OP_ROPE:
+            case GGML_OP_SOFT_MAX:
+                return false;
+            default:
+                break;
+        }
+    }
+
     // check extra buffer types
     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {

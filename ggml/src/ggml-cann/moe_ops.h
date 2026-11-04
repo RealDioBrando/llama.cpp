@@ -8,5 +8,6 @@
 
 void ggml_cann_mul_mat_id_grouped(ggml_backend_cann_context & ctx, ggml_tensor * dst);
 bool ggml_cann_mul_mat_id_grouped_supported(const ggml_tensor * dst);
+bool ggml_cann_mul_mat_id_grouped_uses_compact_groups(const ggml_tensor * dst);
 
 #endif

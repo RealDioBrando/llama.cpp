@@ -405,8 +405,9 @@ extern "C" {
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
-        enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
-        enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        enum ggml_type type_k;   // data type for K cache [EXPERIMENTAL]
+        enum ggml_type type_v;   // data type for V cache [EXPERIMENTAL]
+        enum ggml_type type_act; // data type of the compute graph activations: F32 or F16 [EXPERIMENTAL; CANN and Qwen3-family only]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -433,6 +434,9 @@ extern "C" {
         uint32_t n_gpu_blocks;       // GPU block pool size
         uint32_t n_cpu_blocks;       // CPU block pool size for swap-out
         float    kv_paged_watermark; // percentage of GPU blocks reserved as safety margin [0, 0.1)
+        // Order paged requests by request priority instead of FCFS.
+        // Decided at llama_paged_scheduler_init() time and fixed afterwards.
+        bool     paged_priority;
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -1661,6 +1665,17 @@ extern "C" {
     //
     // Paged inference
     //
+    // Lifecycle state of a paged request. SWAPPED means the KV blocks live in
+    // the CPU pool after an eviction; the scheduler brings the request back
+    // (swap in) as soon as the GPU pool has room.
+    typedef enum llama_paged_seq_status {
+        LLAMA_PAGED_SEQ_STATUS_UNKNOWN  = 0,
+        LLAMA_PAGED_SEQ_STATUS_WAITING  = 1,
+        LLAMA_PAGED_SEQ_STATUS_RUNNING  = 2,
+        LLAMA_PAGED_SEQ_STATUS_SWAPPED  = 3,
+        LLAMA_PAGED_SEQ_STATUS_FINISHED = 4,
+    } llama_paged_seq_status;
+
     struct llama_paged_seq_state {
         int32_t request_id;
         int32_t n_prompt;
@@ -1669,6 +1684,8 @@ extern "C" {
         int32_t n_past;
         int64_t t_arrival_us;
         int64_t t_first_token_us;
+        int32_t priority;
+        llama_paged_seq_status status;
     };
 
     typedef void (*llama_paged_on_finish_cb)(int32_t             request_id,
@@ -1685,10 +1702,30 @@ extern "C" {
                                                 struct llama_context *         ctx);
 
     // Queueing and stepping.
+
+// Priority is clamped by llama_paged_scheduler_add_request() to
+// [-LLAMA_PAGED_PRIORITY_LIMIT, LLAMA_PAGED_PRIORITY_LIMIT].
+#define LLAMA_PAGED_PRIORITY_LIMIT 1000000
+
+    // Lower `priority` values are served first (default 0; negative values are
+    // higher priority). Requests with equal priority are served in arrival
+    // order. Priority only takes effect when the scheduler was created with
+    // llama_context_params.paged_priority = true; that mode is decided at
+    // llama_paged_scheduler_init() time, not by this argument. Otherwise the
+    // value is recorded and ignored. The value is clamped to
+    // [-LLAMA_PAGED_PRIORITY_LIMIT, LLAMA_PAGED_PRIORITY_LIMIT].
+    //
+    // C has no default arguments: C callers must pass `priority` explicitly
+    // (pass 0). The default below only applies to C++ callers.
     LLAMA_API bool llama_paged_scheduler_add_request(struct llama_paged_scheduler * sched,
                                                      const llama_token *            tokens,
                                                      int32_t                        n_tokens,
-                                                     int32_t                        request_id);
+                                                     int32_t                        request_id,
+                                                     int32_t                        priority
+#if defined(__cplusplus)
+                                                     = 0
+#endif
+                                                     );
 
     LLAMA_API bool llama_paged_scheduler_prepare_batch(struct llama_paged_scheduler * sched,
                                                        struct llama_batch *           batch);

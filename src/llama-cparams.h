@@ -58,6 +58,7 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool kv_paged;
+    bool paged_priority;     // order paged requests by priority instead of FCFS
     bool pipeline_parallel;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
@@ -65,6 +66,8 @@ struct llama_cparams {
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;
     enum llama_pooling_type pooling_type;
+
+    enum ggml_type act_type; // data type of the compute graph activations [EXPERIMENTAL; CANN and Qwen3-family only]
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;

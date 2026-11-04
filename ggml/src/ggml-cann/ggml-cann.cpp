@@ -41,6 +41,7 @@
 #endif
 #include <stdarg.h>
 
+#include <cstdlib>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -2917,6 +2918,9 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
         case GGML_OP_GATED_LINEAR_ATTN:
             ggml_cann_gated_linear_attn(ctx, dst);
             break;
+        case GGML_OP_GATED_DELTA_NET:
+            ggml_cann_gated_delta_net(ctx, dst);
+            break;
         case GGML_OP_SSM_CONV:
             ggml_cann_ssm_conv(ctx, dst);
             break;
@@ -3145,14 +3149,23 @@ static void ggml_backend_cann_synchronize(ggml_backend_t backend) {
 static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
                                int                                 node_idx,
                                std::initializer_list<enum ggml_op> ops) {
-    if (!ggml_can_fuse(cgraph, node_idx, ops)) {
-        return false;
-    }
-
-    // CANN backend supports fusing ADD + RMS_NORM operations
     if ((ops.size() == 2) && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_RMS_NORM) {
-        ggml_tensor * add_node = cgraph->nodes[node_idx];
-        // TODO: support broadcast for ADD + RMS_NORM
+        ggml_tensor * add_node       = cgraph->nodes[node_idx];
+        ggml_tensor * rms_norm_node  = cgraph->nodes[node_idx + 1];
+
+        if (add_node->op != GGML_OP_ADD || rms_norm_node->op != GGML_OP_RMS_NORM) {
+            return false;
+        }
+        if ((add_node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            (rms_norm_node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+        if (rms_norm_node->src[0] != add_node) {
+            return false;
+        }
+        if (add_node->type != rms_norm_node->type) {
+            return false;
+        }
         if (add_node->src[0]->ne[0] != add_node->src[1]->ne[0] || add_node->src[0]->ne[1] != add_node->src[1]->ne[1] ||
             add_node->src[0]->ne[2] != add_node->src[1]->ne[2] || add_node->src[0]->ne[3] != add_node->src[1]->ne[3]) {
             return false;
@@ -3160,7 +3173,8 @@ static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
         return true;
     }
 
-    return false;
+    // 其他融合模式走 ggml 原生通用判断
+    return ggml_can_fuse(cgraph, node_idx, ops);
 }
 
 #ifdef USE_ACL_GRAPH
@@ -3473,41 +3487,66 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     // graph fingerprint compares addresses, so this was causing re-capture
     // every step (see MATCH-FAIL diagnostics 8/27). The workspace is freed
     // on program exit instead (g_nz_workspaces is static).
-
     // calculate rope cache for fist layer in current device.
     cann_ctx->rope_cache.cached = false;
 
     bool graph_capture_required = false;
 #ifdef USE_ACL_GRAPH
-    bool use_cann_graph = true;
-
-    static bool prefill_use_graph = parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
-    if (!prefill_use_graph) {
-        // Do not use acl_graph for prefill.
-        // Detect prefill vs decode from the token (batch) count of any matmul:
-        // every split carries a matmul whose activation src[1] has ne[1] = m.
-        // Decode has m == 1; prefill has m > 1. This must not rely on finding
-        // an attention op, because GDN-layer splits route the fused delta-net
-        // node to the CPU, so those splits contain no FA/GDN node and would
-        // otherwise be (wrongly) treated as decode and graph-captured.
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            ggml_tensor * node = cgraph->nodes[i];
-            if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr) {
-                use_cann_graph = (node->src[1]->ne[1] == 1);
-                break;
+    // Paged metadata gives a backend-local phase signal: one token per
+    // sequence is decode, while chunked prefill has several tokens per seq.
+    // Keep the matmul fallback for graphs without paged attention.
+    auto graph_is_prefill = [&](const ggml_cgraph * graph) {
+        bool has_paged_attn = false;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            const ggml_tensor * node = graph->nodes[i];
+            if (node->op != GGML_OP_PAGED_ATTN) {
+                continue;
+            }
+            has_paged_attn = true;
+            if (node->src[6] && node->src[9] && node->src[9]->ne[0] > 0) {
+                return node->src[6]->ne[0] > node->src[9]->ne[0];
             }
         }
-    }
+        if (!has_paged_attn) {
+            for (int i = 0; i < graph->n_nodes; i++) {
+                ggml_tensor * node = graph->nodes[i];
+                if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr) {
+                    return node->src[1]->ne[1] > 1;
+                }
+            }
+        }
+        return false;
+    };
+
+    static bool prefill_use_graph_override =
+        parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
+    bool use_cann_graph = !graph_is_prefill(cgraph) || prefill_use_graph_override;
 
     if (!cann_ctx->acl_graph_mode) {
         use_cann_graph = false;
     }
 
+    if (use_cann_graph) {
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_MUL_MAT_ID &&
+                ggml_cann_mul_mat_id_grouped_uses_compact_groups(node)) {
+                static std::once_flag compact_moe_fallback_once;
+                std::call_once(compact_moe_fallback_once, []() {
+                    GGML_LOG_INFO("CANN graph: eager fallback for compact grouped W8A8\n");
+                });
+                use_cann_graph = false;
+                break;
+            }
+        }
+    }
+
     if (use_cann_graph && !cann_ctx->piecewise_mode) {
         // LRU cache operations (skip when piecewise mode is on)
         // If no matching graph is found, the graph needs to be recaptured.
-            // Debug switch: force re-capture every step.
-            static const bool no_lru = []() {
+            // Debug switch: force re-capture every step. Read per call so
+            // scoped toggles (paged warmup) take effect.
+            const bool no_lru = []() {
                 const char * e = getenv("GGML_CANN_NO_LRU");
                 return e && e[0] == '1';
             }();
@@ -3579,6 +3618,15 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
                 }
             }
 
+            // Grow the gated delta net index cache before capture, it needs a
+            // host-to-device copy which is not allowed during capture.
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                ggml_tensor * node = cgraph->nodes[i];
+                if (node->op == GGML_OP_GATED_DELTA_NET) {
+                    ggml_cann_gdn_cache_preload(*cann_ctx, node);
+                }
+            }
+
             // Pre-create the rms_norm constant caches (ones / zeros
             // vectors) before capture: their first use runs aclrtMalloc +
             // fill, and the malloc is forbidden inside the capture region.
@@ -3589,21 +3637,21 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
                     ggml_tensor * node = cgraph->nodes[i];
                     if (node->op == GGML_OP_RMS_NORM && node->src[0] != nullptr) {
                         const ggml_tensor * s = node->src[0];
+                    const ggml_type one_type = node->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+                    const size_t one_elem_size = ggml_type_size(one_type);
                         int64_t n_el = s->ne[0] * s->ne[1] * s->ne[2] * s->ne[3];
                         if (cann_ctx->rms_norm_one_tensor_cache.size < n_el) {
                             int64_t cn[1] = { n_el };
-                            size_t  cb[1] = { sizeof(float) };
+                        size_t  cb[1] = { one_elem_size };
                             acl_tensor_ptr t1 = ggml_cann_warm_cache_acl_tensor(*cann_ctx,
-                                &cann_ctx->rms_norm_one_tensor_cache.cache,
-                                cann_ctx->rms_norm_one_tensor_cache.size,
-                                cn, cb, GGML_TYPE_F32, 1, 1.0f);
+                                cann_ctx->rms_norm_one_tensor_cache,
+                            cn, cb, one_type, 1, 1.0f);
                         }
                         if (cann_ctx->rms_norm_zero_tensor_cache.size < n_el) {
                             int64_t cn[1] = { n_el };
                             size_t  cb[1] = { sizeof(float) };
                             acl_tensor_ptr t0 = ggml_cann_warm_cache_acl_tensor(*cann_ctx,
-                                &cann_ctx->rms_norm_zero_tensor_cache.cache,
-                                cann_ctx->rms_norm_zero_tensor_cache.size,
+                                cann_ctx->rms_norm_zero_tensor_cache,
                                 cn, cb, GGML_TYPE_F32, 1, 0.0f);
                         }
                         break;  // one RMS norm node is enough to size the caches
@@ -3936,6 +3984,55 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_GATED_LINEAR_ATTN:
             return true;
+        case GGML_OP_GATED_DELTA_NET:
+            {
+                // fused path via the standard 310P APIs: decode is a single
+                // recurrent call, prefill is a single chunk call (8-token block
+                // loop as fallback)
+                if (!ggml_cann_gdn_available()) {
+                    return false;
+                }
+                const ggml_tensor * q = op->src[0];
+                const ggml_tensor * v = op->src[2];
+                const ggml_tensor * g = op->src[3];
+                // recurrent kernel supports scalar gating only
+                if (g->ne[0] != 1) {
+                    return false;
+                }
+                // single state snapshot
+                if (ggml_get_op_params_i32(op, 0) != 1) {
+                    return false;
+                }
+                // kernel fold reduction is only correct for head dim 64 and 128, other sizes run on CPU
+                if (q->ne[0] != v->ne[0] || (q->ne[0] != 64 && q->ne[0] != 128) || v->ne[1] % q->ne[1] != 0 ||
+                    q->ne[1] > 256 || v->ne[1] > 256) {
+                    return false;
+                }
+                // GQA head-mapping divergence: the V310 kernel (fla lineage)
+                // maps v-head h to k-head h / (Nv/Nk), the llama.cpp reference
+                // kernels use modulo (h % Nk). The two only agree when
+                // NK == NV, so reject GQA shapes here and let them run on the
+                // CPU reference instead of mismatching.
+                if (q->ne[1] != v->ne[1]) {
+                    return false;
+                }
+                // the glue casts every source via F32 readers, an F16 (or
+                // other type) source would be reinterpreted with wrong
+                // strides/values. F32 in, F32 dst only.
+                for (int i = 0; i < 6; i++) {
+                    if (op->src[i]->type != GGML_TYPE_F32) {
+                        return false;
+                    }
+                }
+                if (op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                // q/k/v only need rows-contiguous (op contract): the model feeds v as a
+                // strided view of the fused qkv projection, the glue gathers it while casting
+                return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]) &&
+                       ggml_is_contiguous_rows(op->src[2]) && ggml_is_contiguous(op->src[3]) &&
+                       ggml_is_contiguous(op->src[4]) && ggml_is_contiguous(op->src[5]);
+            }
         case GGML_OP_OUT_PROD:
             {
 #ifdef ASCEND_310P
