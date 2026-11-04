@@ -1,6 +1,6 @@
 # Linear Attention Cache 与 Paged Prefix Cache 重构方案
 
-状态: 设计稿 v3 (2026-11-03)
+状态: 设计稿 v6 (2026-11-04)
 
 适用范围: `kv_paged` 下的 hybrid 模型，第一版建议只覆盖 Qwen3.5 和 Qwen3.5MoE。其他 recurrent 或 hybrid 模型继续使用现有路径。
 
@@ -8,9 +8,19 @@
 
 ## 1. 目标类图
 
+本图覆盖 cache 所有权、batch runtime context 和主要数据路径，不展开 scheduler 队列、请求优先级、graph 内部实现或具体类成员。
+
 ```mermaid
 classDiagram
     direction LR
+
+    class llama_memory_i {
+        <<memory interface>>
+    }
+
+    class llama_memory_context_i {
+        <<batch memory context interface>>
+    }
 
     class llama_context {
         <<runtime owner>>
@@ -21,19 +31,35 @@ classDiagram
     }
 
     class llama_kv_cache_paged {
-        <<full attention cache>>
+        <<full attention cache and K/V pools>>
     }
 
     class llama_linear_state_cache {
         <<linear cache, GPU/CPU state pool>>
     }
 
+    class llama_block_manager {
+        <<refcount, free queue, generation>>
+    }
+
     class llama_memory_recurrent {
         <<recurrent runtime>>
     }
 
+    class llama_kv_cache_paged_context {
+        <<full attention batch context>>
+    }
+
     class llama_memory_recurrent_context {
-        <<batch runtime context>>
+        <<recurrent batch context>>
+    }
+
+    class llama_memory_hybrid_paged_context {
+        <<hybrid batch context>>
+    }
+
+    class llama_paged_batch_info {
+        <<batch metadata, non-owning>>
     }
 
     class llama_full_prefix_index {
@@ -52,12 +78,29 @@ classDiagram
         <<cache facade>>
     }
 
-    llama_context *-- llama_memory_hybrid_paged
+    llama_memory_i <|.. llama_kv_cache_paged
+    llama_memory_i <|.. llama_memory_recurrent
+    llama_memory_i <|.. llama_memory_hybrid_paged
+
+    llama_memory_context_i <|.. llama_kv_cache_paged_context
+    llama_memory_context_i <|.. llama_memory_recurrent_context
+    llama_memory_context_i <|.. llama_memory_hybrid_paged_context
+
+    llama_context *-- llama_memory_i : owns runtime memory
+    llama_context ..> llama_memory_i : calls init_batch
+    llama_context ..> llama_memory_context_i : consumes batch context
+    llama_memory_i ..> llama_memory_context_i : creates
     llama_memory_hybrid_paged *-- llama_kv_cache_paged : full attention
     llama_memory_hybrid_paged *-- llama_linear_state_cache : linear attention
+    llama_kv_cache_paged *-- llama_block_manager : full block accounting
+    llama_linear_state_cache *-- llama_block_manager : state block accounting
     llama_linear_state_cache *-- llama_memory_recurrent : runtime state
     llama_linear_state_cache ..> llama_memory_recurrent_context : inject batch row map
     llama_memory_hybrid_paged ..> llama_memory_recurrent_context : create
+    llama_memory_hybrid_paged ..> llama_memory_hybrid_paged_context : create
+    llama_memory_hybrid_paged_context *-- llama_kv_cache_paged_context : composes
+    llama_memory_hybrid_paged_context *-- llama_memory_recurrent_context : composes
+    llama_kv_cache_paged_context ..> llama_paged_batch_info : reads
     llama_kv_cache_paged *-- llama_full_prefix_index : owns
     llama_linear_state_cache *-- llama_linear_prefix_index : owns
     llama_paged_scheduler_impl o-- llama_paged_cache_manager : owns facade
@@ -68,11 +111,19 @@ classDiagram
 类关系的关键点:
 
 1. `llama_memory_hybrid_paged` 继续持有两类 runtime memory。
-2. full attention 的 block pool 和 token prefix index 归 `llama_kv_cache_paged`。
-3. linear attention 的 state block pool 和 checkpoint index 归 `llama_linear_state_cache`。
-4. `llama_paged_cache_manager` 是非 owning facade，由 scheduler 持有，只协调底层 cache。
-5. scheduler 不再直接持有 prefix map，也不直接维护物理 block 引用计数。
-6. `llama_linear_state_cache` 向 batch context 注入 immutable state row map，recurrent runtime 不反向持有 cache 指针。
+2. full attention 的 GPU/CPU K/V storage、block manager 和 token prefix index 归 `llama_kv_cache_paged`。
+3. `llama_full_prefix_index` 只负责 `token hash -> block` 查找，不拥有 K/V 数据。
+4. linear attention 的 GPU/CPU state pool、block manager 和 checkpoint index 归 `llama_linear_state_cache`。
+5. `llama_block_manager` 管理物理 block id、refcount、GPU/CPU free queue 和 generation，不保存 K/V 或 state 数据。
+6. full 和 linear cache 各持有一个独立的 `llama_block_manager` 实例，不共享物理 block pool。
+7. `llama_memory_hybrid_paged_context` 是 per-batch runtime context，组合 full attention context 和 recurrent context。
+8. `llama_paged_batch_info` 是 scheduler 到 paged context 的 batch metadata 输入。
+9. `llama_paged_cache_manager` 是非 owning facade，由 scheduler 持有，只协调底层 cache。
+10. scheduler 不再直接持有 prefix map，也不直接维护物理 block 引用计数。
+11. `llama_linear_state_cache` 向 batch context 注入 immutable state row map，recurrent runtime 不反向持有 cache 指针。
+
+图中没有单独画 K/V tensor 类，因为当前实现将 K/V GPU/CPU tensors 直接保存在 `llama_kv_cache_paged` 内。`llama_block_manager` 管 block 元数据和空闲队列，`llama_full_prefix_index` 管 hash 查询，两者都不保存 K/V 数据。
+
 
 ## 2. 方法调用时机
 
@@ -555,10 +606,14 @@ prefix reserve 必须满足:
 | 对象 | 所有者 | 职责 |
 |---|---|---|
 | `llama_memory_hybrid_paged` | `llama_context` | 持有 full/linear runtime memory |
-| `llama_kv_cache_paged` | `llama_memory_hybrid_paged` | full attention block pool、K/V、full prefix index |
-| `llama_linear_state_cache` | `llama_memory_hybrid_paged` | GPU/CPU state block pool、active state、checkpoint index |
+| `llama_kv_cache_paged` | `llama_memory_hybrid_paged` | full attention GPU/CPU K/V storage、full prefix index |
+| `llama_linear_state_cache` | `llama_memory_hybrid_paged` | GPU/CPU state pool、active state、checkpoint index |
+| `llama_block_manager` | full 或 linear typed cache 各持有一个实例 | refcount、free queue、generation 和物理 block 元数据 |
 | `llama_memory_recurrent` | `llama_linear_state_cache` | recurrent tensor、memory context、graph-facing runtime |
-| `llama_memory_recurrent_context` | batch context 生命周期 | 持有本批次 immutable state row map |
+| `llama_memory_hybrid_paged_context` | per-batch memory context 生命周期 | 组合 full attention context 和 recurrent context |
+| `llama_kv_cache_paged_context` | `llama_memory_hybrid_paged_context` | 提供 full attention batch metadata 和 K/V tensors |
+| `llama_memory_recurrent_context` | `llama_memory_hybrid_paged_context` | 持有本批次 immutable state row map |
+| `llama_paged_batch_info` | scheduler 持有，context 非 owning 读取 | write slots、block table、context lens、batch offsets 和 lengths |
 | `llama_paged_cache_manager` | `llama_paged_scheduler_impl` | 非 owning facade，协调两类 cache |
 
 `llama_paged_cache_manager` 不能比底层 cache 存活更久。
