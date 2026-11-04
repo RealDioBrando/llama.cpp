@@ -97,3 +97,31 @@ size 768.
 
 The one-time NZ conversion added about 19 seconds to model load in this test
 (`27.59s` to tokenization for ND versus `46.94s` for NZ).
+
+## ACL graph mode
+
+An `USE_ACL_GRAPH=ON` build also passes the W8A8 backend matrix:
+
+| Test set | ND | NZ |
+|---|---:|---:|
+| `MUL_MAT_ID`, W8A8 | 13/13 | 13/13 |
+| `MUL_MAT`, W8A8 dense | 10/10 | 10/10 |
+
+The NZ grouped-matmul workspace is not safe to replay from the CANN 9.1 graph
+cache. A long server decode reproduced an AICore failure in
+`DynamicQuant_fp16_1_high_performance_11000` with an invalid GM address. The
+backend now detects W8A8 NZ expert nodes and automatically uses eager execution
+for that graph, while an ACL graph ON build remains usable elsewhere.
+
+After adding the fallback:
+
+| Test | Result |
+|---|---:|
+| AISBench GSM8K, first 10 cases, 768 output tokens | 10/10 |
+| `pp512` | 333.62 tok/s |
+| `tg128` | 9.04 tok/s |
+
+Matched `USE_ACL_GRAPH=ON` results after the fallback were `197.74 / 4.46`
+tok/s for ND and `333.62 / 9.04` tok/s for NZ (`pp512 / tg128`). The NZ path
+therefore remains about 1.69x faster at prefill and 2.03x faster at decode,
+while avoiding the unstable graph-replay path.

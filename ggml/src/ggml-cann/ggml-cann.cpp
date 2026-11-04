@@ -3527,6 +3527,8 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     }
 
     if (use_cann_graph) {
+        const bool use_nz_moe =
+            parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("off"));
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
             if (node->op == GGML_OP_MUL_MAT_ID &&
@@ -3534,6 +3536,18 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
                 static std::once_flag compact_moe_fallback_once;
                 std::call_once(compact_moe_fallback_once, []() {
                     GGML_LOG_INFO("CANN graph: eager fallback for compact grouped W8A8\n");
+                });
+                use_cann_graph = false;
+                break;
+            }
+            if (use_nz_moe && node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr &&
+                node->src[0]->type == GGML_TYPE_W8A8 && ggml_cann_w8a8_is_expert(node->src[0])) {
+                // The WeightNZ grouped-matmul workspace is not safe to replay
+                // from the ACL graph cache on CANN 9.1. Long server decodes can
+                // fail in DynamicQuant with an invalid GM address.
+                static std::once_flag nz_moe_fallback_once;
+                std::call_once(nz_moe_fallback_once, []() {
+                    GGML_LOG_INFO("CANN graph: eager fallback for W8A8 MoE FRACTAL_NZ\n");
                 });
                 use_cann_graph = false;
                 break;
