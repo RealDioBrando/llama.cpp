@@ -59,6 +59,10 @@ class llama_paged_queue {
     virtual llama_sequence_group_ptr pop()                          = 0;
     virtual bool                  empty() const                     = 0;
     virtual size_t                size() const                      = 0;
+
+    // remove the group with this request_id from the queue, preserving the
+    // order of the remaining groups; nullptr when not present
+    virtual llama_sequence_group_ptr take(int32_t request_id) { return nullptr; }
 };
 
 // FCFS order: std::deque with keyed insertion.
@@ -90,6 +94,17 @@ class llama_paged_fcfs_queue : public llama_paged_queue {
 
     bool   empty() const override { return queue_.empty(); }
     size_t size() const override { return queue_.size(); }
+
+    llama_sequence_group_ptr take(int32_t request_id) override {
+        for (auto it = queue_.begin(); it != queue_.end(); ++it) {
+            if ((*it)->request_id == request_id) {
+                llama_sequence_group_ptr g = std::move(*it);
+                queue_.erase(it);
+                return g;
+            }
+        }
+        return nullptr;
+    }
 
   private:
     std::deque<llama_sequence_group_ptr> queue_;
@@ -132,6 +147,25 @@ class llama_paged_priority_queue : public llama_paged_queue {
 
     bool   empty() const override { return queue_.empty(); }
     size_t size() const override { return queue_.size(); }
+
+    // pop everything, keep the non-matching groups, rebuild the heap
+    llama_sequence_group_ptr take(int32_t request_id) override {
+        llama_sequence_group_ptr found;
+        std::vector<llama_sequence_group_ptr> keep;
+        while (!queue_.empty()) {
+            llama_sequence_group_ptr g = queue_.top();
+            queue_.pop();
+            if (!found && g->request_id == request_id) {
+                found = std::move(g);
+                continue;
+            }
+            keep.push_back(std::move(g));
+        }
+        for (auto & g : keep) {
+            queue_.push(std::move(g));
+        }
+        return found;
+    }
 
   private:
     std::priority_queue<llama_sequence_group_ptr, std::vector<llama_sequence_group_ptr>, group_follows> queue_;

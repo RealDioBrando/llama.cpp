@@ -193,7 +193,7 @@ static paged_test_fixture make_fixture(uint32_t n_ctx          = 128,
     fixture.kv->init(fixture.backend, fixture.backend, GGML_TYPE_F16, n_gpu_blocks, n_cpu_blocks, /*watermark=*/0.0f);
 
     fixture.sched = std::unique_ptr<llama_paged_scheduler_impl>(
-        new llama_paged_scheduler_impl(n_ctx, block_size, n_batch, fixture.kv.get(), nullptr, priority_enabled));
+        new llama_paged_scheduler_impl(n_ctx, block_size, n_batch, /*n_pos_per_embd=*/1, fixture.kv.get(), nullptr, priority_enabled));
 
     // Identical dummy prompts would otherwise hit the prefix cache and rewrite
     // n_prompt/n_past, which makes block budgets unstable.
@@ -214,7 +214,9 @@ static llama_sequence_group make_group(int32_t request_id, uint32_t n_prompt, in
 }
 
 // Step once and feed back a token for every scheduled sequence. Returns the
-// request id that was served (the tests always have n_seq == 1).
+// request id that was served (the tests always have n_seq == 1). Mid-prefill
+// chunks advance the KV only: feedback tokens would bump n_decoded and make
+// a chunked prefill look like a finished decode.
 static int32_t step_and_update(paged_test_fixture & f, bool stop) {
     llama_batch batch = {};
     EXPECT_TRUE(f.sched->step(batch) == llama_scheduler_status::OK);
@@ -224,7 +226,17 @@ static int32_t step_and_update(paged_test_fixture & f, bool stop) {
 
     std::vector<llama_token> tok(info->n_seq, 7);
     std::vector<int8_t>      flags(info->n_seq, stop ? 1 : 0);
-    f.sched->update(batch, tok, flags.data());
+
+    auto * group = f.sched->get_group_from_id(rid);
+    const bool final_prefill = info->batch_lens[0] > 1 && group != nullptr &&
+                               (int32_t) group->n_past + info->batch_lens[0] == (int32_t) group->n_prompt_total;
+
+    llama_paged_feedback fb = { rid, tok.data(), (int32_t) tok.size(), flags[0] };
+    if (final_prefill || info->batch_lens[0] == 1) {
+        f.sched->update(&batch, &fb, 1);
+    } else {
+        f.sched->update(&batch, nullptr, 0); // mid-prefill chunk: KV advance only
+    }
     llama_batch_free(batch);
     return rid;
 }
@@ -377,7 +389,11 @@ TEST(test_scheduler_running_stays_arrival_ordered) {
 
     std::vector<llama_token> tok(info->n_seq, 7);
     std::vector<int8_t>      stop(info->n_seq, 0);
-    fixture.sched->update(batch, tok, stop.data());
+    llama_paged_feedback     fbs[2] = {
+        { batch.seq_id[info->batch_offsets[0]][0], &tok[0], 1, stop[0] },
+        { batch.seq_id[info->batch_offsets[1]][0], &tok[1], 1, stop[1] },
+    };
+    fixture.sched->update(&batch, fbs, 2);
 }
 
 TEST(test_scheduler_priority_ordering_strict_total_order) {
@@ -493,7 +509,11 @@ TEST(test_scheduler_priority_evicts_scheduled_low_priority) {
         EXPECT_EQ(info->n_seq, 2);
         std::vector<llama_token> tok(info->n_seq, 7);
         std::vector<int8_t>      stop(info->n_seq, 0);
-        fixture.sched->update(batch, tok, stop.data());
+        llama_paged_feedback     fbs[2] = {
+            { batch.seq_id[info->batch_offsets[0]][0], &tok[0], 1, stop[0] },
+            { batch.seq_id[info->batch_offsets[1]][0], &tok[1], 1, stop[1] },
+        };
+        fixture.sched->update(&batch, fbs, 2);
         llama_batch_free(batch);
     }
 
@@ -556,7 +576,11 @@ TEST(test_scheduler_recompute_preserves_priority_and_arrival_seq) {
 
         std::vector<llama_token> tok(info->n_seq, 7);
         std::vector<int8_t>      stop(info->n_seq, 0);
-        fixture.sched->update(batch, tok, stop.data());
+        std::vector<llama_paged_feedback> fbs;
+        for (int i = 0; i < info->n_seq; ++i) {
+            fbs.push_back({ batch.seq_id[info->batch_offsets[i]][0], &tok[i], 1, stop[i] });
+        }
+        fixture.sched->update(&batch, fbs.data(), (int32_t) fbs.size());
     }
     EXPECT_TRUE(recomputed);
 

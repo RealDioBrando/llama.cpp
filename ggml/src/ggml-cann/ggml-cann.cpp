@@ -2077,6 +2077,9 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
     bool is_nz = !is_quantized && !is_kq && tensor->type != GGML_TYPE_BF16 && weight_to_nz &&
                  ggml_cann_is_weight_layout_candidate((const ggml_tensor *) tensor);
 
+#ifdef ASCEND_310P
+    // kq_path is always GGML_CANN_KQ_NONE on other SoCs, so this block
+    // (and the transform_kq helpers above) only exist on the 310P
     if (is_kq) {
         // Re-quantized layout size differs from ggml_nbytes(); upload the full
         // layout size. Gate on the buffer actually having reserved that much.
@@ -2115,6 +2118,7 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
         }
         return;
     }
+#endif  // ASCEND_310P
 
     // Plain tensor (not quantized, not NZ): direct copy, no tracking needed
     if (!is_quantized && !is_nz) {

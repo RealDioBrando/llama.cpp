@@ -619,6 +619,7 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd       (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_inp   (const struct llama_model * model);
+    LLAMA_API int32_t llama_model_n_pos_per_embd(const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd_out   (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer      (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_layer_nextn(const struct llama_model * model);
@@ -1682,6 +1683,7 @@ extern "C" {
         int32_t n_prompt_total;
         int32_t n_decoded;
         int32_t n_past;
+        int32_t paused;  // waiting for the server to append a pending media segment (12.4)
         int64_t t_arrival_us;
         int64_t t_first_token_us;
         int32_t priority;
@@ -1727,13 +1729,85 @@ extern "C" {
 #endif
                                                      );
 
+    // multimodal (12.4): queue a request described as ordered text/media
+    // segments. text rows carry token ids; media rows occupy one KV position
+    // each but are fed as encoder embeddings. media segments may be declared
+    // with embd == NULL when the size is known and the encoder output is not
+    // available yet; the scheduler pauses on them (see seq_state.paused) and
+    // the server appends the embeddings via append_segment.
+    struct llama_paged_segment {
+        const llama_token * tokens;      // text segment rows; NULL for media
+        const float *       embd;        // media segment rows [n_tokens x embd_stride]; NULL = pending encode
+        int32_t             n_tokens;    // rows in this segment
+        int32_t             embd_stride; // media: floats per embd row (n_embd_inp); 0 for text
+        const llama_pos *   pos;         // media mrope positions [n_tokens x 4] row-major; NULL for text
+    };
+
+    LLAMA_API bool llama_paged_scheduler_add_request_segs(struct llama_paged_scheduler *      sched,
+                                                           const struct llama_paged_segment * segs,
+                                                           int32_t                             n_segs,
+                                                           int32_t                             request_id);
+
+    // append the encoder output for a media segment the scheduler paused on.
+    // pos carries n_tokens x 4 mrope positions starting at the paused
+    // boundary. the request resumes on the next step.
+    LLAMA_API bool llama_paged_scheduler_append_segment(struct llama_paged_scheduler *      sched,
+                                                        int32_t                             request_id,
+                                                        const struct llama_paged_segment * seg);
+
     LLAMA_API bool llama_paged_scheduler_prepare_batch(struct llama_paged_scheduler * sched,
                                                        struct llama_batch *           batch);
 
-    LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler * sched,
-                                                struct llama_batch *           batch,
-                                                const llama_token *            tokens,
-                                                const int8_t *                 stop_flags);
+    // post-decode feedback for one request. tokens are the target outputs
+    // generated this step and are appended to the request's logical sequence:
+    // - plain decode / final prefill chunk: n_tokens = 1 (the sampled token)
+    // - speculative verify: n_tokens = number of accepted tokens (drafts plus
+    //   the bonus), 1..n_draft + 1
+    // - forked children sampled out of batch: n_tokens = 1
+    // when the request is part of the batch, KV positions are advanced by the
+    // batch rows first; fewer accepted tokens than rows means the caller
+    // rejects the rest and rolls the request back via
+    // llama_paged_scheduler_truncate. entries not found in the batch are
+    // applied out-of-batch (token bookkeeping only). batch may be NULL when
+    // every entry is out-of-batch.
+    struct llama_paged_feedback {
+        int32_t             request_id;
+        const llama_token * tokens;
+        int32_t             n_tokens;
+        int8_t              stop;   // finish the request after applying this feedback
+    };
+
+    LLAMA_API void llama_paged_scheduler_update(struct llama_paged_scheduler *      sched,
+                                                struct llama_batch *               batch,
+                                                const struct llama_paged_feedback * feedback,
+                                                int32_t                             n_feedback);
+
+    // fork a fully-prefilled request: dst shares src's prompt blocks by
+    // reference and a partially-filled tail block is eagerly copied per child;
+    // hybrid recurrent state is seq_cp-ed. src must have completed its prompt
+    // (n_past not yet advanced by the final chunk is fine). dst must be a free
+    // request id. the child enters the running list ready for decode.
+    LLAMA_API bool llama_paged_scheduler_fork_request(struct llama_paged_scheduler * sched,
+                                                       int32_t                        src_id,
+                                                       int32_t                        dst_id);
+
+    // tentatively extend the next decode step with draft tokens: the batch
+    // holds 1 + n_draft rows for this seq with logits on every row. the draft
+    // is consumed by the next prepare_batch; acceptance is decided by the
+    // caller via llama_paged_scheduler_update, followed by truncate on
+    // partial rejection.
+    LLAMA_API bool llama_paged_scheduler_attach_draft(struct llama_paged_scheduler * sched,
+                                                       int32_t                        request_id,
+                                                       const llama_token *            draft,
+                                                       int32_t                        n_draft);
+
+    // roll a request back to n_past_new tokens: KV beyond is released (shared
+    // blocks drop their ref, owned blocks are freed, the partial tail block is
+    // kept). used after a speculative step that accepted fewer tokens than
+    // were tentatively decoded.
+    LLAMA_API bool llama_paged_scheduler_truncate(struct llama_paged_scheduler * sched,
+                                                   int32_t                        request_id,
+                                                   int32_t                        n_past_new);
 
     // Introspection.
     LLAMA_API bool llama_paged_scheduler_get_seq_state(struct llama_paged_scheduler * sched,
@@ -1749,6 +1823,17 @@ extern "C" {
     LLAMA_API void llama_paged_scheduler_set_on_finish(struct llama_paged_scheduler * sched,
                                                        llama_paged_on_finish_cb       cb,
                                                        void *                         user_data);
+
+    // Cancel a queued or in-flight request. The request is removed from the
+    // scheduler, its blocks are released (CPU-pool blocks included) and the
+    // finish callback fires synchronously. Returns false when request_id is
+    // unknown (already finished or never added).
+    LLAMA_API bool llama_paged_scheduler_cancel(struct llama_paged_scheduler * sched,
+                                                int32_t                        request_id);
+
+    // Exclusive upper bound for request ids: the paged memory's n_seq_max,
+    // minus the prefix-cache checkpoint slot reservation on hybrid models.
+    LLAMA_API int32_t llama_paged_scheduler_max_request_id(const struct llama_paged_scheduler * sched);
 #ifdef __cplusplus
 }
 #endif
