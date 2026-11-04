@@ -392,10 +392,10 @@ void server_scheduler_paged::update() {
             continue;
         }
 
-        // accounting: the chunk's rows are prompt rows (placeholders)
+        // the scheduler's prefill accounting already counts the appended rows,
+        // only track the chunk ordering here
         slot.prompt.tokens.push_back_placeholder(target);
         slot.n_media_appended++;
-        slot.stats.n_prompt_processed += (uint64_t) n_tok;
         slot.stats.update_prompt_last();
 
         // overlap the next media chunk's encode with the following steps
@@ -703,7 +703,8 @@ const mtmd_input_chunk * server_scheduler_paged::find_media_chunk(server_slot & 
     for (int k = 0; k <= slot.n_media_appended; ++k) {
         auto [c, i] = slot.task->tokens.find_next_media_chunk(search_from);
         if (c == nullptr) {
-            break;
+            // fewer chunks than expected: no pending media left
+            return nullptr;
         }
         target      = c->get();
         if (idx) {
