@@ -651,7 +651,7 @@ struct ggml_cann_rope_cache {
         return id > 0 && id <= generations.size() && generations[id - 1].live;
     }
 
-    void note_param_change(const char *, void *) {
+    void note_param_change() {
         ++param_epoch;
     }
 
