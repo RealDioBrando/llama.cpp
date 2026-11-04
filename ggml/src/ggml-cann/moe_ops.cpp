@@ -56,7 +56,7 @@ bool ggml_cann_mul_mat_id_grouped_uses_compact_groups(const ggml_tensor * dst) {
         return false;
     }
 
-    const bool use_nz = parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("off"));
+    const bool use_nz = ggml_cann_moe_weight_nz_enabled();
     const int64_t n_rows = ids->ne[0] * ids->ne[1];
     return !use_nz && n_rows < weight->ne[2];
 }
@@ -108,9 +108,9 @@ void ggml_cann_mul_mat_id_grouped(ggml_backend_cann_context & ctx, ggml_tensor *
 
     GGML_ASSERT(ggml_cann_mul_mat_id_grouped_supported(dst));
 
-    // ND is the stable path; NZ is experimental and default-off.
-    const bool use_nz =
-        parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("off"));
+    // FRACTAL_NZ is the default W8A8 expert layout on 310P. Set
+    // GGML_CANN_MOE_WEIGHT_NZ=0 to force the ND path.
+    const bool use_nz = ggml_cann_moe_weight_nz_enabled();
     // CANN 9.1.0 can return incorrect results when most expert groups are empty.
     // Compact only the ND path, because the NZ operator consumes all experts.
     const bool compact_groups = ggml_cann_mul_mat_id_grouped_uses_compact_groups(dst);

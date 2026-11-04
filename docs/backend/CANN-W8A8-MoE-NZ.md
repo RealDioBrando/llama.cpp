@@ -1,12 +1,14 @@
 # W8A8 MoE FRACTAL_NZ path on Ascend 310P
 
-This branch adds an opt-in FRACTAL_NZ weight path for W8A8 routed experts:
+This branch enables the FRACTAL_NZ weight path by default for W8A8 routed
+experts on Ascend 310P. The ND path remains available for comparison and
+debugging:
 
 ```text
-GGML_CANN_MOE_WEIGHT_NZ=1
+GGML_CANN_MOE_WEIGHT_NZ=0
 ```
 
-The existing ND grouped-matmul path remains the default.
+A non-310P build keeps ND as the default.
 
 ## Layout
 
@@ -36,7 +38,7 @@ for a representative `[16, 64, 64]` expert tensor.
 - Expert weights only; dense W8A8 uses its existing transformed path.
 - `K % 32 == 0`.
 - `N % 16 == 0`.
-- The path remains opt-in.
+- The path is default-on for 310P and can be disabled with `GGML_CANN_MOE_WEIGHT_NZ=0`.
 
 ## Correctness
 
@@ -125,3 +127,12 @@ Matched `USE_ACL_GRAPH=ON` results after the fallback were `197.74 / 4.46`
 tok/s for ND and `333.62 / 9.04` tok/s for NZ (`pp512 / tg128`). The NZ path
 therefore remains about 1.69x faster at prefill and 2.03x faster at decode,
 while avoiding the unstable graph-replay path.
+
+Default selection was also verified without setting
+`GGML_CANN_MOE_WEIGHT_NZ`:
+
+| Configuration | Result |
+|---|---:|
+| ACL graph OFF, default NZ, W8A8 `MUL_MAT_ID` | 13/13 |
+| ACL graph ON, default NZ, AISBench GSM8K 10 cases | 10/10 |
+| ACL graph ON, default NZ, `pp512` / `tg128` | 336.28 / 8.82 tok/s |

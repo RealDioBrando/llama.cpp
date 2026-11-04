@@ -1823,8 +1823,7 @@ static void ggml_backend_cann_w8a8_upload_a8(ggml_tensor * tensor, const void * 
             tensor->extra = nullptr;
         }
 
-        const bool use_nz =
-            parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("off"));
+        const bool use_nz = ggml_cann_moe_weight_nz_enabled();
         const size_t payload_size = ggml_cann_w8a8_expert_transformed_size(tensor);
         if (use_nz) {
             const int64_t n_blocks = (expert_n + 15) / 16;
@@ -1950,8 +1949,7 @@ static void ggml_backend_cann_w8a8_get_tensor(const ggml_tensor * tensor, void *
 
         std::vector<int8_t> weights(static_cast<size_t>(expert_count * expert_n * expert_k));
         std::vector<float> scales(static_cast<size_t>(expert_count * expert_n));
-        const bool use_nz =
-            parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("off"));
+        const bool use_nz = ggml_cann_moe_weight_nz_enabled();
         if (use_nz) {
             // Reverse the private FRACTAL_NZ payload so callers always observe
             // the public 34-byte W8A8 block representation.
@@ -3527,8 +3525,7 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     }
 
     if (use_cann_graph) {
-        const bool use_nz_moe =
-            parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("off"));
+        const bool use_nz_moe = ggml_cann_moe_weight_nz_enabled();
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
             if (node->op == GGML_OP_MUL_MAT_ID &&
