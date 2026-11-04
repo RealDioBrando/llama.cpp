@@ -791,7 +791,7 @@ rebase 到含请求优先级调度(!23/!29)的 origin/develop 后的增量适配
 | 阶段二 | 工具调用:get_weather({"city": "Paris"}),finish_reason=tool_calls | 通过 |
 | 阶段二 | n_cmpl>1:n=2 返回 2 choices | 通过 |
 | 阶段二 | json_schema 严格约束输出 | 通过 |
-| 阶段二 | 投机推理:启动放行,运行时输出错误 | 未通过,见 11.3 缺陷 2 |
+| 阶段二 | 投机推理:启动放行,运行时输出错误 | 未通过,见 10.3 缺陷 2 |
 | 门禁 | -b != -ub 报错;--kv-paged + --kv-unified 告警关闭;双卡报错附修复建议;--embeddings / --reranking / --cache-ram 启动报错;--cache-reuse 告警关闭;/infill 请求期 501;embeddings / rerank 端点 501;图像输入明确报错 | 全部符合设计 |
 | 对比 | 同 prompt 贪婪 16 token,paged 与 default 逐字一致 | 通过 |
 
@@ -801,7 +801,7 @@ rebase 到含请求优先级调度(!23/!29)的 origin/develop 后的增量适配
    `kv_paged=true`,load_model 对 ctx_dft 的探测式 `common_context_can_seq_rm` 在无路由
    元数据的 paged ctx 上触发 `llama-kv-cache-paged.cpp:375` 断言(目标 ctx 在
    server-context.cpp 已有同款特判,draft 漏了)。修复:`params_dft.kv_paged = false`,
-   对齐 12.3"draft 保持经典 KV"。
+   对齐 9.3"draft 保持经典 KV"。
 2. (已修复 4 处)投机推理在 paged 路径的账本缺陷:update post 循环的 verify 门位于
    sample_now 判断之后,verify 批(len = 1 + n_draft)被当作 prefill 中途块跳过,
    verify_slot 不可达;attach 重复推入 pending token(plain 路径已推);truncate 在
@@ -834,5 +834,3 @@ rebase 到含请求优先级调度(!23/!29)的 origin/develop 后的增量适配
   CALC_TYPE_SPEC 张量契约重查;
 - e2e 的 N_COMPARE=4 等价窗口是否按平台/模型放宽,由 owner 决定;
 - 910B 内核适配若立项,另开文档。
-
-## 12. 第二阶段设计:四个明确支持的特性

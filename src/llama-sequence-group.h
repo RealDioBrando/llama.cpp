@@ -13,7 +13,7 @@ enum class llama_sequence_group_status {
     RUNNING,
     SWAPPED,
     FINISHED,
-    PAUSED_EXTERNAL  // 12.4: waiting for the server to append a media segment's embeddings
+    PAUSED_EXTERNAL  // 9.4: waiting for the server to append a media segment's embeddings
 };
 
 using llama_block_ids = std::vector<uint32_t>;
