@@ -10,8 +10,7 @@
 #include <aclnnop/aclnn_moe_token_unpermute.h>
 #include <aclnnop/aclnn_quant_grouped_matmul_dequant.h>
 #include <aclnnop/aclnn_quant_grouped_matmul_dequant_weight_nz.h>
-#include <aclnnop/aclnn_sort.h>
-#include <aclnnop/aclnn_unique_consecutive.h>
+#include <aclnnop/aclnn_nonzero.h>
 #include <aclnnop/aclnn_cumsum.h>
 
 #include <vector>
@@ -40,7 +39,7 @@ static int64_t acl_tensor_first_dim(const aclTensor * tensor) {
     int64_t * dims = nullptr;
     uint64_t dim_count = 0;
     ACL_CHECK(aclGetViewShape(tensor, &dims, &dim_count));
-    GGML_ASSERT(dim_count == 1);
+    GGML_ASSERT(dim_count == 1 || (dim_count == 2 && dims[1] == 1));
     return dims[0];
 }
 
@@ -214,8 +213,9 @@ void ggml_cann_mul_mat_id_grouped(ggml_backend_cann_context & ctx, ggml_tensor *
     acl_tensor_ptr acl_cumsum_i32 = ggml_cann_create_tensor(cumsum_i32_alloc.get(), ACL_INT32,
                                                             sizeof(int32_t), cumsum_ne, cumsum_i32_nb, 1);
 
+    const int64_t expert_stats_flag = compact_groups ? 2 : 1;
     GGML_CANN_CALL_ACLNN_OP(ctx, MoeInitRoutingV2, acl_x.get(), acl_routing_ids.get(), n_rows, 0, n_exp,
-                            0, 1, false, acl_sorted_x.get(), acl_row_idx.get(),
+                            0, expert_stats_flag, false, acl_sorted_x.get(), acl_row_idx.get(),
                             acl_cumsum_i32.get(), nullptr);
 
     acl_tensor_ptr acl_cumsum_i32_src = ggml_cann_create_tensor(cumsum_i32_alloc.get(), ACL_INT32,
@@ -246,82 +246,73 @@ void ggml_cann_mul_mat_id_grouped(ggml_backend_cann_context & ctx, ggml_tensor *
         void * weight_scale_data = (char *) weight->data + ggml_cann_w8a8_expert_scale_offset(weight);
 
         if (compact_groups) {
-            // Build a compact group list from only the experts that actually occur.
-            // This avoids the CANN empty-group bug and keeps the operator input dense.
-            ggml_cann_pool_alloc sorted_ids_alloc(ctx.pool(), n_rows * sizeof(int32_t));
-            ggml_cann_pool_alloc sort_index_alloc(ctx.pool(), n_rows * sizeof(int64_t));
-            ggml_cann_pool_alloc unique_ids_alloc(ctx.pool(), n_rows * sizeof(int32_t));
-            ggml_cann_pool_alloc unique_counts_alloc(ctx.pool(), n_rows * sizeof(int64_t));
-            ggml_cann_pool_alloc unique_inverse_alloc(ctx.pool(), n_rows * sizeof(int64_t));
+            // CANN 9.1 QuantGroupedMatmulDequant mishandles empty groups.
+            // Nonzero is supported on Atlas inference products; UniqueConsecutive is not.
+            ggml_cann_pool_alloc active_ids_alloc(ctx.pool(), n_exp * sizeof(int64_t));
+            ggml_cann_pool_alloc compact_counts_alloc(ctx.pool(), n_rows * sizeof(int32_t));
+            ggml_cann_pool_alloc compact_group_alloc(ctx.pool(), n_rows * sizeof(int64_t));
 
-            ACL_CHECK(aclrtMemsetAsync(unique_ids_alloc.get(), n_rows * sizeof(int32_t), 0,
-                                       n_rows * sizeof(int32_t), ctx.stream()));
-            ACL_CHECK(aclrtMemsetAsync(unique_counts_alloc.get(), n_rows * sizeof(int64_t), 0,
-                                       n_rows * sizeof(int64_t), ctx.stream()));
+            ACL_CHECK(aclrtMemsetAsync(active_ids_alloc.get(), n_exp * sizeof(int64_t), 0,
+                                       n_exp * sizeof(int64_t), ctx.stream()));
 
-            int64_t flat_ne[1] = { n_rows };
-            int64_t ids_nb[1] = { 1 };
-            int64_t i64_nb[1] = { 1 };
-            acl_tensor_ptr acl_ids_flat = make_direct_tensor(routing_ids_data, flat_ne, ids_nb, 1,
-                                                             ACL_INT32);
-            acl_tensor_ptr acl_sorted_ids = make_direct_tensor(sorted_ids_alloc.get(), flat_ne,
-                                                               ids_nb, 1, ACL_INT32);
-            acl_tensor_ptr acl_sort_index = make_direct_tensor(sort_index_alloc.get(), flat_ne,
-                                                               i64_nb, 1, ACL_INT64);
-            acl_tensor_ptr acl_unique_ids = make_direct_tensor(unique_ids_alloc.get(), flat_ne,
-                                                               ids_nb, 1, ACL_INT32);
-            acl_tensor_ptr acl_unique_counts = make_direct_tensor(unique_counts_alloc.get(), flat_ne,
-                                                                  i64_nb, 1, ACL_INT64);
-            acl_tensor_ptr acl_unique_inverse = make_direct_tensor(unique_inverse_alloc.get(), flat_ne,
-                                                                   i64_nb, 1, ACL_INT64);
+            int64_t expert_counts_ne[1] = { n_exp };
+            int64_t expert_counts_nb[1] = { 1 };
+            int64_t active_ids_ne[2] = { n_exp, 1 };
+            int64_t active_ids_nb[2] = { 1, n_exp };
 
-            GGML_CANN_CALL_ACLNN_OP(ctx, Sort, acl_ids_flat.get(), true, 0, false,
-                                    acl_sorted_ids.get(), acl_sort_index.get());
-            GGML_CANN_CALL_ACLNN_OP(ctx, UniqueConsecutive, acl_sorted_ids.get(), false, true, 0,
-                                    acl_unique_ids.get(), acl_unique_inverse.get(),
-                                    acl_unique_counts.get());
+            acl_tensor_ptr acl_expert_counts = make_direct_tensor(cumsum_i32_alloc.get(), expert_counts_ne,
+                                                                  expert_counts_nb, 1, ACL_INT32);
+            acl_tensor_ptr acl_active_ids = make_direct_tensor(active_ids_alloc.get(), active_ids_ne,
+                                                               active_ids_nb, 2, ACL_INT64);
+            GGML_CANN_CALL_ACLNN_OP(ctx, Nonzero, acl_expert_counts.get(), acl_active_ids.get());
 
-            const int64_t unique_count = acl_tensor_first_dim(acl_unique_counts.get());
-            GGML_ASSERT(unique_count > 0 && unique_count <= n_rows);
+            const int64_t active_count = acl_tensor_first_dim(acl_active_ids.get());
+            GGML_ASSERT(active_count > 0 && active_count <= n_exp);
+
+            int64_t active_ne[1] = { active_count };
+            int64_t active_i64_nb[1] = { 1 };
+            int64_t active_i32_nb[1] = { 1 };
+            acl_tensor_ptr acl_active_ids_flat = make_direct_tensor(active_ids_alloc.get(), active_ne,
+                                                                   active_i64_nb, 1, ACL_INT64);
+            acl_tensor_ptr acl_compact_counts = make_direct_tensor(compact_counts_alloc.get(), active_ne,
+                                                                   active_i32_nb, 1, ACL_INT32);
+            acl_tensor_ptr acl_compact_group = make_direct_tensor(compact_group_alloc.get(), active_ne,
+                                                                  active_i64_nb, 1, ACL_INT64);
+
+            GGML_CANN_CALL_ACLNN_OP(ctx, GatherV2, acl_expert_counts.get(), 0,
+                                    acl_active_ids_flat.get(), acl_compact_counts.get());
+            GGML_CANN_CALL_ACLNN_OP(ctx, Cumsum, acl_compact_counts.get(), 0, ACL_INT64,
+                                    acl_compact_group.get());
 
             ggml_cann_pool_alloc compact_weight_alloc(
-                ctx.pool(), static_cast<size_t>(unique_count * n_ff * n_embd));
+                ctx.pool(), static_cast<size_t>(active_count * n_ff * n_embd));
             ggml_cann_pool_alloc compact_scale_alloc(
-                ctx.pool(), static_cast<size_t>(unique_count * n_ff) * sizeof(float));
-            ggml_cann_pool_alloc compact_group_alloc(ctx.pool(), unique_count * sizeof(int64_t));
+                ctx.pool(), static_cast<size_t>(active_count * n_ff) * sizeof(float));
 
-            int64_t compact_ne[1] = { unique_count };
-            int64_t weight_ne[3] = { n_exp, n_ff, n_embd };
-            int64_t weight_nb[3] = { n_ff * n_embd, n_embd, 1 };
-            int64_t compact_weight_ne[3] = { unique_count, n_ff, n_embd };
+            int64_t source_weight_ne[3] = { n_exp, n_ff, n_embd };
+            int64_t source_weight_nb[3] = { n_ff * n_embd, n_embd, 1 };
+            int64_t compact_weight_ne[3] = { active_count, n_ff, n_embd };
             int64_t compact_weight_nb[3] = { n_ff * n_embd, n_embd, 1 };
-            int64_t scale_ne[2] = { n_exp, n_ff };
-            int64_t scale_nb[2] = { n_ff, 1 };
-            int64_t compact_scale_ne[2] = { unique_count, n_ff };
+            int64_t source_scale_ne[2] = { n_exp, n_ff };
+            int64_t source_scale_nb[2] = { n_ff, 1 };
+            int64_t compact_scale_ne[2] = { active_count, n_ff };
             int64_t compact_scale_nb[2] = { n_ff, 1 };
 
-            acl_tensor_ptr acl_compact_ids = make_direct_tensor(unique_ids_alloc.get(), compact_ne,
-                                                                ids_nb, 1, ACL_INT32);
-            acl_tensor_ptr acl_source_weight = make_direct_tensor(weight->data, weight_ne, weight_nb,
-                                                                 3, ACL_INT8);
+            acl_tensor_ptr acl_source_weight = make_direct_tensor(weight->data, source_weight_ne,
+                                                                 source_weight_nb, 3, ACL_INT8);
             acl_tensor_ptr acl_compact_weight = make_direct_tensor(compact_weight_alloc.get(),
-                                                                   compact_weight_ne,
-                                                                   compact_weight_nb, 3, ACL_INT8);
-            acl_tensor_ptr acl_source_scale = make_direct_tensor(weight_scale_data, scale_ne,
-                                                                 scale_nb, 2, ACL_FLOAT);
+                                                                  compact_weight_ne, compact_weight_nb,
+                                                                  3, ACL_INT8);
+            acl_tensor_ptr acl_source_scale = make_direct_tensor(weight_scale_data, source_scale_ne,
+                                                                source_scale_nb, 2, ACL_FLOAT);
             acl_tensor_ptr acl_compact_scale = make_direct_tensor(compact_scale_alloc.get(),
-                                                                 compact_scale_ne, compact_scale_nb,
-                                                                 2, ACL_FLOAT);
-            acl_tensor_ptr acl_compact_group = make_direct_tensor(compact_group_alloc.get(),
-                                                                  compact_ne, i64_nb, 1,
-                                                                  ACL_INT64);
+                                                                 compact_scale_ne, compact_scale_nb, 2,
+                                                                 ACL_FLOAT);
 
-            GGML_CANN_CALL_ACLNN_OP(ctx, Cumsum, acl_unique_counts.get(), 0, ACL_INT64,
-                                    acl_compact_group.get());
             GGML_CANN_CALL_ACLNN_OP(ctx, GatherV2, acl_source_weight.get(), 0,
-                                    acl_compact_ids.get(), acl_compact_weight.get());
+                                    acl_active_ids_flat.get(), acl_compact_weight.get());
             GGML_CANN_CALL_ACLNN_OP(ctx, GatherV2, acl_source_scale.get(), 0,
-                                    acl_compact_ids.get(), acl_compact_scale.get());
+                                    acl_active_ids_flat.get(), acl_compact_scale.get());
             GGML_CANN_CALL_ACLNN_OP(ctx, QuantGroupedMatmulDequant,
                                     acl_gmm_in.get(), acl_compact_weight.get(),
                                     acl_compact_scale.get(), acl_compact_group.get(), nullptr,

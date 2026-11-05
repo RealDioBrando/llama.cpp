@@ -735,7 +735,8 @@ bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
         return false;
     }
 
-    // Router fusion is not valid for W8A8 grouped MoE on this CANN build.
+    // MoeGatingTopKSoftmax and V2 do not list Atlas inference products
+    // as supported; keep router fusion opt-in on 310P.
     const bool enabled = env_enabled("GGML_CANN_MOE_ROUTER_FUSION", !graph_has_w8a8_expert);
     if (!enabled) {
         return false;
@@ -876,8 +877,7 @@ bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
                                                         sizeof(float), topk_ne, topk32_nb, 2);
     GGML_CANN_CALL_ACLNN_OP(ctx, Div, acl_w32.get(), acl_sum.get(), acl_norm32.get());
 
-    // Full fusion is numerically invalid for W8A8 expert weights on this CANN
-    // build, so bypass it automatically when grouped MoE A8 is selected.
+    // Full fusion uses the F16-only run_moe_gmm path; keep it off for W8A8 experts.
     const bool full_fusion =
         env_enabled("GGML_CANN_MOE_FULL_FUSION", !graph_has_w8a8_expert);
     if (full_fusion &&
@@ -910,8 +910,7 @@ bool ggml_cann_moe_gate_up_fused(ggml_backend_cann_context & ctx,
     }
 
     static const bool enabled = env_enabled("GGML_CANN_MOE_SWIGLU_FUSION", false);
-    // Full fusion is numerically invalid for W8A8 expert weights on this CANN
-    // build, so bypass it automatically when grouped MoE A8 is selected.
+    // Full fusion uses the F16-only run_moe_gmm path; keep it off for W8A8 experts.
     const bool full_fusion =
         env_enabled("GGML_CANN_MOE_FULL_FUSION", !graph_has_w8a8_expert);
     static const bool debug =
