@@ -3881,14 +3881,18 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     return false;
                 }
 #ifdef ASCEND_310P
-                // The generic partial-IMROPE path is not stable for
-                // single-token query decode on 310P. Full-width rotation
-                // stays on the 310P composite path, and the head-count check
-                // keeps the smaller K tensor on CANN for grouped-query models.
+                // Atlas inference products impose this documented constraint
+                // on aclnnRotaryPositionEmbedding for BNSD partial rotation:
+                // D <= 128, D % 32 == 0, and B * N <= S * 8. Do not send an
+                // out-of-contract shape to the vendor operator; its output is
+                // undefined. Full-width rotation uses the 310P composite path.
                 const int32_t * rope_params = (const int32_t *) op->op_params;
                 const int * sections = rope_params + 11;
+                const int64_t rope_dims = rope_params[1];
                 if (rope_params[2] == GGML_ROPE_TYPE_IMROPE && sections[3] == 0 &&
-                    rope_params[1] < op->ne[0] && op->ne[1] > 4 && op->ne[2] == 1) {
+                    rope_dims < op->ne[0] &&
+                    (rope_dims > 128 || rope_dims % 32 != 0 ||
+                     op->ne[1] * op->ne[3] > op->ne[2] * 8)) {
                     return false;
                 }
                 // Partial rope (n_dims < ne[0]) takes the
