@@ -10,7 +10,7 @@ import torch
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .base import LazyTorchTensor, ModelBase, TextModel, gguf, logger
+from .base import LazyTorchTensor, ModelBase, ModelType, TextModel, get_model_architecture, gguf, logger
 
 
 @ModelBase.register("QWenLMHeadModel")
@@ -651,6 +651,28 @@ class Qwen3_5MoeTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
 class DFlashModel(Qwen3Model):
     model_arch = gguf.MODEL_ARCH.DFLASH
 
+    def __init__(self, dir_model, *args, **kwargs):
+        hparams = kwargs.pop("hparams", None)
+        if hparams is None:
+            hparams = ModelBase.load_hparams(dir_model, False)
+
+        # Speculators exports keep the backbone configuration in a nested object.
+        if "transformer_layer_config" in hparams:
+            hparams = {**hparams, **hparams["transformer_layer_config"]}
+            dflash_config = dict(hparams.get("dflash_config", {}))
+            for key in ("block_size", "mask_token_id", "conv_kernel_size", "conv_group_size",
+                        "selector_rank", "selector_top_k"):
+                if key in hparams:
+                    dflash_config.setdefault(key, hparams[key])
+            if "aux_hidden_state_layer_ids" in hparams:
+                # set_gguf_parameters adds one to convert layer outputs to input taps.
+                dflash_config.setdefault("target_layer_ids", [i - 1 for i in hparams["aux_hidden_state_layer_ids"]])
+            elif "target_layer_ids" in hparams:
+                dflash_config.setdefault("target_layer_ids", hparams["target_layer_ids"])
+            hparams["dflash_config"] = dflash_config
+
+        super().__init__(dir_model, *args, hparams=hparams, **kwargs)
+
     def set_vocab(self):
         if self.target_model_dir is None:
             raise ValueError(
@@ -666,7 +688,8 @@ class DFlashModel(Qwen3Model):
         from . import get_model_class
         with open(self.target_model_dir / "config.json", "r", encoding="utf-8") as f:
             target_hparams = json.load(f)
-            target_arch = target_hparams["architectures"][0]
+        # Resolve vision wrappers to the text architecture used for vocabulary loading.
+        target_arch = get_model_architecture(target_hparams, ModelType.TEXT)
         target_cls = get_model_class(target_arch)
 
         if target_cls is not type(self):
@@ -730,9 +753,11 @@ class DFlashModel(Qwen3Model):
         if causal is not None:
             self.gguf_writer.add_causal_attention(bool(causal))
 
-        # M-RoPE target: the draft ropes on the temporal dim only, so write
-        # degenerate sections [n_rot/2, 0, 0, 0]
-        if self._target_uses_mrope():
+        if "mrope_section" in self.rope_parameters:
+            # Keep the draft's trained spatial sections and frequency layout.
+            self.gguf_writer.add_rope_mrope_interleaved(bool(self.rope_parameters.get("mrope_interleaved", False)))
+        elif self._target_uses_mrope():
+            # Legacy drafts without spatial sections use the target's temporal axis.
             head_dim = self.hparams.get("head_dim") or self.hparams["hidden_size"] // self.hparams["num_attention_heads"]
             self.gguf_writer.add_rope_dimension_sections([head_dim // 2, 0, 0, 0])
 

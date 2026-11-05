@@ -332,7 +332,7 @@ static paged_test_fixture make_fixture(uint32_t n_ctx        = 128,
     fixture.kv->init(fixture.backend, fixture.backend, GGML_TYPE_F16, n_gpu_blocks, n_cpu_blocks, /*watermark=*/0.0f);
 
     fixture.sched = std::unique_ptr<llama_paged_scheduler_impl>(
-        new llama_paged_scheduler_impl(n_ctx, block_size, n_batch, fixture.kv.get()));
+        new llama_paged_scheduler_impl(n_ctx, block_size, n_batch, /*n_pos_per_embd=*/1, fixture.kv.get()));
     return fixture;
 }
 
@@ -387,6 +387,76 @@ TEST(test_scheduler_rejects_oversized_prompt) {
     // A request just under the limit is accepted.
     queued = fixture.sched->queue_request(make_group(/*id=*/2, /*n_prompt=*/63));
     EXPECT_TRUE(queued);
+}
+
+TEST(test_scheduler_single_request_decode) {
+    auto fixture = make_fixture(/*n_ctx=*/128, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/8, /*n_cpu_blocks=*/2);
+    fixture.sched->set_prefix_cache_enabled(false);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+
+    llama_batch            batch  = {};
+    llama_scheduler_status status = fixture.sched->step(batch);
+    EXPECT_TRUE(status == llama_scheduler_status::OK);
+    EXPECT_EQ(batch.n_tokens, 32);
+
+    const auto * info = fixture.sched->get_curr_batch_info();
+    EXPECT_TRUE(info != nullptr);
+    EXPECT_EQ(info->n_seq, 1);
+    EXPECT_EQ(info->batch_lens[0], 32);
+    EXPECT_EQ(info->context_lens[0], 32);
+
+    std::vector<llama_token> sampled(1, 42);
+    std::vector<int8_t>      stop(1, 0);
+    llama_paged_feedback     fb = { /*request_id=*/0, sampled.data(), (int32_t) sampled.size(), stop[0] };
+    fixture.sched->update(&batch, &fb, 1);
+
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_EQ(batch.n_tokens, 1);
+
+    info = fixture.sched->get_curr_batch_info();
+    EXPECT_EQ(info->n_seq, 1);
+    EXPECT_EQ(info->batch_lens[0], 1);
+    EXPECT_EQ(info->context_lens[0], 33);
+}
+
+TEST(test_scheduler_multi_request_decode) {
+    auto fixture = make_fixture(/*n_ctx=*/128, /*block_size=*/16, /*n_batch=*/64,
+                                /*n_gpu_blocks=*/8, /*n_cpu_blocks=*/2);
+    fixture.sched->set_prefix_cache_enabled(false);
+
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/0, /*n_prompt=*/32)));
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(/*id=*/1, /*n_prompt=*/32)));
+
+    llama_batch batch = {};
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_EQ(batch.n_tokens, 32);
+
+    std::vector<llama_token> sampled0(1, 42);
+    std::vector<int8_t>      stop0(1, 0);
+    llama_paged_feedback     fb0 = { /*request_id=*/0, sampled0.data(), (int32_t) sampled0.size(), stop0[0] };
+    fixture.sched->update(&batch, &fb0, 1);
+
+    // The scheduler drains prefills one request at a time before decoding.
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_EQ(batch.n_tokens, 32);
+
+    std::vector<llama_token> sampled1(1, 43);
+    std::vector<int8_t>      stop1(1, 0);
+    llama_paged_feedback     fb1 = { /*request_id=*/1, sampled1.data(), (int32_t) sampled1.size(), stop1[0] };
+    fixture.sched->update(&batch, &fb1, 1);
+
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_EQ(batch.n_tokens, 2);
+
+    const auto * info = fixture.sched->get_curr_batch_info();
+    EXPECT_TRUE(info != nullptr);
+    EXPECT_EQ(info->n_seq, 2);
+    EXPECT_EQ(info->batch_lens[0], 1);
+    EXPECT_EQ(info->batch_lens[1], 1);
+    EXPECT_EQ(info->context_lens[0], 33);
+    EXPECT_EQ(info->context_lens[1], 33);
 }
 
 // Testing prefix cache
@@ -475,7 +545,8 @@ TEST(test_scheduler_prefix_cache_hit) {
     const uint32_t blk1 = (uint32_t) info0->block_table[1];
     std::vector<llama_token> sampled(info0->n_seq, 7);
     std::vector<int8_t>      stop(info0->n_seq, 1);
-    fixture.sched->update(batch, sampled, stop.data());
+    llama_paged_feedback fb = { /*request_id=*/0, sampled.data(), (int32_t) sampled.size(), stop[0] };
+    fixture.sched->update(&batch, &fb, 1);
 
     // Finalizing the request keeps its registered blocks cache-resident.
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
@@ -494,7 +565,8 @@ TEST(test_scheduler_prefix_cache_hit) {
 
     const llama_block_ids table1 = g1->block_table;
     std::vector<llama_token> sampled1(1, 8);
-    fixture.sched->update(batch, sampled1, stop.data());
+    llama_paged_feedback fb1 = { /*request_id=*/1, sampled1.data(), (int32_t) sampled1.size(), stop[0] };
+    fixture.sched->update(&batch, &fb1, 1);
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
     EXPECT_EQ(fixture.kv->block_ref_count(blk0), 1u);
     EXPECT_EQ(fixture.kv->block_ref_count(blk1), 1u);
@@ -513,7 +585,8 @@ TEST(test_scheduler_prefix_cache_zero_suffix) {
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
     std::vector<llama_token> sampled(1, 7);
     std::vector<int8_t>      stop(1, 1);
-    fixture.sched->update(batch, sampled, stop.data());
+    llama_paged_feedback fb = { /*request_id=*/0, sampled.data(), (int32_t) sampled.size(), stop[0] };
+    fixture.sched->update(&batch, &fb, 1);
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
 
     // An exact prompt match cannot replay the last token, so one block
@@ -535,7 +608,8 @@ TEST(test_scheduler_prefix_cache_eviction) {
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
     std::vector<llama_token> sampled(1, 7);
     std::vector<int8_t>      stop(1, 1);
-    fixture.sched->update(batch, sampled, stop.data());
+    llama_paged_feedback fb = { /*request_id=*/0, sampled.data(), (int32_t) sampled.size(), stop[0] };
+    fixture.sched->update(&batch, &fb, 1);
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
 
     // Only 3 blocks are free; the fresh request needs 5, so the cache
@@ -572,6 +646,8 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_scheduler_no_deadlock_on_empty);
     RUN(test_scheduler_deadlock_oversize_waiting_request);
     RUN(test_scheduler_rejects_oversized_prompt);
+    RUN(test_scheduler_single_request_decode);
+    RUN(test_scheduler_multi_request_decode);
 
     fprintf(stderr, "test-paged-kv: prefix cache\n");
     RUN(test_block_manager_add_ref);

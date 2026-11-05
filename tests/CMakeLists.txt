@@ -393,3 +393,24 @@ if (LLAMA_TESTS_INSTALL)
 endif()
 add_test(NAME test-paged-kv COMMAND $<TARGET_FILE:test-paged-kv>)
 set_property(TEST test-paged-kv PROPERTY LABELS main)
+
+# Request-priority scheduling tests: also need internal headers in src.
+add_executable(test-req-priority req_priority/test-req-priority.cpp)
+target_link_libraries(test-req-priority PRIVATE llama-common llama)
+target_include_directories(test-req-priority PRIVATE ${PROJECT_SOURCE_DIR}/src)
+if (LLAMA_TESTS_INSTALL)
+    install(TARGETS test-req-priority RUNTIME)
+endif()
+add_test(NAME test-req-priority COMMAND $<TARGET_FILE:test-req-priority>)
+set_property(TEST test-req-priority PROPERTY LABELS main)
+
+# End-to-end inference test for priority scheduling (uses the same tiny model
+# fixture as test-paged-kv-e2e).
+add_executable(test-priority-e2e req_priority/test-priority-e2e.cpp)
+target_link_libraries(test-priority-e2e PRIVATE llama-common llama)
+add_test(NAME test-priority-e2e COMMAND $<TARGET_FILE:test-priority-e2e> -m "${MODEL_DEST}")
+set_tests_properties(test-priority-e2e PROPERTIES FIXTURES_REQUIRED test-download-model)
+if (LLAMA_TESTS_INSTALL)
+    install(TARGETS test-priority-e2e RUNTIME)
+endif()
+set_property(TEST test-priority-e2e PROPERTY LABELS main)

@@ -162,6 +162,7 @@ struct llama_hparams {
     float    yarn_beta_slow   =  1.0f;
 
     std::array<int, 4> rope_sections;
+    bool mrope_interleaved = false;
 
     // Per-layer RoPE enable flags (1 = use RoPE, 0 = NoPE)
     // by default, all layers use RoPE (controlled by rope_finetuned)

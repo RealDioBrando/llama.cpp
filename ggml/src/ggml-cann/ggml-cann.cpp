@@ -41,6 +41,7 @@
 #endif
 #include <stdarg.h>
 
+#include <cstdlib>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -1016,6 +1017,7 @@ struct ggml_backend_cann_buffer_context {
 #ifdef ASCEND_310P
     ggml_cann_tied_output_weight_cache tied_output_weight_cache;
 #endif
+    std::unordered_set<aclTensor *> w8a8_tensors; ///< Resident transformed W8A8 descriptors
 
     /**
      * @brief Constructor to initialize the CANN buffer context.
@@ -1028,7 +1030,12 @@ struct ggml_backend_cann_buffer_context {
     /**
      * @brief Destructor to free the device memory allocated for the buffer.
      */
-    ~ggml_backend_cann_buffer_context() { ACL_CHECK(aclrtFree(dev_ptr)); }
+    ~ggml_backend_cann_buffer_context() {
+        for (aclTensor * tensor : w8a8_tensors) {
+            aclDestroyTensor(tensor);
+        }
+        ACL_CHECK(aclrtFree(dev_ptr));
+    }
 
     /**
      * @brief Get or create a tracker for the given tensor.
@@ -1294,6 +1301,41 @@ static void ggml_backend_cann_transform_back_q8_0(const ggml_tensor * tensor, co
     }
 }
 
+
+static void ggml_backend_cann_transform_w8a8(ggml_tensor * tensor, const void * src, void * dst) {
+    int64_t n_elems     = ggml_nelements(tensor);
+    int64_t groups      = n_elems / QK_W8A8;
+    size_t  quant_bytes = n_elems * sizeof(uint8_t);
+
+    uint8_t *  quant_offset = (uint8_t *) dst;
+    uint16_t * scale_offset = (uint16_t *) ((char *) dst + quant_bytes);
+
+    for (int64_t i = 0; i < groups; i++) {
+        const block_w8a8 * group = (const block_w8a8 *) ((const char *) src + i * sizeof(block_w8a8));
+        *scale_offset            = group->d;
+        scale_offset++;
+        memcpy(quant_offset, group->qs, QK_W8A8);
+        quant_offset += QK_W8A8;
+    }
+}
+
+static void ggml_backend_cann_transform_back_w8a8(const ggml_tensor * tensor, void * src, void * dst) {
+    int64_t n_elems     = ggml_nelements(tensor);
+    int64_t groups      = n_elems / QK_W8A8;
+    size_t  quant_bytes = n_elems * sizeof(uint8_t);
+
+    const uint8_t *  quant_offset = (const uint8_t *) src;
+    const uint16_t * scale_offset = (const uint16_t *) ((char *) src + quant_bytes);
+
+    for (int64_t i = 0; i < groups; i++) {
+        block_w8a8 * group = (block_w8a8 *) ((char *) dst + i * sizeof(block_w8a8));
+        group->d           = *scale_offset;
+        scale_offset++;
+        memcpy(group->qs, quant_offset, QK_W8A8);
+        quant_offset += QK_W8A8;
+    }
+}
+
 /**
  * @brief Transform tensor data based on its type for CANN processing.
  *
@@ -1313,6 +1355,9 @@ static void ggml_backend_cann_transform(ggml_tensor * tensor, const void * src, 
             break;
         case GGML_TYPE_Q8_0:
             ggml_backend_cann_transform_q8_0(tensor, src, dst);
+            break;
+        case GGML_TYPE_W8A8:
+            ggml_backend_cann_transform_w8a8(tensor, src, dst);
             break;
         default:
             break;
@@ -1588,6 +1633,9 @@ static void ggml_backend_cann_transform_back(const ggml_tensor * tensor, void * 
         case GGML_TYPE_Q8_0:
             ggml_backend_cann_transform_back_q8_0(tensor, src, dst);
             break;
+        case GGML_TYPE_W8A8:
+            ggml_backend_cann_transform_back_w8a8(tensor, src, dst);
+            break;
         default:
             break;
     }
@@ -1606,6 +1654,7 @@ static bool need_transform(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_W8A8:
             return true;
         default:
             return false;
@@ -1721,6 +1770,239 @@ static void weight_format_to_nz(ggml_tensor * tensor, int device) {
     ggml_cann_weight_format_to_nz(tensor, device);
 }
 
+// Ask CANN for the exact device-side storage size of a 3D INT8 expert tensor.
+// The result can include backend padding, so E*N*K is not a safe substitute.
+size_t ggml_cann_w8a8_expert_transformed_size(const ggml_tensor * tensor) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_W8A8);
+    GGML_ASSERT(tensor->ne[3] == 1);
+    int64_t shape[3] = { tensor->ne[2], tensor->ne[1], tensor->ne[0] };
+    aclIntArray * shape_array = aclCreateIntArray(shape, 3);
+    uint64_t transformed_size = 0;
+    ACL_CHECK(aclnnCalculateMatmulWeightSizeV2(shape_array, ACL_INT8, &transformed_size));
+    ACL_CHECK(aclDestroyIntArray(shape_array));
+    return static_cast<size_t>(transformed_size);
+}
+
+static void ggml_backend_cann_w8a8_upload_a8(ggml_tensor * tensor, const void * src,
+                                               ggml_backend_cann_buffer_context * ctx) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_W8A8);
+    GGML_ASSERT(tensor->ne[0] % 32 == 0);
+    GGML_ASSERT(tensor->ne[3] == 1);
+
+    // Expert W8A8 weights use a different device layout from dense W8A8 weights.
+    if (ggml_cann_w8a8_is_expert(tensor)) {
+        const int64_t expert_k = tensor->ne[0];
+        const int64_t expert_n = tensor->ne[1];
+        const int64_t expert_count = tensor->ne[2];
+        const int64_t blocks_per_row = expert_k / QK_W8A8;
+        const size_t scale_offset = ggml_cann_w8a8_expert_scale_offset(tensor);
+
+        // Unpack the public 34-byte blocks into a payload plane and one FP32
+        // scale per [expert, output channel]. The repeated-scale invariant is
+        // checked below, so this is a lossless reinterpretation for the payload.
+        std::vector<int8_t> weights(static_cast<size_t>(expert_count * expert_n * expert_k));
+        std::vector<float> scales(static_cast<size_t>(expert_count * expert_n));
+        for (int64_t expert = 0; expert < expert_count; ++expert) {
+            for (int64_t row = 0; row < expert_n; ++row) {
+                const block_w8a8 * blocks = (const block_w8a8 *)
+                    ((const char *) src + (expert * expert_n + row) * blocks_per_row * sizeof(block_w8a8));
+                scales[static_cast<size_t>(expert * expert_n + row)] = ggml_fp16_to_fp32(blocks[0].d);
+                for (int64_t block = 0; block < blocks_per_row; ++block) {
+                    GGML_ASSERT(blocks[block].d == blocks[0].d);
+                    for (int64_t j = 0; j < QK_W8A8; ++j) {
+                        weights[static_cast<size_t>((expert * expert_n + row) * expert_k + block * QK_W8A8 + j)] =
+                            blocks[block].qs[j];
+                    }
+                }
+            }
+        }
+
+        ACL_CHECK(aclrtMemcpy(tensor->data, weights.size(), weights.data(), weights.size(),
+                              ACL_MEMCPY_HOST_TO_DEVICE));
+        ACL_CHECK(aclrtMemcpy((char *) tensor->data + scale_offset, scales.size() * sizeof(float),
+                              scales.data(), scales.size() * sizeof(float), ACL_MEMCPY_HOST_TO_DEVICE));
+        if (scale_offset > weights.size()) {
+            const size_t padding_size = scale_offset - weights.size();
+            ACL_CHECK(aclrtMemset((char *) tensor->data + weights.size(), padding_size, 0, padding_size));
+        }
+        // ND is the stable grouped layout. The NZ layout remains opt-in because
+        // the installed CANN build still has unresolved grouped-matmul issues.
+        const bool transform_expert_weight =
+            parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("off"));
+        if (transform_expert_weight) {
+        int64_t expert_weight_ne[3] = { expert_count, expert_n, expert_k };
+        int64_t expert_weight_nb[3] = { static_cast<int64_t>(expert_n * expert_k),
+                                        static_cast<int64_t>(expert_k), 1 };
+        int64_t expert_weight_storage = expert_count * expert_n * expert_k;
+        acl_tensor_ptr expert_weight(aclCreateTensor(expert_weight_ne, 3, ACL_INT8, expert_weight_nb, 0,
+                                                     ACL_FORMAT_ND, &expert_weight_storage, 1, tensor->data));
+
+        if (tensor->extra != nullptr) {
+            aclTensor * old = (aclTensor *) tensor->extra;
+            ctx->w8a8_tensors.erase(old);
+            ACL_CHECK(aclDestroyTensor(old));
+            tensor->extra = nullptr;
+        }
+
+        uint64_t       workspace_size = 0;
+        aclOpExecutor *executor       = nullptr;
+        ACL_CHECK(aclnnTransMatmulWeightGetWorkspaceSize(expert_weight.get(), &workspace_size, &executor));
+        const int32_t device = g_current_cann_device;
+        aclrtStream stream = nullptr;
+        ACL_CHECK(aclrtCreateStream(&stream));
+        {
+            std::lock_guard<std::mutex> lock(g_nz_workspaces[device].mtx);
+            g_nz_workspaces[device].realloc(workspace_size);
+            ACL_CHECK(aclnnTransMatmulWeight(g_nz_workspaces[device].get(), workspace_size, executor, stream));
+        }
+        ACL_CHECK(aclrtSynchronizeStream(stream));
+        ACL_CHECK(aclrtDestroyStream(stream));
+
+        tensor->extra = expert_weight.release();
+        ctx->w8a8_tensors.insert((aclTensor *) tensor->extra);
+        }
+        return;
+    }
+
+    GGML_ASSERT(tensor->ne[2] == 1);
+    const int64_t k              = tensor->ne[0];
+    const int64_t n              = tensor->ne[1];
+    const int64_t blocks_per_row = k / QK_W8A8;
+    const size_t  hp_elements    = ggml_cann_w8a8_hp_elements(tensor);
+    const size_t  scale_offset   = ggml_cann_w8a8_scale_offset(tensor);
+
+    std::vector<int8_t> hp(hp_elements, 0);
+    std::vector<float>  scales(static_cast<size_t>(n));
+
+    for (int64_t row = 0; row < n; ++row) {
+        const block_w8a8 * blocks =
+            (const block_w8a8 *) ((const char *) src + row * blocks_per_row * sizeof(block_w8a8));
+        scales[static_cast<size_t>(row)] = ggml_fp16_to_fp32(blocks[0].d);
+        for (int64_t block = 0; block < blocks_per_row; ++block) {
+            GGML_ASSERT(blocks[block].d == blocks[0].d);
+            for (int64_t j = 0; j < QK_W8A8; ++j) {
+                hp[static_cast<size_t>(row * k + block * QK_W8A8 + j)] = blocks[block].qs[j];
+            }
+        }
+    }
+
+    ACL_CHECK(aclrtMemcpy(tensor->data, hp.size(), hp.data(), hp.size(), ACL_MEMCPY_HOST_TO_DEVICE));
+    ACL_CHECK(aclrtMemcpy((char *) tensor->data + scale_offset, scales.size() * sizeof(float), scales.data(),
+                          scales.size() * sizeof(float), ACL_MEMCPY_HOST_TO_DEVICE));
+
+    int64_t weight_ne[] = { k, n };
+    size_t  weight_nb[] = { 1, static_cast<size_t>(k) };
+    acl_tensor_ptr weight = ggml_cann_create_tensor(tensor->data, ACL_INT8, (size_t) 1, weight_ne, weight_nb, 2,
+                                                    ACL_FORMAT_ND, 0);
+
+    if (tensor->extra != nullptr) {
+        aclTensor * old = (aclTensor *) tensor->extra;
+        ctx->w8a8_tensors.erase(old);
+        ACL_CHECK(aclDestroyTensor(old));
+        tensor->extra = nullptr;
+    }
+
+    uint64_t       workspace_size = 0;
+    aclOpExecutor *executor       = nullptr;
+    ACL_CHECK(aclnnTransMatmulWeightGetWorkspaceSize(weight.get(), &workspace_size, &executor));
+    const int32_t device = g_current_cann_device;
+    const auto    transform_start = std::chrono::steady_clock::now();
+    aclrtStream stream = nullptr;
+    ACL_CHECK(aclrtCreateStream(&stream));
+    {
+        std::lock_guard<std::mutex> lock(g_nz_workspaces[device].mtx);
+        g_nz_workspaces[device].realloc(workspace_size);
+        ACL_CHECK(aclnnTransMatmulWeight(g_nz_workspaces[device].get(), workspace_size, executor, stream));
+    }
+    ACL_CHECK(aclrtSynchronizeStream(stream));
+    ACL_CHECK(aclrtDestroyStream(stream));
+
+    static const bool log_transform =
+        parse_bool(get_env_as_lowercase("GGML_CANN_W8A8_LOG_TRANSFORM").value_or("off"));
+    if (log_transform) {
+        const auto transform_end = std::chrono::steady_clock::now();
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::microseconds>(transform_end - transform_start).count() /
+            1000.0;
+        GGML_LOG_INFO("%s: W8A8 transform N=%lld K=%lld took %.3f ms\n", __func__,
+                      (long long) n, (long long) k, elapsed_ms);
+    }
+
+    // aclnnTransMatmulWeight refreshes this aclTensor with private layout metadata.
+    // QuantMatmulV5 must consume this exact descriptor, so cache it on the GGML tensor.
+    tensor->extra = weight.release();
+    ctx->w8a8_tensors.insert((aclTensor *) tensor->extra);
+}
+
+static void ggml_backend_cann_w8a8_get_tensor(const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_W8A8);
+    if (ggml_cann_w8a8_is_expert(tensor)) {
+        const int64_t expert_k = tensor->ne[0];
+        const int64_t expert_n = tensor->ne[1];
+        const int64_t expert_count = tensor->ne[2];
+        const size_t scale_offset = ggml_cann_w8a8_expert_scale_offset(tensor);
+        const int64_t blocks_per_row = expert_k / QK_W8A8;
+
+        std::vector<int8_t> weights(static_cast<size_t>(expert_count * expert_n * expert_k));
+        std::vector<float> scales(static_cast<size_t>(expert_count * expert_n));
+        ACL_CHECK(aclrtMemcpy(weights.data(), weights.size(), tensor->data, weights.size(),
+                              ACL_MEMCPY_DEVICE_TO_HOST));
+        ACL_CHECK(aclrtMemcpy(scales.data(), scales.size() * sizeof(float),
+                              (const char *) tensor->data + scale_offset, scales.size() * sizeof(float),
+                              ACL_MEMCPY_DEVICE_TO_HOST));
+
+        std::vector<uint8_t> public_data(ggml_nbytes(tensor));
+        for (int64_t expert = 0; expert < expert_count; ++expert) {
+            for (int64_t row = 0; row < expert_n; ++row) {
+                block_w8a8 * blocks = (block_w8a8 *)
+                    (public_data.data() + (expert * expert_n + row) * blocks_per_row * sizeof(block_w8a8));
+                const ggml_fp16_t scale = ggml_fp32_to_fp16(
+                    scales[static_cast<size_t>(expert * expert_n + row)]);
+                for (int64_t block = 0; block < blocks_per_row; ++block) {
+                    blocks[block].d = scale;
+                    for (int64_t j = 0; j < QK_W8A8; ++j) {
+                        blocks[block].qs[j] =
+                            weights[static_cast<size_t>((expert * expert_n + row) * expert_k + block * QK_W8A8 + j)];
+                    }
+                }
+            }
+        }
+        memcpy(data, public_data.data() + offset, size);
+        return;
+    }
+
+    const int64_t k            = tensor->ne[0];
+    const int64_t n            = tensor->ne[1];
+    const size_t  hp_elements  = ggml_cann_w8a8_hp_elements(tensor);
+    const size_t  scale_offset = ggml_cann_w8a8_scale_offset(tensor);
+    const int64_t n1           = (n + 15) / 16;
+
+    std::vector<int8_t> hp(hp_elements);
+    std::vector<float>  scales(static_cast<size_t>(n));
+    ACL_CHECK(aclrtMemcpy(hp.data(), hp.size(), tensor->data, hp.size(), ACL_MEMCPY_DEVICE_TO_HOST));
+    ACL_CHECK(aclrtMemcpy(scales.data(), scales.size() * sizeof(float), (const char *) tensor->data + scale_offset,
+                          scales.size() * sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST));
+
+    std::vector<uint8_t> public_data(ggml_nbytes(tensor));
+    const int64_t blocks_per_row = k / QK_W8A8;
+    for (int64_t row = 0; row < n; ++row) {
+        block_w8a8 * blocks =
+            (block_w8a8 *) (public_data.data() + row * blocks_per_row * sizeof(block_w8a8));
+        const ggml_fp16_t scale = ggml_fp32_to_fp16(scales[static_cast<size_t>(row)]);
+        for (int64_t block = 0; block < blocks_per_row; ++block) {
+            blocks[block].d = scale;
+            for (int64_t j = 0; j < QK_W8A8; ++j) {
+                const int64_t column = block * QK_W8A8 + j;
+                const size_t physical_index =
+                    static_cast<size_t>(((column / 32) * n1 + row / 16) * 16 + row % 16) * 32 + column % 32;
+                blocks[block].qs[j] = hp[physical_index];
+            }
+        }
+    }
+
+    memcpy(data, public_data.data() + offset, size);
+}
+
 // TODO: need handle tensor which has paddings.
 /**
  * @brief Set tensor data in a CANN buffer.
@@ -1751,6 +2033,26 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
 
     // Only check env once.
     static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
+    if (tensor->type == GGML_TYPE_W8A8) {
+        if (offset == 0 && size == ggml_nbytes(tensor)) {
+            ggml_backend_cann_w8a8_upload_a8(tensor, data, ctx);
+            return;
+        }
+
+        TensorSetTracker * tracker = ctx->get_or_create_tracker(tensor);
+        std::unique_lock<std::mutex> lock(tracker->mtx);
+        if (tracker->host_buffer.empty()) {
+            tracker->host_buffer.resize(tracker->total_bytes);
+        }
+        memcpy(tracker->host_buffer.data() + offset, data, size);
+        tracker->bytes_written += size;
+        if (tracker->bytes_written >= tracker->total_bytes) {
+            ggml_backend_cann_w8a8_upload_a8(tensor, tracker->host_buffer.data(), ctx);
+            lock.unlock();
+            ctx->remove_tracker(tensor);
+        }
+        return;
+    }
 
     bool is_quantized = need_transform(tensor->type);
 #ifdef ASCEND_310P
@@ -1775,6 +2077,9 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
     bool is_nz = !is_quantized && !is_kq && tensor->type != GGML_TYPE_BF16 && weight_to_nz &&
                  ggml_cann_is_weight_layout_candidate((const ggml_tensor *) tensor);
 
+#ifdef ASCEND_310P
+    // kq_path is always GGML_CANN_KQ_NONE on other SoCs, so this block
+    // (and the transform_kq helpers above) only exist on the 310P
     if (is_kq) {
         // Re-quantized layout size differs from ggml_nbytes(); upload the full
         // layout size. Gate on the buffer actually having reserved that much.
@@ -1813,6 +2118,7 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
         }
         return;
     }
+#endif  // ASCEND_310P
 
     // Plain tensor (not quantized, not NZ): direct copy, no tracking needed
     if (!is_quantized && !is_nz) {
@@ -1910,6 +2216,10 @@ static void ggml_backend_cann_buffer_get_tensor(ggml_backend_buffer_t buffer,
 
     ggml_cann_set_device(ctx->device);
 
+    if (tensor->type == GGML_TYPE_W8A8) {
+        ggml_backend_cann_w8a8_get_tensor(tensor, data, offset, size);
+        return;
+    }
 #ifdef ASCEND_310P
     if (ggml_cann_kq_matmul_path(tensor) != GGML_CANN_KQ_NONE) {
         // Re-quantization is lossy: the original GGUF bytes cannot be recovered.
@@ -1950,6 +2260,10 @@ static bool ggml_backend_cann_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
     if (ggml_backend_buft_is_cann(src->buffer->buft)) {
         ggml_backend_cann_buffer_context * src_ctx = (ggml_backend_cann_buffer_context *) src->buffer->context;
         ggml_backend_cann_buffer_context * dst_ctx = (ggml_backend_cann_buffer_context *) buffer->context;
+
+        if (src->type == GGML_TYPE_W8A8) {
+            return false;
+        }
 
         size_t memcpy_size = ggml_nbytes(src);
         // Same device.
@@ -2116,6 +2430,13 @@ static size_t ggml_backend_cann_buffer_type_get_alloc_size(ggml_backend_buffer_t
     // int64_t line_size = ne0 * ggml_element_size(tensor);
     // int64_t line_size_align_32 = (line_size + 31) & ~31;
     // size += (line_size_align_32 - line_size);
+    if (tensor->type == GGML_TYPE_W8A8) {
+        const size_t private_size = ggml_cann_w8a8_is_expert(tensor)
+            ? ggml_cann_w8a8_expert_scale_offset(tensor) + tensor->ne[1] * tensor->ne[2] * sizeof(float)
+            : ggml_cann_w8a8_scale_offset(tensor) + tensor->ne[1] * sizeof(float);
+        return std::max(size, private_size);
+    }
+
     if (ggml_is_quantized(tensor->type)) {
         if (ne0 % MATRIX_ROW_PADDING != 0) {
             size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
@@ -2472,8 +2793,13 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
             ggml_cann_mul_mat(ctx, dst);
             break;
         case GGML_OP_MUL_MAT_ID:
-            if (parse_bool(get_env_as_lowercase("GGML_CANN_MOE_GROUPED").value_or("off")) &&
-                ggml_cann_mul_mat_id_grouped_supported(dst)) {
+            if (dst->src[0]->type == GGML_TYPE_W8A8) {
+                if (!ggml_cann_mul_mat_id_grouped_supported(dst)) {
+                    GGML_ABORT("CANN W8A8 MoE requires a supported 3D expert tensor layout");
+                }
+                ggml_cann_mul_mat_id_grouped(ctx, dst);
+            } else if (parse_bool(get_env_as_lowercase("GGML_CANN_MOE_GROUPED").value_or("off")) &&
+                       ggml_cann_mul_mat_id_grouped_supported(dst)) {
                 ggml_cann_mul_mat_id_grouped(ctx, dst);
             } else {
                 ggml_cann_mul_mat_id(ctx, dst);
@@ -2564,6 +2890,9 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
             break;
         case GGML_OP_GATED_LINEAR_ATTN:
             ggml_cann_gated_linear_attn(ctx, dst);
+            break;
+        case GGML_OP_GATED_DELTA_NET:
+            ggml_cann_gated_delta_net(ctx, dst);
             break;
         case GGML_OP_SSM_CONV:
             ggml_cann_ssm_conv(ctx, dst);
@@ -2793,14 +3122,23 @@ static void ggml_backend_cann_synchronize(ggml_backend_t backend) {
 static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
                                int                                 node_idx,
                                std::initializer_list<enum ggml_op> ops) {
-    if (!ggml_can_fuse(cgraph, node_idx, ops)) {
-        return false;
-    }
-
-    // CANN backend supports fusing ADD + RMS_NORM operations
     if ((ops.size() == 2) && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_RMS_NORM) {
-        ggml_tensor * add_node = cgraph->nodes[node_idx];
-        // TODO: support broadcast for ADD + RMS_NORM
+        ggml_tensor * add_node       = cgraph->nodes[node_idx];
+        ggml_tensor * rms_norm_node  = cgraph->nodes[node_idx + 1];
+
+        if (add_node->op != GGML_OP_ADD || rms_norm_node->op != GGML_OP_RMS_NORM) {
+            return false;
+        }
+        if ((add_node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            (rms_norm_node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+        if (rms_norm_node->src[0] != add_node) {
+            return false;
+        }
+        if (add_node->type != rms_norm_node->type) {
+            return false;
+        }
         if (add_node->src[0]->ne[0] != add_node->src[1]->ne[0] || add_node->src[0]->ne[1] != add_node->src[1]->ne[1] ||
             add_node->src[0]->ne[2] != add_node->src[1]->ne[2] || add_node->src[0]->ne[3] != add_node->src[1]->ne[3]) {
             return false;
@@ -2808,7 +3146,8 @@ static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
         return true;
     }
 
-    return false;
+    // 其他融合模式走 ggml 原生通用判断
+    return ggml_can_fuse(cgraph, node_idx, ops);
 }
 
 #ifdef USE_ACL_GRAPH
@@ -3121,41 +3460,73 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     // graph fingerprint compares addresses, so this was causing re-capture
     // every step (see MATCH-FAIL diagnostics 8/27). The workspace is freed
     // on program exit instead (g_nz_workspaces is static).
-
     // calculate rope cache for fist layer in current device.
     cann_ctx->rope_cache.cached = false;
 
     bool graph_capture_required = false;
 #ifdef USE_ACL_GRAPH
-    bool use_cann_graph = true;
-
-    static bool prefill_use_graph = parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
-    if (!prefill_use_graph) {
-        // Do not use acl_graph for prefill.
-        // Detect prefill vs decode from the token (batch) count of any matmul:
-        // every split carries a matmul whose activation src[1] has ne[1] = m.
-        // Decode has m == 1; prefill has m > 1. This must not rely on finding
-        // an attention op, because GDN-layer splits route the fused delta-net
-        // node to the CPU, so those splits contain no FA/GDN node and would
-        // otherwise be (wrongly) treated as decode and graph-captured.
-        for (int i = 0; i < cgraph->n_nodes; i++) {
-            ggml_tensor * node = cgraph->nodes[i];
-            if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr) {
-                use_cann_graph = (node->src[1]->ne[1] == 1);
-                break;
+    // Paged metadata gives a backend-local phase signal: one token per
+    // sequence is decode, while chunked prefill has several tokens per seq.
+    // Keep the matmul fallback for graphs without paged attention.
+    auto graph_is_prefill = [&](const ggml_cgraph * graph) {
+        bool has_paged_attn = false;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            const ggml_tensor * node = graph->nodes[i];
+            if (node->op != GGML_OP_PAGED_ATTN) {
+                continue;
+            }
+            has_paged_attn = true;
+            if (node->src[6] && node->src[9] && node->src[9]->ne[0] > 0) {
+                return node->src[6]->ne[0] > node->src[9]->ne[0];
             }
         }
+        if (!has_paged_attn) {
+            for (int i = 0; i < graph->n_nodes; i++) {
+                ggml_tensor * node = graph->nodes[i];
+                if (node->op == GGML_OP_MUL_MAT && node->src[1] != nullptr) {
+                    return node->src[1]->ne[1] > 1;
+                }
+            }
+        }
+        return false;
+    };
+
+    static bool prefill_use_graph_override =
+        parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
+    bool use_cann_graph = !graph_is_prefill(cgraph) || prefill_use_graph_override;
+
+    if (!cann_ctx->piecewise_mode) {
+        use_cann_graph = cann_ctx->graph_decode_mode_ptr &&
+            (*cann_ctx->graph_decode_mode_ptr == GGML_GRAPH_PHASE_DECODE ||
+             *cann_ctx->graph_decode_mode_ptr == GGML_GRAPH_PHASE_DRAFT_GENERATE ||
+             *cann_ctx->graph_decode_mode_ptr == GGML_GRAPH_PHASE_DRAFT_KV_INJECT_DECODE);
     }
 
     if (!cann_ctx->acl_graph_mode) {
         use_cann_graph = false;
     }
 
+    if (use_cann_graph) {
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_MUL_MAT_ID &&
+                ggml_cann_mul_mat_id_grouped_uses_compact_groups(node)) {
+                static std::once_flag compact_moe_fallback_once;
+                std::call_once(compact_moe_fallback_once, []() {
+                    GGML_LOG_INFO("CANN graph: eager fallback for compact grouped W8A8\n");
+                });
+                use_cann_graph = false;
+                break;
+            }
+        }
+    }
+
     if (use_cann_graph && !cann_ctx->piecewise_mode) {
         // LRU cache operations (skip when piecewise mode is on)
         // If no matching graph is found, the graph needs to be recaptured.
-            // Debug switch: force re-capture every step.
-            static const bool no_lru = []() {
+            // Debug switch: force re-capture every step. Read per call so
+            // scoped toggles (paged warmup) take effect.
+            const bool no_lru = []() {
                 const char * e = getenv("GGML_CANN_NO_LRU");
                 return e && e[0] == '1';
             }();
@@ -3227,6 +3598,15 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
                 }
             }
 
+            // Grow the gated delta net index cache before capture, it needs a
+            // host-to-device copy which is not allowed during capture.
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                ggml_tensor * node = cgraph->nodes[i];
+                if (node->op == GGML_OP_GATED_DELTA_NET) {
+                    ggml_cann_gdn_cache_preload(*cann_ctx, node);
+                }
+            }
+
             // Pre-create the rms_norm constant caches (ones / zeros
             // vectors) before capture: their first use runs aclrtMalloc +
             // fill, and the malloc is forbidden inside the capture region.
@@ -3237,21 +3617,21 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
                     ggml_tensor * node = cgraph->nodes[i];
                     if (node->op == GGML_OP_RMS_NORM && node->src[0] != nullptr) {
                         const ggml_tensor * s = node->src[0];
+                    const ggml_type one_type = node->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+                    const size_t one_elem_size = ggml_type_size(one_type);
                         int64_t n_el = s->ne[0] * s->ne[1] * s->ne[2] * s->ne[3];
                         if (cann_ctx->rms_norm_one_tensor_cache.size < n_el) {
                             int64_t cn[1] = { n_el };
-                            size_t  cb[1] = { sizeof(float) };
+                        size_t  cb[1] = { one_elem_size };
                             acl_tensor_ptr t1 = ggml_cann_warm_cache_acl_tensor(*cann_ctx,
-                                &cann_ctx->rms_norm_one_tensor_cache.cache,
-                                cann_ctx->rms_norm_one_tensor_cache.size,
-                                cn, cb, GGML_TYPE_F32, 1, 1.0f);
+                                cann_ctx->rms_norm_one_tensor_cache,
+                            cn, cb, one_type, 1, 1.0f);
                         }
                         if (cann_ctx->rms_norm_zero_tensor_cache.size < n_el) {
                             int64_t cn[1] = { n_el };
                             size_t  cb[1] = { sizeof(float) };
                             acl_tensor_ptr t0 = ggml_cann_warm_cache_acl_tensor(*cann_ctx,
-                                &cann_ctx->rms_norm_zero_tensor_cache.cache,
-                                cann_ctx->rms_norm_zero_tensor_cache.size,
+                                cann_ctx->rms_norm_zero_tensor_cache,
                                 cn, cb, GGML_TYPE_F32, 1, 0.0f);
                         }
                         break;  // one RMS norm node is enough to size the caches
@@ -3342,7 +3722,21 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                         return false;
 #endif
                         // only support contiguous for quantized types.
-                        return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+                        return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                               ggml_is_contiguous(op);
+
+#ifdef ASCEND_310P
+                    case GGML_TYPE_W8A8:
+                        return op->src[0]->ne[0] % 32 == 0 &&
+                               op->src[0]->ne[0] <= 65535 &&
+                               op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+                               op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                               (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
+                               (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
+                               ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                               ggml_is_contiguous(op);
+#endif
+
                     case GGML_TYPE_Q4_0:
 #ifdef ASCEND_310P
                     // K-quants: NPU path via W8A8/W4A8 (transform at load, see
@@ -3377,6 +3771,24 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 case GGML_TYPE_F16:
                 case GGML_TYPE_F32:
                     return true;
+#ifdef ASCEND_310P
+                case GGML_TYPE_W8A8: {
+                    static const bool moe_cpu =
+                        parse_bool(get_env_as_lowercase("GGML_CANN_MOE_CPU").value_or("off"));
+                    if (moe_cpu) {
+                        return false;
+                    }
+                    return ggml_cann_w8a8_is_expert(op->src[0]) &&
+                           op->src[0]->ne[0] % 32 == 0 &&
+                           op->src[0]->ne[1] % 16 == 0 &&
+                           op->src[0]->ne[3] == 1 &&
+                           (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
+                           (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
+                           op->src[2]->type == GGML_TYPE_I32 && op->src[2]->nb[0] == sizeof(int32_t) &&
+                           ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                           ggml_is_contiguous(op);
+                }
+#endif
                 case GGML_TYPE_Q8_0:
                 case GGML_TYPE_Q4_0:
 #ifdef ASCEND_310P
@@ -3384,7 +3796,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     return false;
 #endif
                     // only support contiguous for quantized types.
-                    return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+                    return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op);
                 default:
                     return false;
             }
@@ -3459,6 +3871,13 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     return false;
                 }
 #ifdef ASCEND_310P
+                // CANN 310P IMROPE Q is unstable for one-token decode.
+                const int32_t * rope_params = (const int32_t *) op->op_params;
+                const int * sections = rope_params + 11;
+                if (rope_params[2] == GGML_ROPE_TYPE_IMROPE && sections[3] == 0 &&
+                    op->ne[1] > 4 && op->ne[2] == 1) {
+                    return false;
+                }
                 // Partial rope (n_dims < ne[0]) takes the
                 // RotaryPositionEmbedding path in ggml_cann_rope; only
                 // contiguous inputs are supported there.
@@ -3545,6 +3964,55 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_COUNT_EQUAL:
         case GGML_OP_GATED_LINEAR_ATTN:
             return true;
+        case GGML_OP_GATED_DELTA_NET:
+            {
+                // fused path via the standard 310P APIs: decode is a single
+                // recurrent call, prefill is a single chunk call (8-token block
+                // loop as fallback)
+                if (!ggml_cann_gdn_available()) {
+                    return false;
+                }
+                const ggml_tensor * q = op->src[0];
+                const ggml_tensor * v = op->src[2];
+                const ggml_tensor * g = op->src[3];
+                // recurrent kernel supports scalar gating only
+                if (g->ne[0] != 1) {
+                    return false;
+                }
+                // single state snapshot
+                if (ggml_get_op_params_i32(op, 0) != 1) {
+                    return false;
+                }
+                // kernel fold reduction is only correct for head dim 64 and 128, other sizes run on CPU
+                if (q->ne[0] != v->ne[0] || (q->ne[0] != 64 && q->ne[0] != 128) || v->ne[1] % q->ne[1] != 0 ||
+                    q->ne[1] > 256 || v->ne[1] > 256) {
+                    return false;
+                }
+                // GQA head-mapping divergence: the V310 kernel (fla lineage)
+                // maps v-head h to k-head h / (Nv/Nk), the llama.cpp reference
+                // kernels use modulo (h % Nk). The two only agree when
+                // NK == NV, so reject GQA shapes here and let them run on the
+                // CPU reference instead of mismatching.
+                if (q->ne[1] != v->ne[1]) {
+                    return false;
+                }
+                // the glue casts every source via F32 readers, an F16 (or
+                // other type) source would be reinterpreted with wrong
+                // strides/values. F32 in, F32 dst only.
+                for (int i = 0; i < 6; i++) {
+                    if (op->src[i]->type != GGML_TYPE_F32) {
+                        return false;
+                    }
+                }
+                if (op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                // q/k/v only need rows-contiguous (op contract): the model feeds v as a
+                // strided view of the fused qkv projection, the glue gathers it while casting
+                return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]) &&
+                       ggml_is_contiguous_rows(op->src[2]) && ggml_is_contiguous(op->src[3]) &&
+                       ggml_is_contiguous(op->src[4]) && ggml_is_contiguous(op->src[5]);
+            }
         case GGML_OP_OUT_PROD:
             {
 #ifdef ASCEND_310P
@@ -3949,10 +4417,21 @@ static ggml_backend_dev_t ggml_backend_cann_reg_get_device(ggml_backend_reg_t re
     return ctx->devices[index];
 }
 
+#ifdef USE_ACL_GRAPH
+static void ggml_backend_cann_bind_graph_decode_mode(ggml_backend_t backend, const int * mode) {
+    auto * ctx = (ggml_backend_cann_context *) backend->context;
+    ctx->graph_decode_mode_ptr = mode;
+}
+#endif
+
 static void * ggml_backend_cann_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     GGML_UNUSED(name);
-    // reserved for future use
+#ifdef USE_ACL_GRAPH
+    if (strcmp(name, "ggml_backend_bind_graph_decode_mode") == 0) {
+        return (void *) ggml_backend_cann_bind_graph_decode_mode;
+    }
+#endif
     return nullptr;
 }
 
@@ -4002,6 +4481,27 @@ ggml_backend_reg_t ggml_backend_cann_reg() {
 
 ggml_backend_t ggml_backend_cann_init(int32_t device) {
     aclInit(nullptr);
+
+    // aclnnMatmul is deterministic but not strongly consistent by default
+    // on Atlas inference products. CANN 9.1 accepts only the 0/1 mode.
+    static std::once_flag deterministic_once;
+    std::call_once(deterministic_once, []() {
+        static const bool deterministic =
+            parse_bool(get_env_as_lowercase("GGML_CANN_DETERMINISTIC").value_or("off"));
+        if (!deterministic) {
+            return;
+        }
+
+        int64_t before = 0;
+        ACL_CHECK(aclrtGetSysParamOpt(ACL_OPT_DETERMINISTIC, &before));
+        ACL_CHECK(aclrtSetSysParamOpt(ACL_OPT_DETERMINISTIC, 1));
+
+        int64_t after = 0;
+        ACL_CHECK(aclrtGetSysParamOpt(ACL_OPT_DETERMINISTIC, &after));
+        GGML_LOG_INFO("CANN deterministic mode: %lld -> %lld\n",
+                      (long long) before, (long long) after);
+    });
+
     if (device < 0 || device >= ggml_backend_cann_get_device_count()) {
         GGML_LOG_ERROR("%s: error: invalid device %d\n", __func__, device);
         return nullptr;

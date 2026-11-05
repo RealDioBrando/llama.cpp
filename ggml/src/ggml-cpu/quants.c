@@ -50,6 +50,33 @@ void quantize_row_q8_0_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
     quantize_row_q8_0_ref(x, y, k);
 }
 
+void quantize_row_w8a8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_w8a8_ref(x, (block_w8a8 *) y, k);
+}
+
+void ggml_vec_dot_w8a8_f16(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx,
+                           const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(n % QK_W8A8 == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+
+    const block_w8a8 * GGML_RESTRICT x = vx;
+    const ggml_fp16_t * GGML_RESTRICT y = vy;
+    const int64_t nb = n / QK_W8A8;
+
+    float sumf = 0.0f;
+    for (int64_t ib = 0; ib < nb; ++ib) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[ib].d);
+        for (int64_t j = 0; j < QK_W8A8; ++j) {
+            sumf += d * x[ib].qs[j] * GGML_CPU_FP16_TO_FP32(y[ib*QK_W8A8 + j]);
+        }
+    }
+
+    *s = sumf;
+}
 void quantize_row_q8_1_generic(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q8_1_ref(x, y, k);
 }

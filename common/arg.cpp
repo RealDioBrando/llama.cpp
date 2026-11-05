@@ -330,6 +330,28 @@ static std::string get_all_kv_cache_types() {
     return msg.str();
 }
 
+const std::vector<ggml_type> act_types = {
+    GGML_TYPE_F32,
+    GGML_TYPE_F16,
+};
+
+static ggml_type act_type_from_str(const std::string & s) {
+    for (const auto & type : act_types) {
+        if (ggml_type_name(type) == s) {
+            return type;
+        }
+    }
+    throw std::runtime_error("Unsupported activation type: " + s);
+}
+
+static std::string get_all_act_types() {
+    std::ostringstream msg;
+    for (const auto & type : act_types) {
+        msg << ggml_type_name(type) << (&type == &act_types.back() ? "" : ", ");
+    }
+    return msg.str();
+}
+
 static bool parse_bool_value(const std::string & value) {
     if (is_truthy(value)) {
         return true;
@@ -1732,7 +1754,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.kv_paged = value;
         }
-    ).set_env("LLAMA_ARG_KV_PAGED").set_examples({LLAMA_EXAMPLE_PAGED}));
+    ).set_env("LLAMA_ARG_KV_PAGED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"--enable-priority"},
+        {"--no-enable-priority"},
+        "order paged requests by request priority instead of FCFS (default: disabled)",
+        [](common_params & params, bool value) {
+            params.enable_priority = value;
+        }
+    ).set_env("LLAMA_ARG_ENABLE_PRIORITY").set_examples({LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
         {"-ncpub", "--n-cpu-blocks"}, "N",
         "number of physical CPU blocks for paged KV cache (default: 1)",
@@ -1740,7 +1770,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_cpu_blocks = value;
             params.n_cpu_blocks_set = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_PAGED}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
         {"-ngpub", "--n-gpu-blocks"}, "N",
         "number of physical GPU blocks for paged KV cache (default: 1)",
@@ -1748,7 +1778,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_gpu_blocks = value;
             params.n_gpu_blocks_set = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_PAGED}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
         {"-kvbls", "--kv-block-size"}, "N",
         "fixed number of tokens for a given paged block (default: 16)",
@@ -1758,7 +1788,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.block_size = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_PAGED}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
         {"--kv-paged-watermark"}, "N",
         "fraction of blocks reserved before processing new requests (default: 0.05, range [0.0, 1.0))",
@@ -1769,7 +1799,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.kv_paged_watermark = potential_watermark;
         }
-    ).set_examples({LLAMA_EXAMPLE_PAGED}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
@@ -2501,6 +2531,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_type_v = kv_cache_type_from_str(value);
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    add_opt(common_arg(
+        {"-at", "--act-type"}, "TYPE",
+        string_format(
+            "data type of the activations in the compute graph [EXPERIMENTAL; CANN and Qwen3-family only]\n"
+            "allowed values: %s\n"
+            "(default: %s)",
+            get_all_act_types().c_str(),
+            ggml_type_name(params.act_type)
+        ),
+        [](common_params & params, const std::string & value) {
+            params.act_type = act_type_from_str(value);
+        }
+    ).set_env("LLAMA_ARG_ACT_TYPE"));
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",

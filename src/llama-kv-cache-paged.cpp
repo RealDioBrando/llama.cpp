@@ -174,6 +174,33 @@ bool llama_kv_cache_paged::release_block(uint32_t block_id) {
     return true;
 }
 
+void llama_kv_cache_paged::copy_block_content(uint32_t src_block_id, uint32_t dst_block_id) {
+    const bool same_pool  = block_manager.is_gpu(src_block_id) == block_manager.is_gpu(dst_block_id);
+    const bool dst_is_gpu = block_manager.is_gpu(dst_block_id);
+
+    // do_block_copy models a cross-pool transfer; for a same-pool copy feed it
+    // the matching src/dst layer sets directly
+    if (same_pool) {
+        const auto & k = dst_is_gpu ? k_gpu_layers : k_cpu_layers;
+        const auto & v = dst_is_gpu ? v_gpu_layers : v_cpu_layers;
+        const uint32_t src_local = dst_is_gpu ? src_block_id : src_block_id - num_gpu_blocks;
+        const uint32_t dst_local = dst_is_gpu ? dst_block_id : dst_block_id - num_gpu_blocks;
+
+        std::vector<uint8_t> staging(block_bytes);
+        for (uint32_t il = 0; il < n_layers; ++il) {
+            const size_t src_offset = (size_t) src_local * block_bytes;
+            const size_t dst_offset = (size_t) dst_local * block_bytes;
+            ggml_backend_tensor_get(k[il], staging.data(), src_offset, block_bytes);
+            ggml_backend_tensor_set(k[il], staging.data(), dst_offset, block_bytes);
+            ggml_backend_tensor_get(v[il], staging.data(), src_offset, block_bytes);
+            ggml_backend_tensor_set(v[il], staging.data(), dst_offset, block_bytes);
+        }
+        return;
+    }
+
+    do_block_copy({src_block_id}, {dst_block_id}, /*to_gpu=*/dst_is_gpu);
+}
+
 uint32_t llama_kv_cache_paged::n_free_gpu_blocks() const {
     return (uint32_t) block_manager.n_free_gpu_blocks();
 }
@@ -227,17 +254,29 @@ bool llama_kv_cache_paged::swap_in(llama_sequence_group & group) {
         return true;
     }
 
+    // A swapped group is pushed straight into the next batch after swap-in, so
+    // the restored table must already cover the token(s) about to be written.
+    // In particular a decode group can be swapped out with its table exactly
+    // covering the prefix (n_past on a block boundary): without one extra
+    // block, calculate_global_slot_index() reads block_table[n_past/block_size]
+    // out of bounds. Prefill groups that were swapped out before their prompt
+    // was fully reserved get the remainder reserved here as well.
+    const uint32_t next_tokens = group.n_decoded > 0 ? 1u : group.n_prompt + 1u;
+    const uint32_t needed_blocks = (group.n_past + next_tokens + block_size - 1) / block_size;
+    const uint32_t n_new_ids     = std::max(num_blocks, needed_blocks);
+
     // A potential optimization to reduce thrashing is to have a heuristic to check if
     // if we can continue decoding after swap_in.
-    if (!block_manager.has_free_gpu_blocks(num_blocks)) {
+    if (!block_manager.has_free_gpu_blocks(n_new_ids)) {
         return false;
     }
 
-    llama_block_ids new_ids = block_manager.checkout_gpu_blocks(num_blocks);
-    do_block_copy(group.block_table, new_ids, /*to_gpu=*/true);
+    llama_block_ids new_ids = block_manager.checkout_gpu_blocks(n_new_ids);
+    llama_block_ids copy_dst(new_ids.begin(), new_ids.begin() + num_blocks);
+    do_block_copy(group.block_table, copy_dst, /*to_gpu=*/true);
 
     free_blocks(group);
-    group.block_table = new_ids;
+    group.block_table = std::move(new_ids);
     for (size_t i = 0; i < group.block_hashes.size() && i < group.block_table.size(); ++i) {
         if (block_move_cb) {
             block_move_cb(group.block_hashes[i], group.block_table[i]);
@@ -330,7 +369,10 @@ llama_memory_context_ptr llama_kv_cache_paged::init_batch(llama_batch_allocr & b
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = balloc.split_simple(n_ubatch);
+            // Paged metadata requires one token count per sequence set.
+            // split_simple emits one pseudo-sequence per token and hides
+            // prefill from phase-sensitive backends.
+            auto ubatch = balloc.split_equal(n_ubatch, false, 0);
             if (ubatch.n_tokens == 0) {
                 break;
             }
@@ -339,6 +381,8 @@ llama_memory_context_ptr llama_kv_cache_paged::init_batch(llama_batch_allocr & b
 
         // Failed to find a suitable split
         if (balloc.get_n_used() < balloc.get_n_tokens()) {
+            LLAMA_LOG_ERROR("%s: split did not consume the batch: used=%d of %d tokens\n", __func__,
+                            (int) balloc.get_n_used(), (int) balloc.get_n_tokens());
             break;
         }
 
@@ -377,10 +421,11 @@ llama_memory_context_ptr llama_kv_cache_paged::init_full() {
 }
 
 llama_memory_context_ptr llama_kv_cache_paged::init_update(llama_context * /*lctx*/, bool /*optimize*/) {
-    std::vector<llama_ubatch> dummy_ubatch = {};
-    auto                      ctx          = std::make_unique<llama_kv_cache_paged_context>(this, dummy_ubatch);
-    // TODO maybe confirm block counts or clean up stale pointers
-    return ctx;
+    // Paged KV has no host-side pending updates (apply is a no-op). Returning
+    // SUCCESS made the generic memory_update path reset the previous graph and
+    // rebuild the worst-case reserve graph on every decode step, which broke
+    // graph reuse and added ~4 ms/step host overhead.
+    return std::make_unique<llama_kv_cache_paged_context>(LLAMA_MEMORY_STATUS_NO_UPDATE);
 }
 
 struct ggml_tensor * llama_kv_cache_paged::get_k_tensor(int layer_idx) const {

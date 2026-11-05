@@ -629,8 +629,7 @@ void ggml_cann_rope_cache_preload(ggml_backend_cann_context & ctx, ggml_tensor *
  * constants so their first use never happens under capture.
  */
 acl_tensor_ptr ggml_cann_warm_cache_acl_tensor(ggml_backend_cann_context & ctx,
-                                               void **                     buffer,
-                                               int64_t &                   cache_element,
+                                               ggml_cann_tensor_cache &    cache,
                                                int64_t *                   ne,
                                                size_t *                    nb,
                                                ggml_type                   dtype,
@@ -924,6 +923,52 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst
  * @param dst Output tensor; src deps are k, v, q, g, s as above.
  */
 void ggml_cann_gated_linear_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst);
+
+/**
+ * @brief Forward Gated Delta Net on the CANN backend (decode and prefill).
+ *
+ * Expects dst->src[0..5] = {q, k, v, g, beta, state} with T tokens per sequence.
+ * All ggml layouts map one to one onto the aclnn op layouts:
+ *   q, k: [S, H, T, B] -> [T*B, N, D]
+ *   g, beta: [1, H, T, B] -> [T*B, N]
+ *   state: [S_v, S_v, H, B] -> [slots=B, N, DV, DK] (dk fastest in both)
+ * dst holds the packed output [S_v*H, T*B + K*S_v*B]: attention output first,
+ * then the updated state snapshot (K == 1).
+ *
+ * Decode (T == 1) runs all sequences in a single kernel call. Prefill (T > 1)
+ * goes through the chunk kernel as a single call for the whole batch when it
+ * is eligible (GGML_CANN_GDN_PREFILL_CHUNK=0 forces the fallback), the fallback loops 8-token blocks per sequence
+ * through the recurrent kernel and threads the state through the sequence
+ * slot between the calls. Inputs are cast once to
+ * fp16 (g stays fp32), every call works on a view of the staging buffers.
+ * q/k/v may be rows-contiguous strided views (op contract), the input cast
+ * gathers them into the dense staging layout.
+ *
+ * The aclnn op is resolved at runtime from the custom op package,
+ * see ggml_cann_gdn_available.
+ *
+ * @param ctx Backend context providing stream/allocator utilities.
+ * @param dst Output tensor; src deps are q, k, v, g, beta, state as above.
+ */
+void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * dst);
+
+/**
+ * @brief Check whether the standard 310P chunk and recurrent API pairs are loadable.
+ *
+ * Only an explicit absolute custom package in ASCEND_CUSTOM_OPP_PATH is used.
+ */
+bool ggml_cann_gdn_available();
+
+/**
+ * @brief Preload the gated delta net index cache before graph capture.
+ *
+ * The index buffers need a host-to-device copy on growth, which is not allowed
+ * during ACL graph capture, so grow them upfront for the batch of this node.
+ *
+ * @param ctx Backend context holding the index cache.
+ * @param dst A GGML_OP_GATED_DELTA_NET node of the graph about to be captured.
+ */
+void ggml_cann_gdn_cache_preload(ggml_backend_cann_context & ctx, ggml_tensor * dst);
 
 /**
  * @brief Launches an asynchronous task using the memory allocator.

@@ -10,6 +10,7 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 
+#include "../src/llama-context.h"
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
@@ -1011,7 +1012,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         batch_inject = llama_batch_init(llama_n_ubatch(ctx_dft), n_embd_enc, n_seq);
 
         // embd batches on an M-RoPE draft need 4 position rows per token
-        is_mrope = llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE;
+        const auto rope_type = llama_model_rope_type(model_dft);
+        is_mrope = rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE;
         if (is_mrope) {
             free(batch_inject.pos);
             batch_inject.pos = (llama_pos *) malloc(sizeof(llama_pos) * 4 * llama_n_batch(ctx_dft));
@@ -1130,10 +1132,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
-            // an M-RoPE image pins all its rows to one position, so a windowed draft
-            // cache cannot free cells for it - skip it, the draft can jump over the gap
+            // A sliding window cannot evict image rows that share a temporal position.
             const bool pos_pinned = batch_in.pos[i_batch_beg[seq_id]] == batch_in.pos[i_batch_end[seq_id]];
-            if (has_embeddings && n_rows > 1 && pos_pinned) {
+            if (has_embeddings && n_rows > 1 && pos_pinned && llama_model_n_swa(llama_get_model(ctx_dft)) > 0) {
                 continue;
             }
 
@@ -1159,14 +1160,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
                     batch_inject.pos[i] = p;
                     if (is_mrope) {
-                        batch_inject.pos[1 * n_chunk + i] = p;
-                        batch_inject.pos[2 * n_chunk + i] = p;
+                        const auto target_rope = llama_model_rope_type(llama_get_model(ctx_tgt));
+                        const bool spatial = has_embeddings && (target_rope == LLAMA_ROPE_TYPE_MROPE || target_rope == LLAMA_ROPE_TYPE_IMROPE);
+                        // Image batches carry separate T/H/W rows; text broadcasts one position.
+                        const int32_t src = i_batch_beg[seq_id] + offset + i;
+                        batch_inject.pos[1 * n_chunk + i] = spatial ? batch_in.pos[n_tokens + src] : p;
+                        batch_inject.pos[2 * n_chunk + i] = spatial ? batch_in.pos[2 * n_tokens + src] : p;
                         batch_inject.pos[3 * n_chunk + i] = 0;
                     }
                     batch_inject.n_seq_id[i]  = 1;
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
+                ctx_dft->graph_decode_mode = ctx_tgt->graph_decode_mode == GGML_GRAPH_PHASE_DECODE
+                    ? GGML_GRAPH_PHASE_DRAFT_KV_INJECT_DECODE
+                    : GGML_GRAPH_PHASE_DRAFT_KV_INJECT;
                 const int32_t rc = llama_decode(ctx_dft, batch_inject);
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
@@ -1214,6 +1222,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
+        ctx_dft->graph_decode_mode = GGML_GRAPH_PHASE_DRAFT_GENERATE;
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
