@@ -145,6 +145,8 @@ struct llama_context {
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
 
+    int graph_decode_mode = GGML_GRAPH_PHASE_UNSPECIFIED;
+
     //
     // state save/load
     //

@@ -10,6 +10,7 @@
 #include "ngram-mod.h"
 #include "sampling.h"
 
+#include "../src/llama-context.h"
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
@@ -1171,6 +1172,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
+                ctx_dft->graph_decode_mode = ctx_tgt->graph_decode_mode == GGML_GRAPH_PHASE_DECODE
+                    ? GGML_GRAPH_PHASE_DRAFT_KV_INJECT_DECODE
+                    : GGML_GRAPH_PHASE_DRAFT_KV_INJECT;
                 const int32_t rc = llama_decode(ctx_dft, batch_inject);
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
@@ -1218,6 +1222,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // decode all sequence's noise block in a single batch
+        ctx_dft->graph_decode_mode = GGML_GRAPH_PHASE_DRAFT_GENERATE;
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);

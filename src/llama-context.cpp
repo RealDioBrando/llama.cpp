@@ -404,6 +404,11 @@ llama_context::llama_context(
                 if (ggml_backend_set_n_threads_fn) {
                     set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
                 }
+                using bind_graph_mode_fn = void (*)(ggml_backend_t, const int *);
+                auto bind_graph_mode = (bind_graph_mode_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_bind_graph_decode_mode");
+                if (bind_graph_mode) {
+                    bind_graph_mode(backend.get(), &graph_decode_mode);
+                }
             }
         }
 
@@ -1776,6 +1781,11 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    struct reset_graph_mode {
+        int & mode;
+        ~reset_graph_mode() { mode = GGML_GRAPH_PHASE_UNSPECIFIED; }
+    } reset{graph_decode_mode};
+
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
