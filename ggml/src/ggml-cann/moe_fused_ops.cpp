@@ -58,17 +58,6 @@ bool is_down_weight(const ggml_tensor * weight) {
     return name != nullptr && strstr(name, "ffn_down_exps.weight") != nullptr;
 }
 
-bool graph_has_w8a8_expert(const ggml_cgraph * graph) {
-    for (int i = 0; i < graph->n_nodes; ++i) {
-        const ggml_tensor * node = graph->nodes[i];
-        if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr &&
-                node->src[0]->type == GGML_TYPE_W8A8) {
-            return true;
-        }
-    }
-    return false;
-}
-
 bool is_view_like(const ggml_tensor * tensor) {
     return tensor->op == GGML_OP_RESHAPE || tensor->op == GGML_OP_VIEW ||
            tensor->op == GGML_OP_PERMUTE || tensor->op == GGML_OP_TRANSPOSE ||
@@ -739,17 +728,22 @@ void run_moe_gmm(ggml_backend_cann_context & ctx, const ggml_tensor * weight,
 
 bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
                                 const ggml_cgraph * graph, int node_idx,
-                                int * last_fused_node) {
-    // Router fusion is not valid for W8A8 grouped MoE on this CANN build.
-    const bool enabled = env_enabled("GGML_CANN_MOE_ROUTER_FUSION", !graph_has_w8a8_expert(graph));
-    static const bool debug =
-        env_enabled("GGML_CANN_MOE_FULL_DEBUG", false);
-    static int debug_count = 0;
+                                bool graph_has_w8a8_expert, int * last_fused_node) {
     ggml_tensor * node = graph->nodes[node_idx];
-    if (!enabled || node->op != GGML_OP_MUL_MAT || node->src[0] == nullptr ||
+    if (node->op != GGML_OP_MUL_MAT || node->src[0] == nullptr ||
             node->src[1] == nullptr || !is_router_weight(node->src[0])) {
         return false;
     }
+
+    // Router fusion is not valid for W8A8 grouped MoE on this CANN build.
+    const bool enabled = env_enabled("GGML_CANN_MOE_ROUTER_FUSION", !graph_has_w8a8_expert);
+    if (!enabled) {
+        return false;
+    }
+
+    static const bool debug =
+        env_enabled("GGML_CANN_MOE_FULL_DEBUG", false);
+    static int debug_count = 0;
 
     ggml_tensor * selected = nullptr;
     ggml_tensor * weights = nullptr;
@@ -885,7 +879,7 @@ bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
     // Full fusion is numerically invalid for W8A8 expert weights on this CANN
     // build, so bypass it automatically when grouped MoE A8 is selected.
     const bool full_fusion =
-        env_enabled("GGML_CANN_MOE_FULL_FUSION", !graph_has_w8a8_expert(graph));
+        env_enabled("GGML_CANN_MOE_FULL_FUSION", !graph_has_w8a8_expert);
     if (full_fusion &&
             run_moe_full_fused(ctx, graph, node_idx, last, selected, weights,
                                &topk_ids, &norm32, last_fused_node)) {
@@ -909,19 +903,20 @@ bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
 
 bool ggml_cann_moe_gate_up_fused(ggml_backend_cann_context & ctx,
                                  const ggml_cgraph * graph, int node_idx,
-                                 int * last_fused_node) {
-    static const bool enabled = env_enabled("GGML_CANN_MOE_SWIGLU_FUSION", false);
-    // Full fusion is numerically invalid for W8A8 expert weights on this CANN
-    // build, so bypass it automatically when grouped MoE A8 is selected.
-    const bool full_fusion =
-        env_enabled("GGML_CANN_MOE_FULL_FUSION", !graph_has_w8a8_expert(graph));
-    static const bool debug =
-        env_enabled("GGML_CANN_MOE_FULL_DEBUG", false);
-    static int debug_count = 0;
+                                 bool graph_has_w8a8_expert, int * last_fused_node) {
     ggml_tensor * node = graph->nodes[node_idx];
     if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] == nullptr) {
         return false;
     }
+
+    static const bool enabled = env_enabled("GGML_CANN_MOE_SWIGLU_FUSION", false);
+    // Full fusion is numerically invalid for W8A8 expert weights on this CANN
+    // build, so bypass it automatically when grouped MoE A8 is selected.
+    const bool full_fusion =
+        env_enabled("GGML_CANN_MOE_FULL_FUSION", !graph_has_w8a8_expert);
+    static const bool debug =
+        env_enabled("GGML_CANN_MOE_FULL_DEBUG", false);
+    static int debug_count = 0;
 
     if (full_fusion && (is_gate_up_weight(node->src[0]) ||
                             is_gate_weight(node->src[0]) ||
