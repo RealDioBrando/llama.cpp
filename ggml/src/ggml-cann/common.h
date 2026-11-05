@@ -116,11 +116,11 @@ int                        parse_integer(const std::string & value);
  */
 static inline bool ggml_cann_moe_weight_nz_enabled() {
 #ifdef ASCEND_310P
-    const char * default_value = "on";
+    return parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("on"));
 #else
-    const char * default_value = "off";
+    // The W8A8 MoE FRACTAL_NZ descriptor is validated only for 310P.
+    return false;
 #endif
-    return parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or(default_value));
 }
 
 /**
