@@ -3881,14 +3881,14 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     return false;
                 }
 #ifdef ASCEND_310P
-                // Restrict the 310P IMROPE Q workaround to Qwen3.5's
-                // 256-wide single-token decode tensors, where the CANN kernel
-                // is known to be unstable. Broader head-count checks also
-                // match Qwen3-VL and force its Q ROPE to the CPU every step.
+                // The generic partial-IMROPE path is not stable for
+                // single-token query decode on 310P. Full-width rotation
+                // stays on the 310P composite path, and the head-count check
+                // keeps the smaller K tensor on CANN for grouped-query models.
                 const int32_t * rope_params = (const int32_t *) op->op_params;
                 const int * sections = rope_params + 11;
                 if (rope_params[2] == GGML_ROPE_TYPE_IMROPE && sections[3] == 0 &&
-                    op->ne[0] == 256 && op->ne[2] == 1) {
+                    rope_params[1] < op->ne[0] && op->ne[1] > 4 && op->ne[2] == 1) {
                     return false;
                 }
                 // Partial rope (n_dims < ne[0]) takes the
