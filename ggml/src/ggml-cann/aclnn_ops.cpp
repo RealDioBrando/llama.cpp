@@ -5311,8 +5311,6 @@ struct gdn_api {
     // Run each executor through its matching operator entry point.
     run_t                      chunk_run                = nullptr;
     // Library accepted for all GDN bindings.
-    get_workspace_size_t state_f32_get_workspace_size = nullptr;
-    run_t state_f32_run = nullptr;
     std::string lib_path;
     bool                        standard_odd_heads = false;
 };
@@ -5374,10 +5372,6 @@ const gdn_api & gdn_symbols() {
             result.run = run;
             result.chunk_get_workspace_size = chunk_get_ws;
             result.chunk_run = chunk_run;
-            result.state_f32_get_workspace_size = (gdn_api::get_workspace_size_t)
-                resolve("aclnnGdnRecurrentStateF32GetWorkspaceSize");
-            result.state_f32_run = (gdn_api::run_t) resolve("aclnnGdnRecurrentStateF32");
-            GGML_ASSERT(bool(result.state_f32_get_workspace_size) == bool(result.state_f32_run));
             result.lib_path = lib;
             // Older standard packages reject odd heads; opt-in asserts package support.
             result.standard_odd_heads =
@@ -5455,53 +5449,7 @@ bool ggml_cann_gdn_snapshots_supported(const ggml_tensor * dst) {
         ggml_get_op_params_i32(dst, 0), v->ne[1], v->ne[0]);
 }
 
-// Use the FP32 state kernel only within its verified domain.
-static bool gdn_state_f32_enabled(const ggml_tensor * dst) {
-    static const bool enabled = parse_bool(get_env_as_lowercase("GGML_CANN_GDN_STATE_F32").value_or("1"));
-    const auto * q = dst->src[0];
-    const auto * v = dst->src[2];
-    const int64_t k = ggml_get_op_params_i32(dst, 0);
-    return enabled && gdn_symbols().state_f32_get_workspace_size &&
-        q->ne[1] == 16 && v->ne[1] == 16 && q->ne[0] == 128 && v->ne[0] == 128 &&
-        v->ne[3] >= 1 && v->ne[3] <= 32 && k >= 1 && k <= 5;
-}
-
-static const gdn_api & gdn_state_f32_api() {
-    static const gdn_api api = [] {
-        gdn_api a;
-        const auto & standard = gdn_symbols();
-        a.get_workspace_size = standard.state_f32_get_workspace_size;
-        a.run = standard.state_f32_run;
-        a.lib_path = standard.lib_path;
-        GGML_ASSERT(a.get_workspace_size && a.run);
-        GGML_LOG_INFO("ggml_cann: GDN state=f32 library=%s\n", a.lib_path.c_str());
-        return a;
-    }();
-    return api;
-}
-
-// Chunk calls bridge to FP16 state; recurrent calls and snapshot banks retain FP32 state.
-static int64_t gdn_state_f32_chunk_tokens(const ggml_tensor * dst) {
-    static const bool enabled = parse_bool(get_env_as_lowercase("GGML_CANN_GDN_STATE_F32_CHUNK").value_or("1"));
-    static const bool use_chunk = parse_bool(get_env_as_lowercase("GGML_CANN_GDN_PREFILL_CHUNK").value_or("1"));
-    if (!enabled || !gdn_state_f32_enabled(dst) || !use_chunk) return 0;
-    const auto * q = dst->src[0]; const auto * v = dst->src[2];
-    const int64_t T = v->ne[2], B = v->ne[3], K = ggml_get_op_params_i32(dst, 0);
-    // Match the FP32 recurrent kernel domain.
-    if (q->ne[1] != 16 || v->ne[1] != 16 || q->ne[0] != 128 || v->ne[0] != 128 ||
-        B < 1 || B > 32 || K < 1 || K > 5) return 0;
-    const int64_t P = K == 1 ? T : T - std::min(T, K);
-    // Short speculative validation must keep every required post-token state.
-    // A chunk prefix does not include any of the retained newest K snapshots.
-    if (K > 1 && P < 64) return 0;
-    const auto & api = gdn_symbols();
-    return gdn_route::prefill_route(P, B, q->ne[1], v->ne[1], q->ne[0], v->ne[0],
-        use_chunk, api.chunk_get_workspace_size && api.chunk_run, api.standard_odd_heads)
-        == gdn_route::PrefillRoute::kChunkStandard ? P : 0;
-}
-
 static int64_t gdn_snapshot_prefix(const ggml_tensor * dst) {
-    if (gdn_state_f32_enabled(dst)) return gdn_state_f32_chunk_tokens(dst);
     static const bool enabled = parse_bool(get_env_as_lowercase("GGML_CANN_GDN_SNAPSHOT_PREFIX").value_or("0"));
     static const bool use_chunk = parse_bool(get_env_as_lowercase("GGML_CANN_GDN_PREFILL_CHUNK").value_or("1"));
     const auto & api = gdn_symbols();
@@ -5520,9 +5468,9 @@ void ggml_cann_gdn_cache_preload(ggml_backend_cann_context & ctx, ggml_tensor * 
     const int64_t t = dst->src[2]->ne[2];
     ctx.gdn_cache.prepare_prefill(b, t);
     const int64_t snapshots = ggml_get_op_params_i32(dst, 0);
-    if (snapshots > 1 || gdn_state_f32_enabled(dst)) {
-        GGML_ASSERT(snapshots == 1 || ggml_cann_gdn_snapshots_supported(dst));
-        ctx.gdn_cache.ensure_snapshot_indices(gdn_state_f32_enabled(dst) ? 1 : b, t, snapshots);
+    if (snapshots > 1) {
+        GGML_ASSERT(ggml_cann_gdn_snapshots_supported(dst));
+        ctx.gdn_cache.ensure_snapshot_indices(b, t, snapshots);
         const int64_t prefix = gdn_snapshot_prefix(dst);
         if (prefix > 0) {
             ctx.gdn_cache.ensure_prefill_lens(b, prefix);
@@ -5544,72 +5492,6 @@ static bool gdn_prefill_use_chunk() {
 static bool gdn_probe_enabled() {
     static bool enabled = parse_bool(get_env_as_lowercase("GGML_CANN_GDN_PROBE").value_or("0"));
     return enabled;
-}
-
-// All temporary allocations are local to this call and released in reverse
-// allocation order. Caller-owned output and FP32 final state outlive the call.
-static void gdn_state_f32_chunk_bridge(ggml_backend_cann_context & ctx,
-        int64_t T, int64_t B, int64_t nk, int64_t nv, int64_t dk, int64_t dv, int64_t P,
-        void * q, void * k, void * v, void * beta, void * g,
-        void * state_f32, void * output_f16, void * final_f32, float scale) {
-    GGML_ASSERT(P > 1 && P <= T);
-    const auto & chunk = gdn_symbols();
-    GGML_ASSERT(chunk.chunk_get_workspace_size && chunk.chunk_run);
-    ggml_cann_pool_alloc pq(ctx.pool()), pk(ctx.pool()), pv(ctx.pool()), pb(ctx.pool()), pg(ctx.pool());
-    ggml_cann_pool_alloc po(ctx.pool()), si(ctx.pool()), so(ctx.pool()), ws(ctx.pool());
-    auto gather = [&](ggml_cann_pool_alloc & buf, void * src, size_t row) -> void * {
-        if (P == T) return src;
-        void * dest = buf.alloc(B * P * row);
-        for (int64_t b = 0; b < B; ++b) {
-            ACL_CHECK(aclrtMemcpyAsync((char *) dest + b * P * row, P * row,
-                (char *) src + b * T * row, P * row, ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
-        }
-        return dest;
-    };
-    void * cq = gather(pq, q, nk * dk * sizeof(uint16_t));
-    void * ck = gather(pk, k, nk * dk * sizeof(uint16_t));
-    void * cv = gather(pv, v, nv * dv * sizeof(uint16_t));
-    void * cb = gather(pb, beta, nv * sizeof(uint16_t));
-    void * cg = gather(pg, g, nv * sizeof(float));
-    void * co = P == T ? output_f16 : po.alloc(B * P * nv * dv * sizeof(uint16_t));
-    const int64_t S = B * nv * dv * dk;
-    si.alloc(S * sizeof(uint16_t));
-    so.alloc(S * sizeof(uint16_t));
-    gdn_cast_f32_f16(ctx, state_f32, si.get(), S);
-    int64_t nq[3] = {dk, nk, B * P}, nvo[3] = {dv, nv, B * P};
-    int64_t nb[2] = {nv, B * P}, nst[4] = {dk, dv, nv, B}, nl[1] = {B};
-    size_t sq[3] = {2, (size_t) dk * 2, (size_t) dk * nk * 2};
-    size_t sv[3] = {2, (size_t) dv * 2, (size_t) dv * nv * 2};
-    size_t sb[2] = {2, (size_t) nv * 2}, sg[2] = {4, (size_t) nv * 4};
-    size_t ss[4] = {2, (size_t) dk * 2, (size_t) dk * dv * 2, (size_t) dk * dv * nv * 2};
-    size_t sl[1] = {sizeof(int32_t)};
-    auto aq = ggml_cann_create_tensor(cq, ACL_FLOAT16, sizeof(uint16_t), nq, sq, 3);
-    auto ak = ggml_cann_create_tensor(ck, ACL_FLOAT16, sizeof(uint16_t), nq, sq, 3);
-    auto av = ggml_cann_create_tensor(cv, ACL_FLOAT16, sizeof(uint16_t), nvo, sv, 3);
-    auto ab = ggml_cann_create_tensor(cb, ACL_FLOAT16, sizeof(uint16_t), nb, sb, 2);
-    auto ag = ggml_cann_create_tensor(cg, ACL_FLOAT, sizeof(float), nb, sg, 2);
-    auto ast = ggml_cann_create_tensor(si.get(), ACL_FLOAT16, sizeof(uint16_t), nst, ss, 4);
-    auto afin = ggml_cann_create_tensor(so.get(), ACL_FLOAT16, sizeof(uint16_t), nst, ss, 4);
-    auto ao = ggml_cann_create_tensor(co, ACL_FLOAT16, sizeof(uint16_t), nvo, sv, 3);
-    auto al = ggml_cann_create_tensor(ctx.gdn_cache.ensure_prefill_lens(B, P), ACL_INT32, sizeof(int32_t), nl, sl, 1);
-    uint64_t bytes = 0; aclOpExecutor * executor = nullptr;
-    ACL_CHECK(chunk.chunk_get_workspace_size(aq.get(), ak.get(), av.get(), ab.get(), ast.get(), al.get(),
-        ag.get(), scale, ao.get(), afin.get(), &bytes, &executor));
-    void * workspace = bytes ? ws.alloc(bytes) : nullptr;
-    ACL_CHECK(chunk.chunk_run(workspace, bytes, executor, ctx.stream()));
-    if (P != T) {
-        const size_t row = nv * dv * sizeof(uint16_t);
-        for (int64_t b = 0; b < B; ++b) {
-            ACL_CHECK(aclrtMemcpyAsync((char *) output_f16 + b * T * row, P * row,
-                (char *) co + b * P * row, P * row, ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
-        }
-    }
-    gdn_cast_f16_f32(ctx, so.get(), final_f32, S);
-    static std::atomic<bool> announced{false};
-    if (!announced.exchange(true, std::memory_order_relaxed) || gdn_probe_enabled()) {
-        GGML_LOG_INFO("GDN_CHUNK_F32_BRIDGE T=%lld B=%lld prefix=%lld state_bridge=f32-f16-f32 lib=%s\n",
-            (long long) T, (long long) B, (long long) P, chunk.lib_path.c_str());
-    }
 }
 
 void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
@@ -5635,11 +5517,8 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
     const int64_t v_elems     = T * B * nv * dv;
     const int64_t state_elems = B * nv * dv * dk;
 
-    const bool fp32 = gdn_state_f32_enabled(dst);
-    GGML_ASSERT(!fp32 || (nk == 16 && nv == 16 && dk == 128 && dv == 128 && B >= 1 && B <= 32 && snapshots >= 1 && snapshots <= 5));
-    const size_t state_unit = fp32 ? sizeof(float) : sizeof(uint16_t);
-    const aclDataType state_type = fp32 ? ACL_FLOAT : ACL_FLOAT16;
-    const gdn_api & api = fp32 ? gdn_state_f32_api() : gdn_symbols();
+    const size_t state_unit = sizeof(uint16_t);
+    const gdn_api & api = gdn_symbols();
     GGML_ASSERT(api.get_workspace_size != nullptr);
 
     // fp16 staging buffers, cast back to f32 into the packed dst
@@ -5668,11 +5547,7 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
     gdn_cast_strided_f16(ctx, k, k16_alloc.get());
     gdn_cast_strided_f16(ctx, v, v16_alloc.get());
     gdn_cast_f32_f16(ctx, beta->data, beta16_alloc.get(), T * B * nv);
-    if (fp32) {
-        GGML_ASSERT(state->type == GGML_TYPE_F32 && ggml_is_contiguous(state));
-        ACL_CHECK(aclrtMemcpyAsync(state16_alloc.get(), state_elems * 4, state->data, state_elems * 4,
-                                  ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
-    } else gdn_cast_f32_f16(ctx, state->data, state16_alloc.get(), state_elems);
+    gdn_cast_f32_f16(ctx, state->data, state16_alloc.get(), state_elems);
 
     const float scale = 1.0f / sqrtf((float) dv);
 
@@ -5703,7 +5578,7 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
         aclOpExecutor * executor       = nullptr;
         if (gdn_probe_enabled()) {
             GGML_LOG_INFO("ggml_cann: GDN invoke=%s lib=%s\n",
-                          fp32 ? "aclnnGdnRecurrentStateF32" : "aclnnRecurrentGatedDeltaRule", api.lib_path.c_str());
+                          "aclnnRecurrentGatedDeltaRule", api.lib_path.c_str());
         }
         ACL_CHECK(api.get_workspace_size(q_t, k_t, v_t, beta_t, state_t, seq_t, idx_t, g_t, nullptr, nullptr, scale,
                                          out_t, &workspace_size, &executor));
@@ -5738,34 +5613,17 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
     if (gdn_probe_enabled()) {
         GGML_LOG_INFO("ggml_cann: GDN prefill route=%s T=%lld B=%lld NK=%lld NV=%lld DK=%lld DV=%lld\n",
                       snapshots > 1 ? (prefix > 0 ? "chunk-prefix-snapshots" : "recurrent-snapshots") :
-                      (fp32 && gdn_state_f32_chunk_tokens(dst) == T ? "chunk-standard-fp32-bridge" : gdn_route::route_name(gdn_route_res)), (long long) T, (long long) B,
+                      gdn_route::route_name(gdn_route_res), (long long) T, (long long) B,
                       (long long) nk, (long long) nv, (long long) dk, (long long) dv);
     }
 
-    const bool whole_chunk = fp32 && snapshots == 1 && gdn_state_f32_chunk_tokens(dst) == T;
-    if (whole_chunk) {
-        state_out16_alloc.alloc(state_elems * sizeof(float));
-        gdn_state_f32_chunk_bridge(ctx, T, B, nk, nv, dk, dv, T,
-            q16_alloc.get(), k16_alloc.get(), v16_alloc.get(), beta16_alloc.get(), g->data,
-            state16_alloc.get(), out16_alloc.get(), state_out16_alloc.get(), scale);
-        state_final = state_out16_alloc.get();
-    } else if (snapshots > 1 || fp32) {
+    if (snapshots > 1) {
         // GGML keeps newest-first snapshots [W,B,Nv,Dv,Dk]. Last B slots are
         // per-sequence scratch for tokens outside the retained window.
         const size_t state_bytes = (size_t) nv * dv * dk * state_unit;
-        void * bank = snapshot_bank_alloc.alloc((fp32 ? 6 : written + 1) * B * state_bytes);
-        // VMM is LIFO: prefix_state is destroyed AFTER workspace_allocator.
-        // Allocate it BEFORE the first call_op can allocate that workspace.
-        if (fp32) {
-            prefix_state.alloc(written * B * state_bytes);
-        }
-        void * indices = ctx.gdn_cache.ensure_snapshot_indices(fp32 ? 1 : B, T, snapshots);
-        // Each sequence has a separate contiguous six-slot state bank.
-        if (prefix > 0 && fp32) {
-            gdn_state_f32_chunk_bridge(ctx, T, B, nk, nv, dk, dv, prefix,
-                q16_alloc.get(), k16_alloc.get(), v16_alloc.get(), beta16_alloc.get(), g->data,
-                state16_alloc.get(), out16_alloc.get(), prefix_state.get(), scale);
-        } else if (prefix > 0) {
+        void * bank = snapshot_bank_alloc.alloc((written + 1) * B * state_bytes);
+        void * indices = ctx.gdn_cache.ensure_snapshot_indices(B, T, snapshots);
+        if (prefix > 0) {
             // Compact each sequence's prefix. The original batch stride remains T.
             auto gather = [&](ggml_cann_pool_alloc & packed, void * src, size_t row_bytes) {
                 packed.alloc(B * prefix * row_bytes);
@@ -5812,8 +5670,7 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
             }
         }
         auto slot = [&](int64_t b, int64_t t) {
-            return fp32 ? b * 6 + gdn_route::snapshot_index(0, t, 1, T, snapshots)
-                        : gdn_route::snapshot_index(b, t, B, T, snapshots);
+            return gdn_route::snapshot_index(b, t, B, T, snapshots);
         };
         auto seed = [&](int64_t b, int64_t first) {
             void * target = (char *) bank + slot(b, first) * state_bytes;
@@ -5826,10 +5683,8 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
             }
         };
         auto submit = [&](int64_t tok, int64_t count, int64_t batch, void * lengths) {
-            GGML_ASSERT(!fp32 || (batch == 1 && count >= 1 && count <= 8 && tok / T == (tok + count - 1) / T));
-            int64_t ne_bank[4] = {dk, dv, nv, fp32 ? 6 : (written + 1) * B};
-            void * call_bank = fp32 ? (char *) bank + (tok / T) * 6 * state_bytes : bank;
-            acl_tensor_ptr acl_bank = ggml_cann_create_tensor(call_bank, state_type, state_unit, ne_bank, nb_state, 4);
+            int64_t ne_bank[4] = {dk, dv, nv, (written + 1) * B};
+            acl_tensor_ptr acl_bank = ggml_cann_create_tensor(bank, ACL_FLOAT16, state_unit, ne_bank, nb_state, 4);
             int64_t nq[3] = {dk, nk, count}, nv_[3] = {dv, nv, count};
             int64_t nb[2] = {nv, count}, nl[1] = {batch}, ni[1] = {count};
             size_t ns[1] = {sizeof(int32_t)};
@@ -5840,10 +5695,10 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
             acl_tensor_ptr ab = ggml_cann_create_tensor((char *) beta16_alloc.get() + tok * nv * 2, ACL_FLOAT16, sizeof(uint16_t), nb, nb_beta, 2);
             acl_tensor_ptr ag = ggml_cann_create_tensor((char *) g->data + tok * nv * 4, ACL_FLOAT, sizeof(float), nb, nb_g, 2);
             acl_tensor_ptr al = ggml_cann_create_tensor(lengths, ACL_INT32, sizeof(int32_t), nl, ns, 1);
-            acl_tensor_ptr ai = ggml_cann_create_tensor((char *) indices + (fp32 ? tok % T : tok) * 4, ACL_INT32, sizeof(int32_t), ni, ns, 1);
+            acl_tensor_ptr ai = ggml_cann_create_tensor((char *) indices + tok * 4, ACL_INT32, sizeof(int32_t), ni, ns, 1);
             call_op(aq.get(), ak.get(), av.get(), ab.get(), acl_bank.get(), al.get(), ai.get(), ag.get(), ao.get());
         };
-        if (!fp32 && T <= GDN_PREFILL_BLOCK) {
+        if (T <= GDN_PREFILL_BLOCK) {
             for (int64_t b = 0; b < B; ++b) {
                 seed(b, 0);
             }
@@ -5857,24 +5712,11 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
                 }
             }
         }
-        if (fp32) {
-            // Restore GGML newest-first [written,B,Nv,Dv,Dk] from [B,6,Nv,Dv,Dk].
-            void * packed = prefix_state.get();
-            for (int64_t w = 0; w < written; ++w) {
-                for (int64_t b = 0; b < B; ++b) {
-                    ACL_CHECK(aclrtMemcpyAsync((char *) packed + (w * B + b) * state_bytes, state_bytes,
-                        (char *) bank + (b * 6 + w) * state_bytes, state_bytes,
-                        ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
-                }
-            }
-            state_final = packed;
-        } else {
-            state_final = bank;
-        }
+        state_final = bank;
         if (gdn_probe_enabled()) {
             GGML_LOG_INFO("ggml_cann: GDN snapshots K=%lld W=%lld T=%lld B=%lld calls=%lld\n",
                 (long long) snapshots, (long long) written, (long long) T, (long long) B,
-                (long long) (!fp32 && T <= GDN_PREFILL_BLOCK ? 1 : B * ((T - prefix + 7) / 8)));
+                (long long) (T <= GDN_PREFILL_BLOCK ? 1 : B * ((T - prefix + 7) / 8)));
         }
     } else if (T == 1) {
         // decode: all B sequences (one token each) in a single call
@@ -5989,10 +5831,5 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
     // packed dst layout: attention output first, then the updated state snapshot
     float * out_base = (float *) dst->data;
     gdn_cast_f16_f32(ctx, out16_alloc.get(), out_base, v_elems);
-    if (fp32) {
-        ACL_CHECK(aclrtMemcpyAsync(out_base + v_elems, written * state_elems * 4,
-            state_final, written * state_elems * 4, ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
-    } else {
-        gdn_cast_f16_f32(ctx, state_final, out_base + v_elems, written * state_elems);
-    }
+    gdn_cast_f16_f32(ctx, state_final, out_base + v_elems, written * state_elems);
 }

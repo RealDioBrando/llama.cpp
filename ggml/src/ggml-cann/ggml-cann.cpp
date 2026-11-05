@@ -3573,7 +3573,6 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
         case GGML_OP_GATED_DELTA_NET:
             {
                 // Select chunk or recurrent from shape and snapshot requirements.
-                // FP32 state calls submit each sequence separately.
                 if (!ggml_cann_gdn_available()) {
                     return false;
                 }
