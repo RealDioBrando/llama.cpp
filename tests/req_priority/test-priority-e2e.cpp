@@ -230,6 +230,7 @@ static run_result run_mode(const std::string & model_path,
 
         std::vector<llama_token> sampled(info->n_seq, LLAMA_TOKEN_NULL);
         std::vector<int8_t>      stop(info->n_seq, 0);
+        std::vector<llama_paged_feedback> fbs;
 
         for (int i = 0; i < info->n_seq; ++i) {
             const int32_t rid = batch.seq_id[info->batch_offsets[i]][0];
@@ -262,10 +263,11 @@ static run_result run_mode(const std::string & model_path,
                     ++n_finished;
                     done[rid] = true;
                 }
+                fbs.push_back({ rid, &sampled[i], 1, stop[i] });
             }
         }
 
-        llama_paged_scheduler_update(sched, &batch, sampled.data(), stop.data());
+        llama_paged_scheduler_update(sched, &batch, fbs.empty() ? nullptr : fbs.data(), (int32_t) fbs.size());
     }
 
     EXPECT_TRUE(n_finished == n_requests);

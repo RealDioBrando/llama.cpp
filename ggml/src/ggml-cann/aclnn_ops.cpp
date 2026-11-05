@@ -2460,10 +2460,10 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tensor
     float weight_elem_size;
     if (type == GGML_TYPE_Q4_0) {
         weight_elem_size = float(sizeof(uint8_t)) / 2;
-    } else if (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_W8A8) {
+    } else if (type == GGML_TYPE_Q8_0) {
         weight_elem_size = float(sizeof(uint8_t));
     } else {
-        GGML_ABORT("Only support Q4_0, Q8_0, and W8A8 MUL_MAT");
+        GGML_ABORT("Only support Q4_0 and Q8_0 MUL_MAT");
     }
     float  weight_nb[]   = { src0->ne[0] * weight_elem_size, weight_elem_size };
     size_t weight_stride = src0->ne[1] * src0->ne[0] * weight_elem_size;
@@ -2936,11 +2936,7 @@ void ggml_cann_mul_mat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
 #endif
 #ifdef ASCEND_310P
         case GGML_TYPE_W8A8:
-            if (ggml_cann_w8a8_a8_enabled()) {
-                ggml_cann_mul_mat_w8a8_a8(ctx, dst);
-            } else {
-                ggml_cann_mul_mat_quant(ctx, dst, type);
-            }
+            ggml_cann_mul_mat_w8a8_a8(ctx, dst);
             break;
         // Re-quantized weights (device layout written at load time);
         // reachable only when ggml_cann_kq_matmul_path(src0) != NONE.

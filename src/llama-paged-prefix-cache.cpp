@@ -52,6 +52,16 @@ void llama_paged_prefix_cache::update_block_id(uint64_t hash, uint32_t new_block
     }
 }
 
+void llama_paged_prefix_cache::drop_block(uint32_t block_id) {
+    for (auto it = blocks.begin(); it != blocks.end(); ) {
+        if (it->second.block_id == block_id) {
+            it = blocks.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 void llama_paged_prefix_cache::set_cached_state(uint64_t hash, bool cached) {
     auto it = blocks.find(hash);
     if (it == blocks.end()) {

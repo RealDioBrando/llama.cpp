@@ -2848,6 +2848,10 @@ int32_t llama_model_n_embd_inp(const llama_model * model) {
     return model->hparams.n_embd_inp();
 }
 
+int32_t llama_model_n_pos_per_embd(const llama_model * model) {
+    return model->hparams.n_pos_per_embd();
+}
+
 int32_t llama_model_n_embd_out(const llama_model * model) {
     return model->hparams.n_embd_out();
 }
