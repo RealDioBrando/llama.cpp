@@ -244,7 +244,8 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
         ggml_tensor * candidate = graph->nodes[i];
         if (candidate->op == GGML_OP_MUL_MAT_ID && candidate->src[0] != nullptr &&
                 (is_gate_up_weight(candidate->src[0]) || is_gate_weight(candidate->src[0]) ||
-                 is_up_weight(candidate->src[0])) && candidate->src[2] == selected &&
+                 is_up_weight(candidate->src[0])) && candidate->src[0]->type == GGML_TYPE_F16 &&
+                candidate->src[2] == selected &&
                 ggml_cann_mul_mat_id_grouped_supported(candidate)) {
             first_expert = candidate;
             first_expert_idx = i;
@@ -264,8 +265,8 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
         for (int i = first_expert_idx + 1; i < graph->n_nodes; ++i) {
             ggml_tensor * candidate = graph->nodes[i];
             if (candidate->op == GGML_OP_MUL_MAT_ID && candidate->src[0] != nullptr &&
-                    is_up_weight(candidate->src[0]) && candidate->src[2] == selected &&
-                    ggml_cann_mul_mat_id_grouped_supported(candidate)) {
+                    is_up_weight(candidate->src[0]) && candidate->src[0]->type == GGML_TYPE_F16 &&
+                    candidate->src[2] == selected && ggml_cann_mul_mat_id_grouped_supported(candidate)) {
                 up_node = candidate;
                 break;
             }
@@ -275,14 +276,17 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
         for (int i = first_expert_idx + 1; i < graph->n_nodes; ++i) {
             ggml_tensor * candidate = graph->nodes[i];
             if (candidate->op == GGML_OP_MUL_MAT_ID && candidate->src[0] != nullptr &&
-                    is_gate_weight(candidate->src[0]) && candidate->src[2] == selected &&
-                    ggml_cann_mul_mat_id_grouped_supported(candidate)) {
+                    is_gate_weight(candidate->src[0]) && candidate->src[0]->type == GGML_TYPE_F16 &&
+                    candidate->src[2] == selected && ggml_cann_mul_mat_id_grouped_supported(candidate)) {
                 gate_node = candidate;
                 break;
             }
         }
     }
-    if (gate_node == nullptr || up_node == nullptr ||
+    if (gate_node == nullptr || up_node == nullptr || weights == nullptr ||
+            gate_node->src[1] == nullptr || gate_node->src[1]->type != GGML_TYPE_F32 ||
+            gate_node->src[2] == nullptr || gate_node->src[2]->type != GGML_TYPE_I32 ||
+            weights->type != GGML_TYPE_F32 ||
             gate_node->src[1] != up_node->src[1] ||
             gate_node->ne[0] != up_node->ne[0]) {
         if (debug) fprintf(stderr, "[MoE FULL] fail: no gate/up pair\n");
@@ -303,8 +307,8 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
     for (int i = glu_idx + 1; i < graph->n_nodes; ++i) {
         ggml_tensor * candidate = graph->nodes[i];
         if (candidate->op == GGML_OP_MUL_MAT_ID && candidate->src[0] != nullptr &&
-                is_down_weight(candidate->src[0]) && candidate->src[2] == selected &&
-                ggml_cann_mul_mat_id_grouped_supported(candidate)) {
+                is_down_weight(candidate->src[0]) && candidate->src[0]->type == GGML_TYPE_F16 &&
+                candidate->src[2] == selected && ggml_cann_mul_mat_id_grouped_supported(candidate)) {
             down_node = candidate;
             break;
         }
@@ -425,7 +429,7 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
     ggml_cann_pool_alloc row_idx(ctx.pool(), n_rows * i32);
     ggml_cann_pool_alloc cumsum_i32(ctx.pool(), n_exp * i32);
     ggml_cann_pool_alloc cumsum_i64(ctx.pool(), n_exp * sizeof(int64_t));
-    ggml_cann_pool_alloc gate_out(ctx.pool(), n_rows * n_ff * f16);
+    ggml_cann_pool_alloc gate_out(ctx.pool(), n_rows * (merged_gate_up ? 2 * n_ff : n_ff) * f16);
     ggml_cann_pool_alloc up_out(ctx.pool(),
                                 (merged_gate_up ? 0 : n_rows * n_ff) * f16);
     ggml_cann_pool_alloc activation(ctx.pool(), n_rows * n_ff * f16);
@@ -551,6 +555,10 @@ void run_moe_gmm(ggml_backend_cann_context & ctx, const ggml_tensor * weight,
     const int64_t n_token = ids->ne[1];
     const int64_t n_rows  = n_used * n_token;
     const int64_t x_rows  = input->ne[1] == 1 ? n_token : n_rows;
+
+    GGML_ASSERT(weight->type == GGML_TYPE_F16);
+    GGML_ASSERT(input->type == GGML_TYPE_F32 && input->ne[2] == 1 && input->ne[3] == 1);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
 
     GGML_ASSERT(input_alloc.get() != nullptr);
     GGML_ASSERT(input_alloc.actual_size >= n_in * x_rows * sizeof(uint16_t));
@@ -731,13 +739,22 @@ bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
                                 bool graph_has_w8a8_expert, int * last_fused_node) {
     ggml_tensor * node = graph->nodes[node_idx];
     if (node->op != GGML_OP_MUL_MAT || node->src[0] == nullptr ||
-            node->src[1] == nullptr || !is_router_weight(node->src[0])) {
+            node->src[1] == nullptr || node->type != GGML_TYPE_F32 ||
+            node->src[1]->type != GGML_TYPE_F32 || !is_router_weight(node->src[0])) {
         return false;
     }
 
     // MoeGatingTopKSoftmax and V2 do not list Atlas inference products
-    // as supported; keep router fusion opt-in on 310P.
-    const bool enabled = env_enabled("GGML_CANN_MOE_ROUTER_FUSION", !graph_has_w8a8_expert);
+    // as supported. Never fuse a W8A8 expert graph; the env override is only
+    // for diagnosing the F16 path.
+    if (graph_has_w8a8_expert) {
+        return false;
+    }
+#ifdef ASCEND_310P
+    const bool enabled = env_enabled("GGML_CANN_MOE_ROUTER_FUSION", false);
+#else
+    const bool enabled = env_enabled("GGML_CANN_MOE_ROUTER_FUSION", true);
+#endif
     if (!enabled) {
         return false;
     }
@@ -905,7 +922,8 @@ bool ggml_cann_moe_gate_up_fused(ggml_backend_cann_context & ctx,
                                  const ggml_cgraph * graph, int node_idx,
                                  bool graph_has_w8a8_expert, int * last_fused_node) {
     ggml_tensor * node = graph->nodes[node_idx];
-    if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] == nullptr) {
+    if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] == nullptr ||
+            node->src[0]->type != GGML_TYPE_F16) {
         return false;
     }
 
@@ -917,9 +935,10 @@ bool ggml_cann_moe_gate_up_fused(ggml_backend_cann_context & ctx,
         env_enabled("GGML_CANN_MOE_FULL_DEBUG", false);
     static int debug_count = 0;
 
-    if (full_fusion && (is_gate_up_weight(node->src[0]) ||
-                            is_gate_weight(node->src[0]) ||
-                            is_up_weight(node->src[0])) &&
+    if (full_fusion && node->src[0]->type == GGML_TYPE_F16 &&
+            (is_gate_up_weight(node->src[0]) ||
+             is_gate_weight(node->src[0]) ||
+             is_up_weight(node->src[0])) &&
             ggml_cann_mul_mat_id_grouped_supported(node)) {
         ggml_tensor * selected = node->src[2];
         const ggml_tensor * logits =
@@ -970,7 +989,8 @@ bool ggml_cann_moe_gate_up_fused(ggml_backend_cann_context & ctx,
         for (int i = node_idx + 1; i < graph->n_nodes; ++i) {
             ggml_tensor * candidate = graph->nodes[i];
             if (candidate->op == GGML_OP_MUL_MAT_ID && candidate->src[0] != nullptr &&
-                    is_up_weight(candidate->src[0]) && candidate->src[2] == node->src[2]) {
+                    is_up_weight(candidate->src[0]) && candidate->src[0]->type == GGML_TYPE_F16 &&
+                    candidate->src[2] == node->src[2]) {
                 up_node = candidate;
                 break;
             }
@@ -980,13 +1000,16 @@ bool ggml_cann_moe_gate_up_fused(ggml_backend_cann_context & ctx,
         for (int i = node_idx + 1; i < graph->n_nodes; ++i) {
             ggml_tensor * candidate = graph->nodes[i];
             if (candidate->op == GGML_OP_MUL_MAT_ID && candidate->src[0] != nullptr &&
-                    is_gate_weight(candidate->src[0]) && candidate->src[2] == node->src[2]) {
+                    is_gate_weight(candidate->src[0]) && candidate->src[0]->type == GGML_TYPE_F16 &&
+                    candidate->src[2] == node->src[2]) {
                 gate_node = candidate;
                 break;
             }
         }
     }
-    if (gate_node == nullptr || up_node == nullptr) {
+    if (gate_node == nullptr || up_node == nullptr ||
+            gate_node->src[1] == nullptr || gate_node->src[1]->type != GGML_TYPE_F32 ||
+            gate_node->src[2] == nullptr || gate_node->src[2]->type != GGML_TYPE_I32) {
         return false;
     }
     if (!ggml_cann_mul_mat_id_grouped_supported(gate_node) ||
@@ -997,7 +1020,8 @@ bool ggml_cann_moe_gate_up_fused(ggml_backend_cann_context & ctx,
     ggml_tensor * glu = gate_node == up_node
         ? find_glu_node(graph, node_idx)
         : find_glu_node_for_pair(graph, node_idx, gate_node, up_node);
-    if (glu == nullptr || ggml_get_op_params_i32(glu, 1) != 0) {
+    if (glu == nullptr || glu->type != GGML_TYPE_F32 ||
+            ggml_get_op_params_i32(glu, 1) != 0) {
         return false;
     }
     const int glu_idx = find_node_index(graph, glu);
@@ -1060,13 +1084,17 @@ bool ggml_cann_moe_down_unpermute_fused(ggml_backend_cann_context & ctx,
     static const bool enabled = env_enabled("GGML_CANN_MOE_UNPERMUTE_FUSION", true);
     ggml_tensor * node = graph->nodes[node_idx];
     if (!enabled || node->op != GGML_OP_MUL_MAT_ID || node->src[0] == nullptr ||
+            node->src[0]->type != GGML_TYPE_F16 || node->src[1] == nullptr ||
+            node->src[1]->type != GGML_TYPE_F32 || node->src[2] == nullptr ||
+            node->src[2]->type != GGML_TYPE_I32 ||
             !is_down_weight(node->src[0]) ||
             !ggml_cann_mul_mat_id_grouped_supported(node)) {
         return false;
     }
 
     ggml_tensor * weighted = nullptr;
-    if (find_weighted_down(graph, node_idx, &weighted) == nullptr) {
+    if (find_weighted_down(graph, node_idx, &weighted) == nullptr ||
+            weighted->src[1] == nullptr || weighted->src[1]->type != GGML_TYPE_F32) {
         return false;
     }
     const int weighted_idx = find_node_index(graph, weighted);
@@ -1097,7 +1125,7 @@ bool ggml_cann_moe_down_unpermute_fused(ggml_backend_cann_context & ctx,
     ggml_cann_pool_alloc probs16(ctx.pool(), n_token * n_used * sizeof(uint16_t));
     int64_t probs_ne[2] = { n_used, n_token };
     size_t  probs_nb[2] = { sizeof(uint16_t), n_used * sizeof(uint16_t) };
-    size_t  weights_nb[2] = { sizeof(float), weighted->src[1]->nb[0] };
+    size_t  weights_nb[2] = { weighted->src[1]->nb[1], weighted->src[1]->nb[2] };
     acl_tensor_ptr acl_prob_dst = ggml_cann_create_tensor(probs16.get(), ACL_FLOAT16,
                                                           sizeof(uint16_t), probs_ne,
                                                           probs_nb, 2);

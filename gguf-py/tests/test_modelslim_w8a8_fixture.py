@@ -68,6 +68,7 @@ def make_fixture(
     weight_dtype: np.dtype = np.dtype(np.int8),
     k: int = 64,
     static_metadata: bool = False,
+    embedding_w8a8: bool = False,
 ) -> None:
     model_dir.mkdir(parents=True, exist_ok=True)
     (model_dir / "config.json").write_text(json.dumps(base_config(architecture)), encoding="utf-8")
@@ -75,12 +76,19 @@ def make_fixture(
     scale_name = weight_name.removesuffix(".weight") + ".weight_scale"
     offset_name = weight_name.removesuffix(".weight") + ".weight_offset"
     norm_name = "model.language_model.layers.0.input_layernorm.weight"
+    embedding_name = "model.language_model.embed_tokens.weight"
     tensors = {
         weight_name: np.arange(32 * k, dtype=np.int16).astype(weight_dtype).reshape(32, k),
         scale_name: np.full((32, 1), 0.25, dtype=np.float32),
         offset_name: np.full((32, 1), 1.0 if nonzero_offset else 0.0, dtype=np.float32),
         norm_name: np.ones((64,), dtype=np.float32),
     }
+    if embedding_w8a8:
+        embedding_scale = embedding_name.removesuffix(".weight") + ".weight_scale"
+        embedding_offset = embedding_name.removesuffix(".weight") + ".weight_offset"
+        tensors[embedding_name] = np.zeros((128, 64), dtype=np.int8)
+        tensors[embedding_scale] = np.ones((128, 1), dtype=np.float32)
+        tensors[embedding_offset] = np.zeros((128, 1), dtype=np.float32)
     for name in (missing,) if missing else ():
         tensors.pop(name, None)
 
@@ -94,6 +102,10 @@ def make_fixture(
     }
     if missing:
         description.pop(missing, None)
+    if embedding_w8a8:
+        description[embedding_name] = "W8A8_DYNAMIC"
+        description[embedding_name.removesuffix(".weight") + ".weight_scale"] = "W8A8_DYNAMIC"
+        description[embedding_name.removesuffix(".weight") + ".weight_offset"] = "W8A8_DYNAMIC"
     if static_metadata:
         description["model.language_model.layers.0.self_attn.q_proj.input_scale"] = "W8A8"
     (model_dir / "quant_model_description.json").write_text(json.dumps(description), encoding="utf-8")
@@ -119,6 +131,15 @@ class ModelslimFixtureTest(unittest.TestCase):
             model.prepare_tensors()
             self.assertEqual(len(model._modelslim_mapping), 1)
             self.assertEqual(model._modelslim_mapping[0]["gguf_name"], "blk.0.ffn_gate.weight")
+
+    def test_w8a8_token_embedding_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp) / "model"
+            make_fixture(model_dir, embedding_w8a8=True)
+            result = run_tool(CONVERTER, str(model_dir), "--outfile", str(Path(tmp) / "out.gguf"),
+                              "--outtype", "w8a8", "--dry-run")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("token embedding", result.stderr.lower())
 
     def test_missing_scale_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

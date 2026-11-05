@@ -3739,10 +3739,14 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     case GGML_TYPE_W8A8:
                         // aclnnQuantMatmulV5 Atlas inference K-C: last x1
                         // dimension (K) <= 65535; W8A8 blocks require K % 32.
-                        return op->src[0]->ne[0] % 32 == 0 &&
+                        return (op->src[0]->buffer == nullptr ||
+                                ggml_backend_buft_is_cann(op->src[0]->buffer->buft)) &&
+                               op->src[0]->ne[0] % 32 == 0 &&
                                op->src[0]->ne[0] <= 65535 &&
                                op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+                               op->src[1]->ne[0] == op->src[0]->ne[0] &&
                                op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                               op->ne[2] == 1 && op->ne[3] == 1 &&
                                (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
                                (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
                                ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
@@ -3792,7 +3796,9 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     }
                     // aclnnQuantGroupedMatmulDequant requires n and k to be
                     // multiples of 16; W8A8 blocks further require K % 32.
-                    return ggml_cann_w8a8_is_expert(op->src[0]) &&
+                    return (op->src[0]->buffer == nullptr ||
+                            ggml_backend_buft_is_cann(op->src[0]->buffer->buft)) &&
+                           ggml_cann_w8a8_is_expert(op->src[0]) &&
                            op->src[0]->ne[0] % 32 == 0 &&
                            op->src[0]->ne[1] % 16 == 0 &&
                            op->src[0]->ne[3] == 1 &&

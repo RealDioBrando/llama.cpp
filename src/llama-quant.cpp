@@ -375,6 +375,14 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
     const int64_t ncols = t->ne[0];
     const int64_t qk_k = ggml_blck_size(target_type);
 
+    if (target_type == GGML_TYPE_W8A8 && t->ne[2] > 1 && t->ne[1] % 16 != 0) {
+        LLAMA_LOG_WARN("warning: %-36s - expert output N %6" PRId64
+                        " is not divisible by 16 (required for W8A8 grouped matmul) -> falling back to F16\n",
+                        t->name, t->ne[1]);
+        ++qs.n_fallback;
+        return GGML_TYPE_F16;
+    }
+
     if (ncols % qk_k != 0) { // this tensor's shape is incompatible with this quant
         LLAMA_LOG_WARN("warning: %-36s - ncols %6" PRId64 " not divisible by %3" PRId64 " (required for type %7s) ",
                         t->name, ncols, qk_k, ggml_type_name(target_type));

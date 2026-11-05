@@ -11,27 +11,31 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "gguf-py"))
 
-from conversion.modelslim import w8a8_blocks, w8a8_expert_blocks  # noqa: E402
+from conversion.modelslim import (  # noqa: E402
+    validate_expert_output_alignment,
+    w8a8_blocks,
+    w8a8_expert_blocks,
+)
 
 
 class W8A8PackingTest(unittest.TestCase):
     def test_expert_blocks_preserve_payload_and_scale(self) -> None:
-        weight = np.arange(2 * 3 * 64, dtype=np.int8).reshape(2, 3, 64)
-        scale = np.array([[0.5, 1.0, 2.0], [3.0, 4.0, 5.0]], dtype=np.float32)
+        weight = np.arange(2 * 16 * 64, dtype=np.int8).reshape(2, 16, 64)
+        scale = np.tile(np.array([0.5, 1.0, 2.0, 3.0], dtype=np.float32), (2, 4))
         raw = w8a8_expert_blocks(weight, scale)
-        self.assertEqual(raw.shape, (2, 3, 2 * 34))
+        self.assertEqual(raw.shape, (2, 16, 2 * 34))
 
-        decoded = raw.reshape(2, 3, 2, 34)
+        decoded = raw.reshape(2, 16, 2, 34)
         self.assertEqual(decoded.dtype, np.uint8)
         for expert in range(2):
-            for row in range(3):
+            for row in range(16):
                 self.assertEqual(decoded[expert, row, :, 0:2].view('<f2').reshape(-1).tolist(), [scale[expert, row]] * 2)
                 payload = decoded[expert, row, :, 2:].view(np.int8).reshape(64)
                 self.assertTrue(np.array_equal(payload, weight[expert, row]))
 
     def test_singleton_scale_plane_is_normalized(self) -> None:
-        weight = np.arange(2 * 2 * 32, dtype=np.int8).reshape(2, 2, 32)
-        scale = np.array([[[0.25], [0.5]], [[1.0], [2.0]]], dtype=np.float32)
+        weight = np.arange(2 * 16 * 32, dtype=np.int8).reshape(2, 16, 32)
+        scale = np.arange(1, 33, dtype=np.float32).reshape(2, 16, 1)
         np.testing.assert_array_equal(w8a8_expert_blocks(weight, scale), w8a8_expert_blocks(weight, scale[..., 0]))
 
     def test_dense_blocks_are_byte_stable(self) -> None:
@@ -69,6 +73,16 @@ class W8A8ValidationTest(unittest.TestCase):
         scale = np.ones((2, 1), dtype=np.float16)
         self.assert_rejected(lambda: w8a8_blocks(weight, scale))
 
+    def test_dense_rejects_negative_scale(self) -> None:
+        weight = np.zeros((2, 32), dtype=np.int8)
+        scale = -np.ones((2, 1), dtype=np.float32)
+        self.assert_rejected(lambda: w8a8_blocks(weight, scale))
+
+    def test_dense_rejects_fp16_scale_overflow(self) -> None:
+        weight = np.zeros((2, 32), dtype=np.int8)
+        scale = np.full((2, 1), np.finfo(np.float32).max, dtype=np.float32)
+        self.assert_rejected(lambda: w8a8_blocks(weight, scale))
+
     def test_expert_rejects_invalid_dtype(self) -> None:
         weight = np.zeros((2, 2, 32), dtype=np.float32)
         scale = np.ones((2, 2), dtype=np.float32)
@@ -79,14 +93,29 @@ class W8A8ValidationTest(unittest.TestCase):
         scale = np.ones((2, 3), dtype=np.float32)
         self.assert_rejected(lambda: w8a8_expert_blocks(weight, scale))
 
+    def test_expert_rejects_unaligned_output_width(self) -> None:
+        weight = np.zeros((2, 8, 32), dtype=np.int8)
+        scale = np.ones((2, 8), dtype=np.float32)
+        self.assert_rejected(lambda: w8a8_expert_blocks(weight, scale))
+
+    def test_expert_accepts_aligned_output_width(self) -> None:
+        weight = np.zeros((2, 16, 32), dtype=np.int8)
+        scale = np.ones((2, 16), dtype=np.float32)
+        self.assertEqual(w8a8_expert_blocks(weight, scale).shape, (2, 16, 34))
+
+    def test_fused_gate_up_checks_each_half(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_expert_output_alignment(24, "gate_up_proj")
+        validate_expert_output_alignment(32, "gate_up_proj")
+
     def test_fused_gate_up_slice_order(self) -> None:
-        weight = np.arange(2 * 4 * 32, dtype=np.int8).reshape(2, 4, 32)
-        scale = np.ones((2, 4), dtype=np.float32)
-        half = 2
+        weight = np.arange(2 * 32 * 32, dtype=np.int8).reshape(2, 32, 32)
+        scale = np.ones((2, 32), dtype=np.float32)
+        half = 16
         gate = w8a8_expert_blocks(weight[:, :half, :], scale[:, :half])
         up = w8a8_expert_blocks(weight[:, half:, :], scale[:, half:])
-        gate_payload = gate.reshape(2, 2, 1, 34)[:, :, :, 2:].view(np.int8).reshape(2, 2, 32)
-        up_payload = up.reshape(2, 2, 1, 34)[:, :, :, 2:].view(np.int8).reshape(2, 2, 32)
+        gate_payload = gate.reshape(2, 16, 1, 34)[:, :, :, 2:].view(np.int8).reshape(2, 16, 32)
+        up_payload = up.reshape(2, 16, 1, 34)[:, :, :, 2:].view(np.int8).reshape(2, 16, 32)
         np.testing.assert_array_equal(gate_payload, weight[:, :half, :])
         np.testing.assert_array_equal(up_payload, weight[:, half:, :])
 

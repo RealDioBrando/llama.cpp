@@ -54,6 +54,14 @@ def load_description(model_dir: Path) -> dict[str, object]:
     return description
 
 
+def validate_expert_output_alignment(n: int, projection: str) -> None:
+    target_n = n // 2 if projection == "gate_up_proj" else n
+    require(n % 2 == 0 if projection == "gate_up_proj" else True,
+            f"{projection} output dimension {n} must be even")
+    require(target_n % 16 == 0,
+            f"{projection} output dimension {target_n} must be divisible by 16 for the 310P grouped operator")
+
+
 def w8a8_blocks(weight: np.ndarray, scale: np.ndarray) -> np.ndarray:
     """Pack a 2D ModelSlim W8A8 tensor into GGML block bytes."""
     require(weight.dtype == np.int8, f"weight must be INT8, got {weight.dtype}")
@@ -62,6 +70,9 @@ def w8a8_blocks(weight: np.ndarray, scale: np.ndarray) -> np.ndarray:
     require(scale.ndim == 2 and scale.shape == (weight.shape[0], 1),
             f"weight_scale must have shape ({weight.shape[0]}, 1), got {scale.shape}")
     require(weight.shape[1] % 32 == 0, f"K must be divisible by 32, got {weight.shape[1]}")
+    require(np.isfinite(scale).all(), "weight_scale must contain finite values")
+    require((scale >= 0).all(), "weight_scale must be non-negative")
+    require((scale <= np.finfo(np.float16).max).all(), "weight_scale cannot be represented as FP16")
 
     n, k = weight.shape
     scale_f16 = scale.reshape(-1).astype(np.float16, copy=False)
@@ -92,6 +103,7 @@ def w8a8_expert_blocks(weight: np.ndarray, scale: np.ndarray) -> np.ndarray:
         f"expert weight_scale shape {scale.shape} != {(weight.shape[0], weight.shape[1])}",
     )
     require(weight.shape[2] % 32 == 0, f"K must be divisible by 32, got {weight.shape[2]}")
+    require(weight.shape[1] % 16 == 0, f"expert output N must be divisible by 16, got {weight.shape[1]}")
 
     n_experts, n, k = weight.shape
     raw = np.empty((n_experts, n, (k // 32) * 34), dtype=np.uint8)
@@ -173,6 +185,15 @@ class ModelSlimAdapter:
         base = weight_name.removesuffix(".weight")
         return base + ".weight_scale", base + ".weight_offset"
 
+    def _is_token_embedding(self, weight_name: str) -> bool:
+        return self.tensor_map.get_type(weight_name, try_suffixes=(".weight",)) == gguf.MODEL_TENSOR.TOKEN_EMBD
+
+    def _validate_dense_support(self, weight_name: str) -> None:
+        require(
+            not self._is_token_embedding(weight_name),
+            f"W8A8 token embeddings are not supported because GET_ROWS has no CANN W8A8 path: {weight_name}",
+        )
+
     def _tensor(self, name: str, description: str) -> torch.Tensor:
         require(name in self.model_tensors, f"missing normalized {description} tensor: {name}")
         return self.model_tensors[name]()
@@ -191,6 +212,7 @@ class ModelSlimAdapter:
         return nonzero
 
     def _pack_dense_weight(self, source_name: str, weight_name: str) -> dict[str, object]:
+        self._validate_dense_support(weight_name)
         scale_name, offset_name = self._triple_names(weight_name)
         weight_lazy = self._tensor(weight_name, "weight")
         scale_lazy = self._tensor(scale_name, "scale")
@@ -232,6 +254,7 @@ class ModelSlimAdapter:
         for source_name, weight_name in self._quantized_weight_names():
             if ".mlp.experts." in weight_name:
                 continue
+            self._validate_dense_support(weight_name)
             if load_payload:
                 records.append(self._pack_dense_weight(source_name, weight_name))
                 continue
@@ -356,6 +379,7 @@ class _ModelSlimFullAdapter(ModelSlimAdapter):
                     f"{first_scale_name} shape {scale_shape} != ({weight_shape[0]}, 1)")
             require(offset_shape == scale_shape, f"{first_offset_name} shape {offset_shape} != {scale_shape}")
             require(weight_shape[1] % 32 == 0, f"K must be divisible by 32, got {weight_shape[1]}")
+            validate_expert_output_alignment(weight_shape[0], projection)
 
             gguf_name = self.map_tensor_name(self._merged_expert_name(layer, projection))
             raw = None
@@ -451,6 +475,7 @@ class _ModelSlimFullAdapter(ModelSlimAdapter):
             require(raw_offset_shape in (scale_shape, (*scale_shape, 1)),
                     f"{offset_name} shape {raw_offset_shape} incompatible with scale shape {scale_shape}")
             require(weight_shape[2] % 32 == 0, f"K must be divisible by 32, got {weight_shape[2]}")
+            validate_expert_output_alignment(weight_shape[1], projection)
             self._validate_offset(offset_lazy, offset_name)
             scale = self._validate_scale(scale_lazy, scale_name)
 
