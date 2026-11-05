@@ -173,6 +173,12 @@ class ModelBase:
         self._fp8_as_q8 = fp8_as_q8
         self._fp8_dequantized: set[str] = set()
 
+        if self.ftype == gguf.LlamaFileType.GUESSED:
+            from .modelslim import has_modelslim_checkpoint
+            if self.model_type == ModelType.TEXT and has_modelslim_checkpoint(self.dir_model):
+                self.ftype = gguf.LlamaFileType.MOSTLY_W8A8
+                logger.info("heuristics detected a ModelSlim checkpoint, setting --outtype w8a8")
+
         # Apply heuristics to figure out typical tensor encoding based on first tensor's dtype
         # NOTE: can't use field "torch_dtype" in config.json, because some finetunes lie.
         if self.ftype == gguf.LlamaFileType.GUESSED:
@@ -214,6 +220,10 @@ class ModelBase:
         raise KeyError(f"could not find any of: {keys}")
 
     def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
+        from .modelslim import has_modelslim_checkpoint, index_modelslim_tensors
+        if has_modelslim_checkpoint(self.dir_model):
+            return index_modelslim_tensors(self, remote_hf_model_id)
+
         tensors: dict[str, Callable[[], Tensor]] = {}
 
         if remote_hf_model_id is not None:
@@ -950,6 +960,19 @@ class ModelBase:
         self._is_nvfp4 = quant_algo in ("NVFP4", "W4A16_NVFP4")
         self._is_mxfp4 = quant_method == "mxfp4"
 
+        from .modelslim import create_adapter, has_modelslim_checkpoint
+        modelslim_checkpoint = (
+            self.model_type == ModelType.TEXT and has_modelslim_checkpoint(self.dir_model)
+        )
+        if self.ftype == gguf.LlamaFileType.MOSTLY_W8A8 and not modelslim_checkpoint:
+            raise ValueError("--outtype w8a8 requires a ModelSlim W8A8_DYNAMIC checkpoint")
+        if modelslim_checkpoint:
+            if self.ftype != gguf.LlamaFileType.MOSTLY_W8A8:
+                raise ValueError("ModelSlim checkpoints require --outtype w8a8")
+            adapter = create_adapter(self)
+            self._modelslim_mapping = adapter.prepare()
+            logger.info(f"gguf: packed {len(self._modelslim_mapping)} ModelSlim W8A8 source tensors")
+
         # NVFP4 weights are repacked and written directly to gguf_writer.
         # This must run before dequant_model so NVFP4 tensors are removed
         # from model_tensors, leaving only non-NVFP4 (e.g. FP8) for dequant.
@@ -1082,6 +1105,8 @@ class ModelBase:
                         data_qtype = gguf.GGMLQuantizationType.BF16
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_Q8_0:
                         data_qtype = gguf.GGMLQuantizationType.Q8_0
+                    elif self.ftype == gguf.LlamaFileType.MOSTLY_W8A8:
+                        data_qtype = gguf.GGMLQuantizationType.F16
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ1_0:
                         data_qtype = gguf.GGMLQuantizationType.TQ1_0
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ2_0:

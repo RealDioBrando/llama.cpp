@@ -314,7 +314,15 @@ int main(int argc, char ** argv) {
             }
         }
 
-        llama_paged_scheduler_update(scheduler, &batch, sampled_tokens.data(), stop_flags.data());
+        std::vector<llama_paged_feedback> fb;
+        fb.reserve(info->n_seq);
+        for (int i = 0; i < info->n_seq; ++i) {
+            if (stop_flags[i] || sampled_tokens[i] != LLAMA_TOKEN_NULL) {
+                const int32_t rid = batch.seq_id[info->batch_offsets[i]][0];
+                fb.push_back({ rid, &sampled_tokens[i], 1, stop_flags[i] });
+            }
+        }
+        llama_paged_scheduler_update(scheduler, &batch, fb.data(), (int32_t) fb.size());
     }
 
     LOG_INF("%s: Finished paged example.\n", __func__);
