@@ -25,6 +25,7 @@
 #include <array>
 #include <cfloat>
 #include <cinttypes>
+#include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -39,6 +40,7 @@
 #include <regex>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -1338,10 +1340,10 @@ struct test_case {
         }
     }
 
-    test_status_t eval(ggml_backend_t backend1,
-                       ggml_backend_t backend2,
-                       const char *   op_names_filter,
-                       printer *      output_printer) {
+    virtual test_status_t eval(ggml_backend_t backend1,
+                               ggml_backend_t backend2,
+                               const char *   op_names_filter,
+                               printer *      output_printer) {
         mode = MODE_TEST;
 
         ggml_init_params params = {
@@ -4661,6 +4663,202 @@ struct test_gated_delta_net : public test_case {
                 init_tensor_uniform(t);
             }
         }
+    }
+};
+
+// Verify each draft position against a CPU graph that only advances one token.
+struct test_gated_delta_net_draft16 : public test_gated_delta_net {
+    test_gated_delta_net_draft16(int tokens, int sequences)
+        : test_gated_delta_net(GGML_TYPE_F32, 16, 128, tokens, sequences, 1, false, false, 17) {}
+
+    struct graph {
+        ggml_context_ptr ctx{ggml_init({16 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true})};
+        ggml_backend_buffer_ptr buffer;
+        ggml_tensor * out;
+        ggml_cgraph * gf;
+
+        graph(int64_t d, int64_t h, int64_t t, int64_t b, int64_t slots) {
+            if (!ctx) { throw std::runtime_error("GDN graph allocation failed"); }
+            ggml_tensor * inputs[6];
+            for (int i = 0; i < 5; ++i) {
+                inputs[i] = ::ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, i < 3 ? d : 1, h, t, b);
+            }
+            inputs[5] = ::ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d, d, h, b);
+            for (auto * input : inputs) { ggml_set_input(input); }
+            out = ggml_gated_delta_net(ctx.get(), inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], slots);
+            ggml_set_output(out);
+            gf = ggml_new_graph(ctx.get());
+            ggml_build_forward_expand(gf, out);
+        }
+
+        void allocate(ggml_backend_t backend) {
+            buffer.reset(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+            if (!buffer) { throw std::runtime_error("GDN buffer allocation failed"); }
+        }
+
+        void run(ggml_backend_t backend, const std::vector<float> & state) {
+            ggml_backend_tensor_set(out->src[5], state.data(), 0, state.size() * sizeof(float));
+            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+                throw std::runtime_error("GDN graph compute failed");
+            }
+            ggml_backend_synchronize(backend);
+        }
+    };
+
+    using inputs = std::array<std::vector<float>, 5>;
+
+    inputs make_inputs(int64_t tokens, std::mt19937 & rng) const {
+        inputs x;
+        std::uniform_real_distribution<float> uniform(-1.0f, 1.0f);
+        for (size_t i = 0; i < x.size(); ++i) {
+            x[i].resize(n_seqs * tokens * head_count * (i < 3 ? head_size : 1));
+            for (float & value : x[i]) {
+                value = uniform(rng);
+                if (i == 3) { value = -0.015f + 0.01f * value; }
+                if (i == 4) { value =  0.45f  + 0.25f * value; }
+            }
+            if (i < 2) {
+                for (size_t j = 0; j < x[i].size(); j += head_size) {
+                    float * row = x[i].data() + j;
+                    double norm = 0.0;
+                    for (int64_t d = 0; d < head_size; ++d) { norm += double(row[d]) * row[d]; }
+                    const float scale = static_cast<float>(std::sqrt(norm));
+                    for (int64_t d = 0; d < head_size; ++d) { row[d] /= scale; }
+                }
+            }
+        }
+        return x;
+    }
+
+    static void set_inputs(graph & dst, const inputs & x, int token = -1) {
+        for (size_t i = 0; i < x.size(); ++i) {
+            ggml_tensor * input = dst.out->src[i];
+            if (token < 0) {
+                ggml_backend_tensor_set(input, x[i].data(), 0, ggml_nbytes(input));
+            } else {
+                const size_t width = input->ne[0] * input->ne[1];
+                const size_t seq_stride = x[i].size() / input->ne[3];
+                for (int64_t b = 0; b < input->ne[3]; ++b) {
+                    ggml_backend_tensor_set(input, x[i].data() + b * seq_stride + token * width,
+                                            b * width * sizeof(float), width * sizeof(float));
+                }
+            }
+        }
+    }
+
+    static std::vector<float> read(ggml_tensor * tensor, size_t offset, size_t count) {
+        std::vector<float> result(count);
+        ggml_backend_tensor_get(tensor, result.data(), offset * sizeof(float), count * sizeof(float));
+        return result;
+    }
+
+    int64_t rollback_distance(int seq, int visit, int64_t written) const {
+        if (n_seqs == 1) { return visit == 0 ? written - 1 : 0; }
+        if (n_seqs == 4) {
+            constexpr int distances[] = {16, 9, 8, 0};
+            return distances[(seq + visit) % 4] % written;
+        }
+        return (seq + visit) % written;
+    }
+
+    void check(graph & batch, graph & step, graph & next, ggml_backend_t target, ggml_backend_t cpu) {
+        const size_t row = head_size * head_count;
+        const size_t state = head_size * row;
+        const size_t output_size = n_seqs * n_seq_tokens * row;
+        const int64_t written = std::min(n_seq_tokens, K);
+        const double limit = max_nmse_err(target);
+        auto compare = [&](const float * got, const float * ref, size_t count, const char * what, int b, int j) {
+            const double err = nmse(ref, got, count);
+            if (!std::isfinite(err) || err > limit) {
+                fprintf(stderr, "GDN %s seq=%d step=%d NMSE=%.9g (limit %.9g)\n", what, b, j, err, limit);
+                throw std::runtime_error(what);
+            }
+        };
+
+        // Run both visits on the same graph and buffers before submitting the continuation graph.
+        std::vector<float> selected[2], reference[2];
+        for (int visit = 0; visit < 2; ++visit) {
+            std::mt19937 rng(static_cast<unsigned>(283 + 1009 * visit + 31 * n_seqs + n_seq_tokens));
+            const inputs x = make_inputs(n_seq_tokens, rng);
+            std::vector<float> initial(n_seqs * state);
+            std::uniform_real_distribution<float> uniform(-0.15f, 0.15f);
+            for (float & value : initial) { value = uniform(rng); }
+            const std::vector<float> guard(state, 123.25f);
+            for (int64_t cell = written * n_seqs; cell < K * n_seqs; ++cell) {
+                ggml_backend_tensor_set(batch.out, guard.data(), (output_size + cell * state) * sizeof(float), state * sizeof(float));
+            }
+            set_inputs(batch, x);
+            batch.run(target, initial);
+            if (read(batch.out->src[5], 0, initial.size()) != initial) { throw std::runtime_error("initial state modified"); }
+            std::vector<float> running = initial;
+            reference[visit].resize(running.size());
+            selected[visit].resize(running.size());
+            for (int j = 0; j < n_seq_tokens; ++j) {
+                set_inputs(step, x, j);
+                step.run(cpu, running);
+                const auto outputs = read(step.out, 0, n_seqs * row);
+                running = read(step.out, n_seqs * row, n_seqs * state);
+                const int64_t slot = n_seq_tokens - 1 - j;
+                for (int b = 0; b < n_seqs; ++b) {
+                    const auto output = read(batch.out, (b * n_seq_tokens + j) * row, row);
+                    compare(output.data(), outputs.data() + b * row, row, "output", b, j);
+                    if (slot >= written) { continue; }
+                    const auto snapshot = read(batch.out, output_size + (slot * n_seqs + b) * state, state);
+                    compare(snapshot.data(), running.data() + b * state, state, "snapshot", b, j);
+                    if (slot == rollback_distance(b, visit, written)) {
+                        std::copy_n(running.data() + b * state, state, reference[visit].data() + b * state);
+                        std::copy(snapshot.begin(), snapshot.end(), selected[visit].data() + b * state);
+                    }
+                }
+            }
+            for (int64_t cell = written * n_seqs; cell < K * n_seqs; ++cell) {
+                if (read(batch.out, output_size + cell * state, state) != guard) { throw std::runtime_error("unused slot modified"); }
+            }
+        }
+        for (int visit = 0; visit < 2; ++visit) {
+            std::mt19937 rng(284 + visit);
+            for (int j = 0; j < 2; ++j) {
+                const inputs x = make_inputs(1, rng);
+                set_inputs(next, x);
+                set_inputs(step, x);
+                next.run(target, selected[visit]);
+                step.run(cpu, reference[visit]);
+                const auto outputs = read(step.out, 0, n_seqs * row);
+                reference[visit] = read(step.out, n_seqs * row, n_seqs * state);
+                selected[visit] = read(next.out, n_seqs * row, n_seqs * state);
+                for (int b = 0; b < n_seqs; ++b) {
+                    const auto output = read(next.out, b * row, row);
+                    compare(output.data(), outputs.data() + b * row, row, "continuation output", b, j);
+                    compare(selected[visit].data() + b * state, reference[visit].data() + b * state, state, "continuation state", b, j);
+                }
+            }
+        }
+    }
+
+    test_status_t eval(ggml_backend_t backend, ggml_backend_t cpu, const char * filter, printer * output) override {
+        mode = MODE_TEST;
+        current_op_name = "GATED_DELTA_NET";
+        const char * name = ggml_backend_name(backend);
+        try {
+            graph batch(head_size, head_count, n_seq_tokens, n_seqs, K);
+            if (!matches_filter(batch.out, filter)) { return test_status_t::SKIPPED; }
+            graph step(head_size, head_count, 1, n_seqs, 1);
+            graph next(head_size, head_count, 1, n_seqs, K);
+            if (!ggml_backend_supports_op(backend, batch.out) || !ggml_backend_supports_op(backend, next.out)
+                || !ggml_backend_supports_op(cpu, step.out)) {
+                print_test_result_locked(output, test_result(name, current_op_name, vars(), "test", false, false, "not supported"));
+                return test_status_t::NOT_SUPPORTED;
+            }
+            batch.allocate(backend);
+            step.allocate(cpu);
+            next.allocate(backend);
+            check(batch, step, next, backend, cpu);
+        } catch (const std::exception & e) {
+            print_test_result_locked(output, test_result(name, current_op_name, vars(), "test", true, false, e.what()));
+            return test_status_t::FAIL;
+        }
+        print_test_result_locked(output, test_result(name, current_op_name, vars(), "test", true, true));
+        return test_status_t::OK;
     }
 };
 
@@ -8902,6 +9100,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 73, 2, 1, false, false, 5));
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 1, false, false, 1));
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 2, 1, false, false, 5));
+        for (int sequences : {1, 4, 32}) {
+            test_cases.emplace_back(new test_gated_delta_net_draft16(17, sequences));
+        }
+        test_cases.emplace_back(new test_gated_delta_net_draft16(3, 4));
+        test_cases.emplace_back(new test_gated_delta_net_draft16(16, 2));
+        test_cases.emplace_back(new test_gated_delta_net_draft16(18, 2));
         return test_cases;
     }
 

@@ -1790,7 +1790,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
-    // Opt-in ngram-simple rollback with four retained states.
+    // Reserve one rollback step per possible ngram-simple draft token.
     const char * snapshot_enable = std::getenv("LLAMA_GDN_SNAPSHOT_ENABLE");
     if ((snapshot_enable && std::strcmp(snapshot_enable, "1") == 0) &&
         std::find(params.speculative.types.begin(), params.speculative.types.end(),
@@ -1798,10 +1798,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
         std::all_of(params.speculative.types.begin(), params.speculative.types.end(), [](common_speculative_type t) {
             return t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE;
         })) {
-        if (params.speculative.ngram_simple.size_m != 4) {
-            throw std::runtime_error("snapshot rollback requires ngram-simple size-m=4");
-        }
-        cparams.n_rs_seq = 4;
+        cparams.n_rs_seq = params.speculative.ngram_simple.size_m;
     }
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
