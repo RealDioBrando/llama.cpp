@@ -3495,6 +3495,13 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
         parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
     bool use_cann_graph = !graph_is_prefill(cgraph) || prefill_use_graph_override;
 
+    if (!cann_ctx->piecewise_mode) {
+        use_cann_graph = cann_ctx->graph_decode_mode_ptr &&
+            (*cann_ctx->graph_decode_mode_ptr == GGML_GRAPH_PHASE_DECODE ||
+             *cann_ctx->graph_decode_mode_ptr == GGML_GRAPH_PHASE_DRAFT_GENERATE ||
+             *cann_ctx->graph_decode_mode_ptr == GGML_GRAPH_PHASE_DRAFT_KV_INJECT_DECODE);
+    }
+
     if (!cann_ctx->acl_graph_mode) {
         use_cann_graph = false;
     }
@@ -4408,10 +4415,21 @@ static ggml_backend_dev_t ggml_backend_cann_reg_get_device(ggml_backend_reg_t re
     return ctx->devices[index];
 }
 
+#ifdef USE_ACL_GRAPH
+static void ggml_backend_cann_bind_graph_decode_mode(ggml_backend_t backend, const int * mode) {
+    auto * ctx = (ggml_backend_cann_context *) backend->context;
+    ctx->graph_decode_mode_ptr = mode;
+}
+#endif
+
 static void * ggml_backend_cann_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     GGML_UNUSED(name);
-    // reserved for future use
+#ifdef USE_ACL_GRAPH
+    if (strcmp(name, "ggml_backend_bind_graph_decode_mode") == 0) {
+        return (void *) ggml_backend_cann_bind_graph_decode_mode;
+    }
+#endif
     return nullptr;
 }
 

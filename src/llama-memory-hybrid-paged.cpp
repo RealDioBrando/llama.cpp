@@ -86,10 +86,14 @@ llama_memory_context_ptr llama_memory_hybrid_paged::init_batch(
         if (embd_all) {
             ubatch = balloc.split_seq(n_ubatch);
         } else {
-            // Keep the trailing rollback snapshots of each sequence together.
+            // Paged KV uses write_slots/block_table and the recurrent cache is
+            // indexed by seq_id: no need for the non-unified-KV sequential
+            // constraint. A sequential split also reorders sequences out of the
+            // batch_info row order. Keep the trailing rollback snapshots of each
+            // sequence together.
             ubatch = balloc.split_equal(
                     n_ubatch,
-                    false,
+                    /*sequential=*/false,
                     mem_recr->n_rs_seq > 0 ? mem_recr->n_rs_seq + 1 : 0);
         }
 
