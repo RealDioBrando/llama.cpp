@@ -584,6 +584,14 @@ struct common_params {
     float cpu_to_gpu_blocks_ratio = 0.25;
     float kv_paged_watermark      = 0.05;  // percentage
 
+    float    kv_paged_vram_utilization = 0.80f;
+    float    kv_paged_linear_ratio     = 0.20f;
+    float    kv_paged_cpu_state_ratio  = 1.0f;
+    uint32_t n_gpu_state_blocks = 0;
+    uint32_t n_cpu_state_blocks = 0;
+    uint32_t kv_prefix_ckpt_interval = 4;
+    uint32_t kv_prefix_ckpt_base = 0;
+
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation

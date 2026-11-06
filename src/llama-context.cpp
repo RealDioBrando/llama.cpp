@@ -13,6 +13,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -306,7 +307,19 @@ llama_context::llama_context(
     cparams.block_size = params.block_size;
     cparams.n_gpu_blocks = params.n_gpu_blocks;
     cparams.n_cpu_blocks = params.n_cpu_blocks;
-    cparams.kv_paged_watermark = params.kv_paged_watermark;
+    cparams.kv_paged_watermark = std::clamp(params.kv_paged_watermark, 0.0f, 0.99f);
+    cparams.kv_paged_vram_utilization = params.kv_paged_vram_utilization <= 0.0f
+        ? 0.80f
+        : std::min(params.kv_paged_vram_utilization, 1.0f);
+    cparams.kv_paged_linear_ratio = std::clamp(params.kv_paged_linear_ratio, 0.0f, std::nextafter(1.0f, 0.0f));
+    cparams.kv_paged_cpu_state_ratio = std::max(params.kv_paged_cpu_state_ratio, 0.0f);
+    cparams.cpu_to_gpu_blocks_ratio  = std::max(params.cpu_to_gpu_blocks_ratio, 0.0f);
+    cparams.n_gpu_state_blocks       = params.n_gpu_state_blocks;
+    cparams.n_cpu_state_blocks       = params.n_cpu_state_blocks;
+    cparams.kv_prefix_ckpt_interval  = params.kv_prefix_ckpt_interval;
+    cparams.kv_prefix_ckpt_base      = params.kv_prefix_ckpt_interval > 0
+        ? params.kv_prefix_ckpt_base % params.kv_prefix_ckpt_interval
+        : 0;
     cparams.act_type           = params.type_act;
     cparams.paged_priority     = params.paged_priority;
 
@@ -3853,6 +3866,14 @@ llama_context_params llama_context_default_params() {
         /*.n_gpu_blocks                =*/ 0,
         /*.n_cpu_blocks                =*/ 0,
         /*.kv_paged_watermark          =*/ 0.05,
+        /*.kv_paged_vram_utilization   =*/ 0.80f,
+        /*.kv_paged_linear_ratio       =*/ 0.20f,
+        /*.kv_paged_cpu_state_ratio    =*/ 1.0f,
+        /*.cpu_to_gpu_blocks_ratio     =*/ 0.25f,
+        /*.n_gpu_state_blocks          =*/ 0,
+        /*.n_cpu_state_blocks          =*/ 0,
+        /*.kv_prefix_ckpt_interval     =*/ 4,
+        /*.kv_prefix_ckpt_base         =*/ 0,
         /*.paged_priority              =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,

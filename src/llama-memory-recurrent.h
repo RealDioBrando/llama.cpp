@@ -12,8 +12,34 @@
 // llama_memory_recurrent
 //
 
-// TODO: extract the cache state used for graph computation into llama_memory_recurrent_context_i
-//       see the implementation of llama_kv_cache_context_i for an example how to do it
+// Device pools for the paged linear-attention state storage. When a pool is
+// provided the recurrent memory switches to "paged" mode:
+//   - the state tensors are split into a GPU and a CPU pool of independent
+//     state blocks, each block holding (1 + n_rs_seq) rollback planes,
+//   - physical blocks are addressed by the owning llama_linear_state_cache,
+//     not by seq_id,
+//   - the batch context consumes an immutable per-ubatch row map instead of
+//     running find_slot().
+struct llama_recurrent_state_pool {
+    ggml_backend_t backend_gpu = nullptr;
+    ggml_backend_t backend_cpu = nullptr;
+    uint32_t       n_gpu_blocks = 0;
+    uint32_t       n_cpu_blocks = 0;
+};
+
+// Immutable state-row mapping for one ubatch. Rows are absolute row indices
+// in the per-layer GPU state tensors, laid out as plane-major:
+//
+//   row(block_local, plane) = plane * n_gpu_blocks + block_local
+struct llama_recurrent_batch_rows {
+    uint32_t n_seqs   = 0;
+    uint32_t n_planes = 1;
+    // row of the state to read for sequence i (already includes the rollback plane)
+    std::vector<int32_t> read_rows;   // [n_seqs]
+    // row to write plane p for sequence i: write_rows[i*n_planes + p]
+    std::vector<int32_t> write_rows;  // [n_seqs * n_planes]
+};
+
 class llama_memory_recurrent : public llama_memory_i {
 public:
     llama_memory_recurrent(
@@ -24,9 +50,27 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
-        const layer_filter_cb & filter);
+        const layer_filter_cb & filter,
+    const llama_recurrent_state_pool * state_pool = nullptr);
 
     ~llama_memory_recurrent() = default;
+
+    // Paged state pool API (valid only when is_paged() is true).
+    bool     is_paged() const { return paged; }
+    uint32_t n_state_planes() const { return 1 + n_rs_seq; }
+    uint32_t n_gpu_state_blocks() const { return n_gpu_state_blocks_; }
+    uint32_t n_cpu_state_blocks() const { return n_cpu_state_blocks_; }
+
+    ggml_tensor * get_state_r_tensor(int32_t il, bool gpu) const;
+    ggml_tensor * get_state_s_tensor(int32_t il, bool gpu) const;
+    ggml_tensor * get_state_p_tensor(int32_t il, bool gpu) const;
+
+    // Copy every plane of state block src_id to dst_id. Blocks may live in
+    // either pool; the copy is a synchronous host-staged transfer.
+    void copy_state_block(uint32_t src_id, bool src_gpu, uint32_t dst_id, bool dst_gpu);
+    void zero_state_block(uint32_t id, bool gpu);
+
+    uint32_t n_seq_max_hint() const { return n_seq_max; }
 
     //
     // llama_memory_i
@@ -116,6 +160,17 @@ public:
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
 
+    // paged mode: separate GPU and CPU block pools
+    bool paged = false;
+    uint32_t n_gpu_state_blocks_ = 0;
+    uint32_t n_cpu_state_blocks_ = 0;
+    std::vector<ggml_tensor *> r_l_gpu;
+    std::vector<ggml_tensor *> s_l_gpu;
+    std::vector<ggml_tensor *> p_l_gpu;
+    std::vector<ggml_tensor *> r_l_cpu;
+    std::vector<ggml_tensor *> s_l_cpu;
+    std::vector<ggml_tensor *> p_l_cpu;
+
 private:
     //const llama_model & model;
     const llama_hparams & hparams;
@@ -152,6 +207,12 @@ public:
             llama_memory_recurrent * mem,
             std::vector<llama_ubatch> ubatches);
 
+    // paged mode: batch context driven by an immutable per-ubatch row map
+    llama_memory_recurrent_context(
+            llama_memory_recurrent * mem,
+            std::vector<llama_ubatch> ubatches,
+            std::vector<llama_recurrent_batch_rows> batch_rows);
+
     virtual ~llama_memory_recurrent_context();
 
     //
@@ -173,11 +234,17 @@ public:
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
 
+    bool     is_paged() const { return mem->is_paged(); }
+    uint32_t get_n_planes() const { return mem->n_state_planes(); }
+
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // paged mode: write row for plane `plane` of batch sequence `i`
+    int32_t s_write(int i, uint32_t plane) const;
 
 private:
     const llama_memory_status status;
@@ -187,6 +254,9 @@ private:
     size_t i_next = 0;
 
     std::vector<llama_ubatch> ubatches;
+
+    // paged mode row maps, one per ubatch
+    std::vector<llama_recurrent_batch_rows> batch_rows;
 
     //
     // data needed for building the compute graph for the current ubatch:
