@@ -2413,10 +2413,7 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
     // Only check env once.
     static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
     bool used_tied_copy = false;
-    bool weight_is_nz = false;
 #ifdef ASCEND_310P
-    const bool f16_prefill = input->type == GGML_TYPE_F16 && input->ne[1] > 1;
-
     // The tied lm head (token_embd.weight) keeps its ND data for GET_ROWS;
     // mul_mat reads a separate FRACTAL_NZ copy prepared once at weight-load
     // time. Lookup only, so graph capture never sees a first-use prepare.
@@ -2428,19 +2425,13 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
                                                         transpose_ne, transpose_nb, n_dims,
                                                         ACL_FORMAT_FRACTAL_NZ);
             used_tied_copy = true;
-            weight_is_nz = true;
         }
     }
-#endif
-
-#ifndef ASCEND_310P
-    constexpr bool f16_prefill = false;
 #endif
 
     if (!used_tied_copy && weight_to_nz && weight->type != GGML_TYPE_BF16 &&
         ggml_cann_is_weight_layout_candidate(weight)) {
         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_FRACTAL_NZ);
-        weight_is_nz = true;
     } else if (!used_tied_copy) {
         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_ND);
     }
@@ -2448,11 +2439,6 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
 
     switch (n_dims) {
         case 2:
-            if (f16_prefill && weight_is_nz) {
-                // aclnnMm cannot consume FRACTAL_NZ weights; aclnnMatmul can.
-                GGML_CANN_CALL_ACLNN_OP(ctx, Matmul, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(), 2);
-                break;
-            }
             GGML_CANN_CALL_ACLNN_OP(ctx, Mm, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(), 2);
             break;
         case 3:
