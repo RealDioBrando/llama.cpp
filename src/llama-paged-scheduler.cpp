@@ -11,8 +11,6 @@ struct llama_paged_scheduler {
 
     llama_paged_scheduler(uint32_t n_ctx, uint32_t block_sz, uint32_t n_batch, int32_t n_pos_per_embd,
                           llama_kv_cache_paged * kv_manager,
-                          llama_memory_hybrid_paged * hybrid_memory) :
-        impl(n_ctx, block_sz, n_batch, n_pos_per_embd, kv_manager, hybrid_memory) {}
                           llama_memory_hybrid_paged * hybrid_memory,
                           bool priority_enabled) :
         impl(n_ctx, block_sz, n_batch, n_pos_per_embd, kv_manager, hybrid_memory, priority_enabled) {}
@@ -48,7 +46,6 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
     const int32_t n_pos_per_embd = llama_model_n_pos_per_embd(llama_get_model(ctx));
 
     try {
-        return new llama_paged_scheduler(n_ctx, block_sz, n_batch, n_pos_per_embd, paged_kv, hybrid_memory);
         return new llama_paged_scheduler(n_ctx, block_sz, n_batch, n_pos_per_embd, paged_kv, hybrid_memory,
                                          ctx->paged_priority());
     } catch (const std::exception & e) {

@@ -58,10 +58,6 @@ class llama_paged_scheduler_impl {
 
     int32_t get_curr_decode_tokens() const;
 
-    void evict();
-    void process_running_list(llama_sequence_group_raw_list & candidates, int32_t & row_budget);
-    void process_swapped_list(llama_sequence_group_raw_list & candidates, int32_t & row_budget);
-    void process_waiting_list(llama_sequence_group_raw_list & candidates, int32_t & row_budget);
     // Evict one group from `running` and return it (may be nullptr if every
     // group is FINISHED). Priority mode picks the lowest priority, FCFS the
     // most recent arrival. Groups already added to this step's candidates are

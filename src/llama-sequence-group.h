@@ -13,13 +13,11 @@ enum class llama_sequence_group_status {
     RUNNING,
     SWAPPED,
     FINISHED,
-    PAUSED_EXTERNAL  // 12.4: waiting for the server to append a media segment's embeddings
     PAUSED_EXTERNAL  // 9.4: waiting for the server to append a media segment's embeddings
 };
 
 using llama_block_ids = std::vector<uint32_t>;
 
-// multimodal (12.4): one ordered piece of a request's prompt. text rows carry
 // multimodal (9.4): one ordered piece of a request's prompt. text rows carry
 // token ids in logical_seq; media rows occupy one KV position each but their
 // input embeddings come from the vision encoder (server-owned buffer), and
@@ -60,7 +58,6 @@ struct llama_sequence_group {
     // consumed (cleared) by populate_batch_from
     std::vector<llama_token> pending_draft;
 
-    // multimodal (12.4): ordered segmentation covering all rows; empty for
     // multimodal (9.4): ordered segmentation covering all rows; empty for
     // legacy text-only requests. media segments are appended with their
     // encoder output by the server when the scheduler pauses on them.

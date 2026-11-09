@@ -59,6 +59,7 @@ class llama_paged_queue {
     virtual llama_sequence_group_ptr pop()                          = 0;
     virtual bool                  empty() const                     = 0;
     virtual size_t                size() const                      = 0;
+
     // remove the group with this request_id from the queue, preserving the
     // order of the remaining groups; nullptr when not present
     virtual llama_sequence_group_ptr take(int32_t request_id) { return nullptr; }
@@ -104,6 +105,7 @@ class llama_paged_fcfs_queue : public llama_paged_queue {
         }
         return nullptr;
     }
+
   private:
     std::deque<llama_sequence_group_ptr> queue_;
 };
@@ -164,6 +166,7 @@ class llama_paged_priority_queue : public llama_paged_queue {
         }
         return found;
     }
+
   private:
     std::priority_queue<llama_sequence_group_ptr, std::vector<llama_sequence_group_ptr>, group_follows> queue_;
 };

@@ -100,7 +100,7 @@ llama_scheduler_status llama_paged_scheduler_impl::step(llama_batch & batch) {
     // sequence starts decoding while later sequences wait and a queued batch
     // runs with a tiny active batch.
     if (!waiting->empty()) {
-    process_waiting_list(candidates, row_budget);
+        process_waiting_list(candidates, row_budget);
     }
 
     // Keep exactly one prefill candidate. FCFS keeps the first one in
@@ -121,21 +121,6 @@ llama_scheduler_status llama_paged_scheduler_impl::step(llama_batch & batch) {
     }
 
     // multimodal (9.4): an embd step (a media segment's rows fed as
-    // batch.embd) runs exclusively - text and embd rows cannot share a batch
-    auto media_it = std::find_if(candidates.begin(), candidates.end(), [](const llama_sequence_group * group) {
-        if (!group) {
-            return false;
-        }
-        const llama_seq_segment * seg = group->segment_at(group->n_past);
-        return seg && seg->is_media;
-    });
-    if (media_it != candidates.end()) {
-        llama_sequence_group * media = *media_it;
-        candidates.clear();
-        candidates.push_back(media);
-    }
-
-    // multimodal (12.4): an embd step (a media segment's rows fed as
     // batch.embd) runs exclusively - text and embd rows cannot share a batch
     auto media_it = std::find_if(candidates.begin(), candidates.end(), [](const llama_sequence_group * group) {
         if (!group) {
@@ -600,7 +585,8 @@ void llama_paged_scheduler_impl::process_running_list(llama_sequence_group_raw_l
             continue;
         }
 
-        // multimodal (9.4): a group waiting for the server to append a media        // segment's encoder output pauses here; excluded from candidates and
+        // multimodal (9.4): a group waiting for the server to append a media
+        // segment's encoder output pauses here; excluded from candidates and
         // from the capacity accounting until append_segment resumes it
         if (group->paused_external || group->pending_media_at(group->n_past)) {
             group->paused_external  = true;
@@ -837,7 +823,8 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
             rows = std::min<int32_t>((int32_t)(seg->start_row + seg->n_tokens - group->n_past), n_batch);
         } else if (is_prefill) {
             rows = std::min<int32_t>((int32_t)(group->n_prompt_total - group->n_past), n_batch);
-            // text rows stop at the next media segment boundary (9.4)            if (seg && !seg->is_media) {
+            // text rows stop at the next media segment boundary (9.4)
+            if (seg && !seg->is_media) {
                 rows = std::min<int32_t>(rows, (int32_t)(seg->start_row + seg->n_tokens - group->n_past));
             }
         } else {
@@ -896,7 +883,8 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
             new_tokens = std::min<int32_t>((int32_t)(seg->start_row + seg->n_tokens - group->n_past), n_batch);
         } else if (is_prefill) {
             new_tokens = std::min<int32_t>((int32_t)(group->n_prompt_total - group->n_past), n_batch);
-            // text rows stop at the next media segment boundary (9.4)            if (seg && !seg->is_media) {
+            // text rows stop at the next media segment boundary (9.4)
+            if (seg && !seg->is_media) {
                 new_tokens = std::min<int32_t>(new_tokens,
                         (int32_t)(seg->start_row + seg->n_tokens - group->n_past));
             }
@@ -906,7 +894,8 @@ void llama_paged_scheduler_impl::populate_batch_from(const llama_sequence_group_
 
         if (media_step) {
             // pure-embd slice: rows come from the server-owned encoder
-            // output; no token ids (9.4). null out the token array so the            // batch allocr validation skips the placeholder ids (-1); the
+            // output; no token ids (9.4). null out the token array so the
+            // batch allocr validation skips the placeholder ids (-1); the
             // init-allocated buffer is freed in clear_batch
             GGML_ASSERT(seg->embd != nullptr && "media step without encoder output");
             batch.embd           = const_cast<float *>(seg->embd) +

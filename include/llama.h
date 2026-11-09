@@ -1755,32 +1755,6 @@ extern "C" {
                                                         int32_t                             request_id,
                                                         const struct llama_paged_segment * seg);
 
-    // multimodal (12.4): queue a request described as ordered text/media
-    // segments. text rows carry token ids; media rows occupy one KV position
-    // each but are fed as encoder embeddings. media segments may be declared
-    // with embd == NULL when the size is known and the encoder output is not
-    // available yet; the scheduler pauses on them (see seq_state.paused) and
-    // the server appends the embeddings via append_segment.
-    struct llama_paged_segment {
-        const llama_token * tokens;      // text segment rows; NULL for media
-        const float *       embd;        // media segment rows [n_tokens x embd_stride]; NULL = pending encode
-        int32_t             n_tokens;    // rows in this segment
-        int32_t             embd_stride; // media: floats per embd row (n_embd_inp); 0 for text
-        const llama_pos *   pos;         // media mrope positions [n_tokens x 4] row-major; NULL for text
-    };
-
-    LLAMA_API bool llama_paged_scheduler_add_request_segs(struct llama_paged_scheduler *      sched,
-                                                           const struct llama_paged_segment * segs,
-                                                           int32_t                             n_segs,
-                                                           int32_t                             request_id);
-
-    // append the encoder output for a media segment the scheduler paused on.
-    // pos carries n_tokens x 4 mrope positions starting at the paused
-    // boundary. the request resumes on the next step.
-    LLAMA_API bool llama_paged_scheduler_append_segment(struct llama_paged_scheduler *      sched,
-                                                        int32_t                             request_id,
-                                                        const struct llama_paged_segment * seg);
-
     LLAMA_API bool llama_paged_scheduler_prepare_batch(struct llama_paged_scheduler * sched,
                                                        struct llama_batch *           batch);
 
