@@ -2413,7 +2413,10 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
     // Only check env once.
     static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
     bool used_tied_copy = false;
+    bool weight_is_nz = false;
 #ifdef ASCEND_310P
+    const bool f16_prefill = input->type == GGML_TYPE_F16 && input->ne[1] > 1;
+
     // The tied lm head (token_embd.weight) keeps its ND data for GET_ROWS;
     // mul_mat reads a separate FRACTAL_NZ copy prepared once at weight-load
     // time. Lookup only, so graph capture never sees a first-use prepare.
@@ -2425,13 +2428,19 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
                                                         transpose_ne, transpose_nb, n_dims,
                                                         ACL_FORMAT_FRACTAL_NZ);
             used_tied_copy = true;
+            weight_is_nz = true;
         }
     }
+#endif
+
+#ifndef ASCEND_310P
+    constexpr bool f16_prefill = false;
 #endif
 
     if (!used_tied_copy && weight_to_nz && weight->type != GGML_TYPE_BF16 &&
         ggml_cann_is_weight_layout_candidate(weight)) {
         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_FRACTAL_NZ);
+        weight_is_nz = true;
     } else if (!used_tied_copy) {
         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_ND);
     }
@@ -2439,6 +2448,47 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
 
     switch (n_dims) {
         case 2:
+            if (f16_prefill && weight_is_nz) {
+                // aclnnMm rejects FRACTAL_NZ weights, so aclnnMatmul is the
+                // fast path. Its tiling fails on some M boundaries (a
+                // -ub 2048 warmup builds M=2048, one of them), so probe
+                // first and fall back to the stable F32-activation Mm path
+                // when the probe rejects the shape.
+                uint64_t       probe_ws   = 0;
+                aclOpExecutor * probe_exec = nullptr;
+                if (aclnnMatmulGetWorkspaceSize(acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(),
+                                                2, &probe_ws, &probe_exec) == ACL_SUCCESS) {
+                    GGML_CANN_CALL_ACLNN_OP(ctx, Matmul, acl_input_tensor.get(), acl_weight_tensor.get(),
+                                            acl_dst.get(), 2);
+                    break;
+                }
+
+                // Fallback: cast the F16 activation to F32, run the stable
+                // aclnnMm over the NZ weight, then cast the F32 result back.
+                ggml_cann_pool_alloc f32_input_allocator(ctx.pool());
+                ggml_cann_pool_alloc f32_dst_allocator(ctx.pool());
+                const size_t input_elems = (size_t) bcast_input_ne[0] * bcast_input_ne[1];
+                const size_t dst_elems   = (size_t) bcast_dst_ne[0] * bcast_dst_ne[1];
+                void * f32_input = f32_input_allocator.alloc(input_elems * sizeof(float));
+                void * f32_dst   = f32_dst_allocator.alloc(dst_elems * sizeof(float));
+
+                size_t f32_input_nb[GGML_MAX_DIMS * 2];
+                size_t f32_dst_nb[GGML_MAX_DIMS * 2];
+                for (int64_t i = 0; i < n_dims; ++i) {
+                    f32_input_nb[i] = bcast_input_nb[i] * 2;
+                    f32_dst_nb[i]   = bcast_dst_nb[i] * 2;
+                }
+
+                acl_tensor_ptr f32_input_tensor = ggml_cann_create_tensor(f32_input, ACL_FLOAT, sizeof(float),
+                                                                          bcast_input_ne, f32_input_nb, n_dims);
+                acl_tensor_ptr f32_dst_tensor   = ggml_cann_create_tensor(f32_dst, ACL_FLOAT, sizeof(float),
+                                                                          bcast_dst_ne, f32_dst_nb, n_dims);
+                aclnn_cast(ctx, acl_input_tensor.get(), f32_input_tensor.get(), ACL_FLOAT);
+                GGML_CANN_CALL_ACLNN_OP(ctx, Mm, f32_input_tensor.get(), acl_weight_tensor.get(),
+                                        f32_dst_tensor.get(), 2);
+                aclnn_cast(ctx, f32_dst_tensor.get(), acl_dst.get(), ACL_FLOAT16);
+                break;
+            }
             GGML_CANN_CALL_ACLNN_OP(ctx, Mm, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(), 2);
             break;
         case 3:
