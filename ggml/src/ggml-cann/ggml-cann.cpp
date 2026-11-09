@@ -3316,6 +3316,8 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 
 #ifdef USE_ACL_GRAPH
     if (use_cann_graph && cann_graph_capture_required) {  // Begin CANN graph capture
+        auto * capture_graph = cann_ctx->graph_lru_cache.cache_list.front();
+        capture_graph->rope_refs.clear();
         ACL_CHECK(aclmdlRICaptureBegin(cann_ctx->stream(), ACL_MODEL_RI_CAPTURE_MODE_GLOBAL));
         cann_ctx->capturing = true;
         // Register the OOM relief hook: evicts every cached graph except
@@ -3342,6 +3344,16 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
     static bool opt_fusion = parse_bool(get_env_as_lowercase("GGML_CANN_OPERATOR_FUSION").value_or(""));
 
     if (!use_cann_graph || cann_graph_capture_required) {
+        bool graph_has_w8a8_expert = false;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * candidate = cgraph->nodes[i];
+            if (candidate->op == GGML_OP_MUL_MAT_ID && candidate->src[0] != nullptr &&
+                candidate->src[0]->type == GGML_TYPE_W8A8) {
+                graph_has_w8a8_expert = true;
+                break;
+            }
+        }
+
         int fused_until = -1;
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
@@ -3360,10 +3372,10 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                 }
             }
 
-            if (ggml_cann_moe_router_fused(*cann_ctx, cgraph, i, &fused_until)) {
+            if (ggml_cann_moe_router_fused(*cann_ctx, cgraph, i, graph_has_w8a8_expert, &fused_until)) {
                 continue;
             }
-            if (ggml_cann_moe_gate_up_fused(*cann_ctx, cgraph, i, &fused_until)) {
+            if (ggml_cann_moe_gate_up_fused(*cann_ctx, cgraph, i, graph_has_w8a8_expert, &fused_until)) {
                 continue;
             }
             if (ggml_cann_moe_down_unpermute_fused(*cann_ctx, cgraph, i, &fused_until)) {
@@ -3401,6 +3413,14 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
         }
 
         // Execute CANN graph
+        for (const auto & ref : matched_graph->rope_refs) {
+            const auto & cache = cann_ctx->rope_cache;
+            const bool live = cache.generation_live(ref[0]);
+            const bool params = ref[1] == cache.param_epoch;
+            if (cache.lifetime_fix()) {
+                GGML_ASSERT(live && params && ref[2]);
+            }
+        }
         ACL_CHECK(aclmdlRIExecuteAsync(matched_graph->graph, cann_ctx->stream()));
 
     }
@@ -3422,6 +3442,9 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
     ggml_cann_set_device(cann_ctx->device);
+#ifdef USE_ACL_GRAPH
+    GGML_ASSERT(!(cann_ctx->rope_cache.lifetime_fix() && cann_ctx->piecewise_mode));
+#endif
     // One-time summary of the switch state for this run.
     {
         static bool config_printed = false;
@@ -3871,11 +3894,18 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     return false;
                 }
 #ifdef ASCEND_310P
-                // CANN 310P IMROPE Q is unstable for one-token decode.
+                // Atlas inference products impose this documented constraint
+                // on aclnnRotaryPositionEmbedding for BNSD partial rotation:
+                // D <= 128, D % 32 == 0, and B * N <= S * 8. Do not send an
+                // out-of-contract shape to the vendor operator; its output is
+                // undefined. Full-width rotation uses the 310P composite path.
                 const int32_t * rope_params = (const int32_t *) op->op_params;
                 const int * sections = rope_params + 11;
+                const int64_t rope_dims = rope_params[1];
                 if (rope_params[2] == GGML_ROPE_TYPE_IMROPE && sections[3] == 0 &&
-                    op->ne[1] > 4 && op->ne[2] == 1) {
+                    rope_dims < op->ne[0] &&
+                    (rope_dims > 128 || rope_dims % 32 != 0 ||
+                     op->ne[1] * op->ne[3] > op->ne[2] * 8)) {
                     return false;
                 }
                 // Partial rope (n_dims < ne[0]) takes the
@@ -3966,9 +3996,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             return true;
         case GGML_OP_GATED_DELTA_NET:
             {
-                // fused path via the standard 310P APIs: decode is a single
-                // recurrent call, prefill is a single chunk call (8-token block
-                // loop as fallback)
+                // Select chunk or recurrent from shape and snapshot requirements.
                 if (!ggml_cann_gdn_available()) {
                     return false;
                 }
@@ -3979,8 +4007,8 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 if (g->ne[0] != 1) {
                     return false;
                 }
-                // single state snapshot
-                if (ggml_get_op_params_i32(op, 0) != 1) {
+                // Snapshot support is checked before submitting to ACLNN.
+                if (ggml_get_op_params_i32(op, 0) != 1 && !ggml_cann_gdn_snapshots_supported(op)) {
                     return false;
                 }
                 // kernel fold reduction is only correct for head dim 64 and 128, other sizes run on CPU
@@ -4064,11 +4092,13 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 if (op->src[1]->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_F16) {
                     return false;
                 }
-                // The prefill path (q_len > 1) assumes a single sequence;
-                // route multi-sequence prefill to the CPU. Decode handles any B.
-                if (op->src[0]->ne[3] > 1 && op->src[0]->ne[1] > 1) {
-                    return false;
-                }
+                // Multi-sequence prefill (B > 1, q_len > 1) is handled by the
+                // per-batch-element PFA loop in ggml_cann_flash_attn_ext_310p.
+                // It must NOT be routed to the CPU backend: the scheduler's
+                // input materialization for these strided views is broken on
+                // the host side (v/mask arrive zeroed), which corrupted
+                // multi-sequence prefill and poisoned all downstream state
+                // (llama-server multi-slot GSM8K collapse).
                 return true;
 #endif
                 // derived from [ggml-cuda.cu]
