@@ -402,6 +402,7 @@ void ggml_cann_fill(ggml_backend_cann_context & ctx, ggml_tensor * dst);
  *            dst->op is `GGML_OP_UPSCALE`.
  */
 void ggml_cann_upsample_nearest2d(ggml_backend_cann_context & ctx, ggml_tensor * dst);
+void ggml_cann_upsample_bilinear2d(ggml_backend_cann_context & ctx, ggml_tensor * dst);
 
 /**
  * @brief   Pads a ggml tensor to match the dimensions of the destination tensor

@@ -100,7 +100,7 @@ llama_scheduler_status llama_paged_scheduler_impl::step(llama_batch & batch) {
     // sequence starts decoding while later sequences wait and a queued batch
     // runs with a tiny active batch.
     if (!waiting->empty()) {
-        process_waiting_list(candidates, n_batch);
+        process_waiting_list(candidates, row_budget);
     }
 
     // Keep exactly one prefill candidate. FCFS keeps the first one in
@@ -732,6 +732,7 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
     }
 
     candidates.push_back(group);
+    row_budget -= chunk_tokens;
     llama_sequence_group_ptr group_ptr = waiting->pop();
     LLAMA_LOG_DEBUG("%s: (start) request_id=%d sent for processing.\n", __func__, group_ptr->request_id);
     set_running(std::move(group_ptr));
@@ -1023,6 +1024,7 @@ void llama_paged_scheduler_impl::update(const llama_batch *                 batc
             kv_cache_manager->set_seq_max_pos(group->request_id, batch->pos[last_token_in_batch_idx]);
 
             group->n_past += batch_len;
+            group->n_prompt = std::max<uint32_t>(0, group->n_prompt - batch_len);
 
             const llama_paged_feedback * fb = nullptr;
             for (int32_t f = 0; f < n_feedback; ++f) {
