@@ -194,7 +194,6 @@ def test_dflash_metadata_round_trip(dflash2_config, tmp_path):
         assert reader.fields[key].contents() == value
     assert "dflash.sample_from_anchor" not in reader.fields
 
-
 @pytest.mark.parametrize("model_class", [DFlashModel, DSparkModel])
 @pytest.mark.parametrize("layout", ["interleaved", "contiguous", "legacy", "text"])
 def test_vl_draft_vocab_and_rope_metadata(model_class, layout, monkeypatch, tmp_path):

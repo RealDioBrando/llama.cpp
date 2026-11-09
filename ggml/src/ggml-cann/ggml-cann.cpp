@@ -2772,7 +2772,11 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
             ggml_cann_concat(ctx, dst);
             break;
         case GGML_OP_UPSCALE:
-            ggml_cann_upsample_nearest2d(ctx, dst);
+            if ((ggml_get_op_params_i32(dst, 0) & 0xff) == GGML_SCALE_MODE_BILINEAR) {
+                ggml_cann_upsample_bilinear2d(ctx, dst);
+            } else {
+                ggml_cann_upsample_nearest2d(ctx, dst);
+            }
             break;
         case GGML_OP_PAD:
             ggml_cann_pad(ctx, dst);
@@ -3146,8 +3150,7 @@ static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
         return true;
     }
 
-    // 其他融合模式走 ggml 原生通用判断
-    return ggml_can_fuse(cgraph, node_idx, ops);
+    return false;
 }
 
 #ifdef USE_ACL_GRAPH
@@ -3924,7 +3927,8 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 if (op->src[0]->ne[2] * op->ne[3] != op->src[0]->ne[3] * op->ne[2]) {
                     return false;
                 }
-                if (op->op_params[0] != GGML_SCALE_MODE_NEAREST) {
+                const int mode = op->op_params[0] & 0xff;
+                if (mode != GGML_SCALE_MODE_NEAREST && mode != GGML_SCALE_MODE_BILINEAR) {
                     return false;
                 }
                 if (op->op_params[0] & GGML_SCALE_FLAG_ANTIALIAS) {
@@ -4083,12 +4087,8 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 if (maxBias != 0.0f) {
                     return false;
                 }
-                // Mask flows through device memory (pseShift for decode,
-                // attenMask for prefill), so the captured graph is
-                // replay-safe: no host-side KV length channel.
-                if (op->src[3] == nullptr) {
-                    return false;
-                }
+                // A null mask means full attention; the 310P path fills an
+                // all-keep attenMask for prefill and passes no pseShift for decode.
                 if (op->src[1]->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_F16) {
                     return false;
                 }

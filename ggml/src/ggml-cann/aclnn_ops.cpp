@@ -90,6 +90,7 @@
 #include <aclnnop/aclnn_logical_not.h>
 #include <aclnnop/aclnn_masked_fill_scalar.h>
 #include <aclnnop/aclnn_upsample_nearest_2d.h>
+#include <aclnnop/aclnn_upsample_bilinear_2d.h>
 #include <aclnnop/aclnn_weight_quant_batch_matmul_v2.h>
 #include <aclnnop/level2/aclnn_dynamic_quant.h>
 #include <aclnnop/level2/aclnn_quant_matmul_v5.h>
@@ -944,6 +945,22 @@ void ggml_cann_upsample_nearest2d(ggml_backend_cann_context & ctx, ggml_tensor *
     acl_int_array_ptr    output_size_array = ggml_cann_create_int_array(output_size.data(), 2);
 
     GGML_CANN_CALL_ACLNN_OP(ctx, UpsampleNearest2d, acl_src.get(), output_size_array.get(), acl_dst.get());
+}
+
+void ggml_cann_upsample_bilinear2d(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+    ggml_tensor *  src     = dst->src[0];
+    acl_tensor_ptr acl_src = ggml_cann_create_tensor(src, nullptr, nullptr, 0, ACL_FORMAT_NCHW);
+    acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst, nullptr, nullptr, 0, ACL_FORMAT_NCHW);
+
+    const bool align_corners = (ggml_get_op_params_i32(dst, 0) & GGML_SCALE_FLAG_ALIGN_CORNERS) != 0;
+    const double scales_h   = (double) dst->ne[1] / (double) src->ne[1];
+    const double scales_w   = (double) dst->ne[0] / (double) src->ne[0];
+
+    std::vector<int64_t> output_size{ dst->ne[1], dst->ne[0] };
+    acl_int_array_ptr    output_size_array = ggml_cann_create_int_array(output_size.data(), 2);
+
+    GGML_CANN_CALL_ACLNN_OP(ctx, UpsampleBilinear2d, acl_src.get(), output_size_array.get(), align_corners,
+                            scales_h, scales_w, acl_dst.get());
 }
 
 /**
@@ -2396,7 +2413,10 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
     // Only check env once.
     static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
     bool used_tied_copy = false;
+    bool weight_is_nz = false;
 #ifdef ASCEND_310P
+    const bool f16_prefill = input->type == GGML_TYPE_F16 && input->ne[1] > 1;
+
     // The tied lm head (token_embd.weight) keeps its ND data for GET_ROWS;
     // mul_mat reads a separate FRACTAL_NZ copy prepared once at weight-load
     // time. Lookup only, so graph capture never sees a first-use prepare.
@@ -2408,13 +2428,19 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
                                                         transpose_ne, transpose_nb, n_dims,
                                                         ACL_FORMAT_FRACTAL_NZ);
             used_tied_copy = true;
+            weight_is_nz = true;
         }
     }
+#endif
+
+#ifndef ASCEND_310P
+    constexpr bool f16_prefill = false;
 #endif
 
     if (!used_tied_copy && weight_to_nz && weight->type != GGML_TYPE_BF16 &&
         ggml_cann_is_weight_layout_candidate(weight)) {
         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_FRACTAL_NZ);
+        weight_is_nz = true;
     } else if (!used_tied_copy) {
         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_ND);
     }
@@ -2422,6 +2448,11 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
 
     switch (n_dims) {
         case 2:
+            if (f16_prefill && weight_is_nz) {
+                // aclnnMm cannot consume FRACTAL_NZ weights; aclnnMatmul can.
+                GGML_CANN_CALL_ACLNN_OP(ctx, Matmul, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(), 2);
+                break;
+            }
             GGML_CANN_CALL_ACLNN_OP(ctx, Mm, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(), 2);
             break;
         case 3:
@@ -4554,7 +4585,7 @@ static void ggml_cann_flash_attn_ext_310p(ggml_backend_cann_context & ctx, ggml_
     memcpy(&scaleValue, (float *) dst->op_params + 0, sizeof(float));
 
     GGML_ASSERT(ggml_cann_type_mapping(src1->type) == ACL_FLOAT16);
-    GGML_ASSERT(src3 != nullptr && src3->type == GGML_TYPE_F16);
+    GGML_ASSERT(src3 == nullptr || src3->type == GGML_TYPE_F16);
 
     // helper: ggml-order ne [D, heads, seq, B] -> ACL (B, seq, heads, D) contiguous BSND
     auto bsnd = [](int64_t * ne, size_t * nb, int64_t d, int64_t h, int64_t s, int64_t b, size_t es) {
@@ -4672,9 +4703,10 @@ static void ggml_cann_flash_attn_ext_310p(ggml_backend_cann_context & ctx, ggml_
 
             // whole-batch pseShift: (B,1,1,K) -> repeat across heads -> (B,N,1,K)
             ggml_cann_pool_alloc pse_allocator(ctx.pool());
-            void *               pse_buf = pse_allocator.alloc((size_t) B * N * K * sizeof(uint16_t));
+            void *               pse_buf = nullptr;
             acl_tensor_ptr       acl_pse;
-            {
+            if (src3 != nullptr) {
+                pse_buf = pse_allocator.alloc((size_t) B * N * K * sizeof(uint16_t));
                 int64_t mask_ne[GGML_MAX_DIMS];
                 size_t  mask_nb[GGML_MAX_DIMS];
                 int64_t pse_ne[GGML_MAX_DIMS];
@@ -4712,7 +4744,7 @@ static void ggml_cann_flash_attn_ext_310p(ggml_backend_cann_context & ctx, ggml_
             acl_int_array_ptr    act_seq_lens = ggml_cann_create_int_array(act_seq_lens_buf.data(), B);
             char                 layout[]     = "BSND";
             GGML_CANN_CALL_ACLNN_OP(ctx, IncreFlashAttentionV4, acl_q.get(), acl_k_list.get(), acl_v_list.get(),
-                                    acl_pse.get(),                        // pseShift (additive mask)
+                                    src3 ? acl_pse.get() : nullptr,       // pseShift (additive mask)
                                     nullptr,                              // attenMask
                                     act_seq_lens.get(),                   // actualSeqLengths
                                     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
@@ -4724,7 +4756,7 @@ static void ggml_cann_flash_attn_ext_310p(ggml_backend_cann_context & ctx, ggml_
             char * q_b    = (char *) q_f16      + b * q_b_stride;
             char * k_b    = (char *) src1->data + b * src1->nb[3];
             char * v_b    = (char *) src2->data + b * src2->nb[3];
-            char * mask_b = (char *) src3->data + b * src3->nb[3];
+            char * mask_b = src3 ? (char *) src3->data + b * src3->nb[3] : nullptr;
             char * out_b  = (char *) out_f16    + b * (size_t) N * D * sizeof(uint16_t);
 
             int64_t            kv_ne[GGML_MAX_DIMS];
@@ -4755,9 +4787,10 @@ static void ggml_cann_flash_attn_ext_310p(ggml_backend_cann_context & ctx, ggml_
 
             // per-b mask (1,1,1,K) f16 -> repeat across heads -> (1,N,1,K) pseShift
             ggml_cann_pool_alloc pse_allocator(ctx.pool());
-            void *               pse_buf = pse_allocator.alloc((size_t) N * K * sizeof(uint16_t));
+            void *               pse_buf = nullptr;
             acl_tensor_ptr       acl_pse;
-            {
+            if (src3 != nullptr) {
+                pse_buf = pse_allocator.alloc((size_t) N * K * sizeof(uint16_t));
                 int64_t mask_ne[GGML_MAX_DIMS];
                 size_t  mask_nb[GGML_MAX_DIMS];
                 int64_t pse_ne[GGML_MAX_DIMS];
@@ -4787,7 +4820,7 @@ static void ggml_cann_flash_attn_ext_310p(ggml_backend_cann_context & ctx, ggml_
             acl_int_array_ptr  act_seq_lens = ggml_cann_create_int_array(act_seq_lens_buf, 1);
             char               layout[]     = "BSND";
             GGML_CANN_CALL_ACLNN_OP(ctx, IncreFlashAttentionV4, acl_q.get(), acl_k_list.get(), acl_v_list.get(),
-                                    acl_pse.get(),                        // pseShift (additive mask)
+                                    src3 ? acl_pse.get() : nullptr,       // pseShift (additive mask)
                                     nullptr,                              // attenMask
                                     act_seq_lens.get(),                   // actualSeqLengths
                                     nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
