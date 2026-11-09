@@ -3344,6 +3344,16 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
     static bool opt_fusion = parse_bool(get_env_as_lowercase("GGML_CANN_OPERATOR_FUSION").value_or(""));
 
     if (!use_cann_graph || cann_graph_capture_required) {
+        bool graph_has_w8a8_expert = false;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * candidate = cgraph->nodes[i];
+            if (candidate->op == GGML_OP_MUL_MAT_ID && candidate->src[0] != nullptr &&
+                candidate->src[0]->type == GGML_TYPE_W8A8) {
+                graph_has_w8a8_expert = true;
+                break;
+            }
+        }
+
         int fused_until = -1;
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
@@ -3362,10 +3372,10 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                 }
             }
 
-            if (ggml_cann_moe_router_fused(*cann_ctx, cgraph, i, &fused_until)) {
+            if (ggml_cann_moe_router_fused(*cann_ctx, cgraph, i, graph_has_w8a8_expert, &fused_until)) {
                 continue;
             }
-            if (ggml_cann_moe_gate_up_fused(*cann_ctx, cgraph, i, &fused_until)) {
+            if (ggml_cann_moe_gate_up_fused(*cann_ctx, cgraph, i, graph_has_w8a8_expert, &fused_until)) {
                 continue;
             }
             if (ggml_cann_moe_down_unpermute_fused(*cann_ctx, cgraph, i, &fused_until)) {
@@ -3884,11 +3894,18 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     return false;
                 }
 #ifdef ASCEND_310P
-                // CANN 310P IMROPE Q is unstable for one-token decode.
+                // Atlas inference products impose this documented constraint
+                // on aclnnRotaryPositionEmbedding for BNSD partial rotation:
+                // D <= 128, D % 32 == 0, and B * N <= S * 8. Do not send an
+                // out-of-contract shape to the vendor operator; its output is
+                // undefined. Full-width rotation uses the 310P composite path.
                 const int32_t * rope_params = (const int32_t *) op->op_params;
                 const int * sections = rope_params + 11;
+                const int64_t rope_dims = rope_params[1];
                 if (rope_params[2] == GGML_ROPE_TYPE_IMROPE && sections[3] == 0 &&
-                    op->ne[1] > 4 && op->ne[2] == 1) {
+                    rope_dims < op->ne[0] &&
+                    (rope_dims > 128 || rope_dims % 32 != 0 ||
+                     op->ne[1] * op->ne[3] > op->ne[2] * 8)) {
                     return false;
                 }
                 // Partial rope (n_dims < ne[0]) takes the
