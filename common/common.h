@@ -572,6 +572,7 @@ struct common_params {
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
     bool kv_unified        = false; // enable unified KV cache
     bool kv_paged          = false; // enable paged KV cache
+    bool enable_priority   = false; // order paged requests by priority instead of FCFS
 
     int32_t  block_size      = 16;
 
@@ -597,6 +598,7 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    ggml_type act_type     = GGML_TYPE_F32; // data type of the compute graph activations [EXPERIMENTAL; CANN and Qwen3-family only]
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

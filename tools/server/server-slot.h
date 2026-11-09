@@ -162,12 +162,12 @@ struct server_slot {
     // multimodal
     mtmd_context * mctx = nullptr;
 
-    // multimodal (12.4): the number of media segments already encoded and
+    // multimodal (9.4): the number of media segments already encoded and
     // appended for the in-flight request
     int32_t n_media_appended = 0;
     mtmd::batch_ptr mbatch = nullptr;
 
-    // multimodal (12.4): a media chunk encoded ahead of the scheduler pause
+    // multimodal (9.4): a media chunk encoded ahead of the scheduler pause
     // on a worker thread, so the clip run overlaps the scheduler steps. the
     // worker never touches the slot; the consumer joins the worker (which is
     // the happens-before) and moves the batch out. the chunk pointer is owned

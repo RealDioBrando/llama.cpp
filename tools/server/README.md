@@ -70,6 +70,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--no-host` | bypass host buffer allowing extra buffers to be used<br/>(env: LLAMA_ARG_NO_HOST) |
 | `-ctk, --cache-type-k TYPE` | KV cache data type for K<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_CACHE_TYPE_K) |
 | `-ctv, --cache-type-v TYPE` | KV cache data type for V<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_CACHE_TYPE_V) |
+| `-at, --act-type TYPE` | data type of the activations in the compute graph [EXPERIMENTAL; CANN and Qwen3-family only]<br/>allowed values: f32, f16<br/>(default: f32)<br/>(env: LLAMA_ARG_ACT_TYPE) |
 | `-dt, --defrag-thold N` | KV cache defragmentation threshold (DEPRECATED)<br/>(env: LLAMA_ARG_DEFRAG_THOLD) |
 | `--rpc SERVERS` | comma-separated list of RPC servers (host:port)<br/>(env: LLAMA_ARG_RPC) |
 | `-lm, --load-mode MODE` | model loading mode (default: auto)<br/>- auto: mmap, unless a device does not support it<br/>- none: no special loading mode<br/>- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)<br/>- mlock: force system to keep model in RAM rather than swapping or compressing<br/>- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing<br/>- dio: use DirectIO if available<br/><br/>(env: LLAMA_ARG_LOAD_MODE) |
@@ -354,9 +355,11 @@ Phase-1 restrictions:
   request ends when its context is full.
 - Supported: `/completion`, `/v1/completions` and `/v1/chat/completions` (including tool
   calls and grammar), speculative decoding (`--spec-*`; the draft context always runs on
-  classic memory), and `n` / `n_cmpl > 1` parallel sampling. Multimodal inputs, infill,
-  embeddings, reranking, synthetic speculative acceptance, LoRA adapters, `--cache-ram` and
-  the `/slots` save/restore endpoints return an error or are rejected at startup.
+  classic memory), `n` / `n_cmpl > 1` parallel sampling, and multimodal inputs (media
+  segments are prefilled in order and encoded on demand when the scheduler pauses on
+  them). Infill, embeddings, reranking, synthetic speculative acceptance, LoRA adapters,
+  `--cache-ram` and the `/slots` save/restore endpoints return an error or are rejected
+  at startup.
 - Explicit `id_slot` requests are not supported.
 - SWA architectures (gemma3, llama4, etc.) are not yet supported; hybrid recurrent models
   (Qwen3.5) reserve a few sequence ids internally, reducing the effective slot count.

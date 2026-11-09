@@ -13,6 +13,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "src/llama-context.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -194,7 +195,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
 // server_context_impl (private implementation)
 //
 
-struct server_context_impl : server_scheduler_host {
+struct server_context_impl : server_context_port {
     friend struct server_context;
 
 public:
@@ -401,7 +402,7 @@ private:
                 SRV_ERR("%s", "--kv-paged does not support embeddings yet\n");
                 return false;
             }
-            if (params_base.cache_ram_mib > 0) {
+            if (params_base.cache_ram_mib != 0) {
                 SRV_ERR("%s", "--kv-paged does not support --cache-ram\n");
                 return false;
             }
@@ -422,7 +423,7 @@ private:
                 return false;
             }
             if (has_mmproj) {
-                // multimodal (12.4): media chunks are launched as pending
+                // multimodal (9.4): media chunks are launched as pending
                 // segments and encoded on demand when the scheduler pauses
                 SRV_INF("%s", "multimodal inputs enabled with the paged scheduler\n");
             }
@@ -1678,6 +1679,12 @@ private:
 
     // tokenize the input if it's set by CLI, return false on error
     bool tokenize_cli_input(server_task & task) {
+        if (task.cli_prompt.empty() && !task.tokens.empty()) {
+            // the task was deferred and re-queued after a first pass already
+            // tokenized it: keep the existing tokens, re-running with the
+            // cleared cli_prompt would wipe them
+            return true;
+        }
         try {
             auto & prompt = task.cli_prompt;
             if (mctx != nullptr) {
@@ -3132,14 +3139,21 @@ private:
         }
 
         bool has_output = false;
+        bool has_prompt = false;
+        bool has_decode = false;
         for (int i = off; i < off + batch_view.n_tokens; ++i) {
             has_output |= batch.tokens[i].output;
+            has_prompt |= batch.tokens[i].is_prompt;
+            has_decode |= !batch.tokens[i].is_prompt;
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            ctx_tgt->graph_decode_mode = has_prompt
+                ? (has_decode ? GGML_GRAPH_PHASE_MIXED : GGML_GRAPH_PHASE_PREFILL)
+                : GGML_GRAPH_PHASE_DECODE;
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
@@ -3205,6 +3219,12 @@ private:
         if (spec) {
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
+                struct reset_graph_mode {
+                    int & mode;
+                    ~reset_graph_mode() { mode = GGML_GRAPH_PHASE_UNSPECIFIED; }
+                } reset{ctx_tgt->graph_decode_mode};
+                // decode cleared the phase; expose it only while processing target features.
+                ctx_tgt->graph_decode_mode = has_prompt ? GGML_GRAPH_PHASE_UNSPECIFIED : GGML_GRAPH_PHASE_DECODE;
                 ok = common_speculative_process(spec.get(), batch_view);
             });
 
@@ -3611,7 +3631,7 @@ private:
     }
 
     //
-    // server_scheduler_host interface (--kv-paged)
+    // server_context_port interface (--kv-paged)
     //
     // note: process_token, populate_token_probs, launch_slot_with_task and
     // the send_* / metrics_* hooks satisfy the interface directly

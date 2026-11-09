@@ -1790,6 +1790,16 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    // Reserve one rollback step per possible ngram-simple draft token.
+    const char * snapshot_enable = std::getenv("LLAMA_GDN_SNAPSHOT_ENABLE");
+    if ((snapshot_enable && std::strcmp(snapshot_enable, "1") == 0) &&
+        std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE) != params.speculative.types.end() &&
+        std::all_of(params.speculative.types.begin(), params.speculative.types.end(), [](common_speculative_type t) {
+            return t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE;
+        })) {
+        cparams.n_rs_seq = params.speculative.ngram_simple.size_m;
+    }
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
@@ -1821,9 +1831,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_gpu_blocks      = params.n_gpu_blocks;
     cparams.n_cpu_blocks      = params.n_cpu_blocks;
     cparams.kv_paged_watermark = params.kv_paged_watermark;
+    cparams.paged_priority      = params.enable_priority;
 
-    cparams.type_k = params.cache_type_k;
-    cparams.type_v = params.cache_type_v;
+    cparams.type_k   = params.cache_type_k;
+    cparams.type_v   = params.cache_type_v;
+    cparams.type_act = params.act_type;
 
     return cparams;
 }

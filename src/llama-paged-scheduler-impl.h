@@ -3,6 +3,7 @@
 #include "llama-kv-cache-paged.h"
 #include "llama-memory-hybrid-paged.h"
 #include "llama-paged-prefix-cache.h"
+#include "llama-paged-queue.h"
 
 #include <clocale>
 #include <cstdlib>
@@ -21,7 +22,8 @@ class llama_paged_scheduler_impl {
             int32_t  n_batch,
             int32_t  n_pos_per_embd,
             llama_kv_cache_paged * kv_manager,
-            llama_memory_hybrid_paged * hybrid_memory = nullptr);
+            llama_memory_hybrid_paged * hybrid_memory = nullptr,
+            bool priority_enabled = false);
 
     llama_scheduler_status step(llama_batch & batch);
     bool                   queue_request(llama_sequence_group group);
@@ -60,6 +62,14 @@ class llama_paged_scheduler_impl {
     void process_running_list(llama_sequence_group_raw_list & candidates, int32_t & row_budget);
     void process_swapped_list(llama_sequence_group_raw_list & candidates, int32_t & row_budget);
     void process_waiting_list(llama_sequence_group_raw_list & candidates, int32_t & row_budget);
+    // Evict one group from `running` and return it (may be nullptr if every
+    // group is FINISHED). Priority mode picks the lowest priority, FCFS the
+    // most recent arrival. Groups already added to this step's candidates are
+    // eligible; the caller removes them from `candidates` before eviction.
+    llama_sequence_group_ptr evict();
+    void process_running_list(llama_sequence_group_raw_list & candidates, int32_t & row_budget);
+    void process_swapped_list(llama_sequence_group_raw_list & candidates, int32_t & row_budget);
+    void process_waiting_list(llama_sequence_group_raw_list & candidates, int32_t row_budget);
 
     void swap_out_or_recompute(llama_sequence_group_ptr group_ptr);
 
@@ -76,9 +86,18 @@ class llama_paged_scheduler_impl {
     static uint64_t hash_block(uint64_t prev, const std::vector<llama_token> & tokens, uint32_t block_idx,
                                uint32_t block_size);
 
+    // Scheduling mode is fixed at construction time (see enable_priority).
+    const bool priority_enabled_;
+    // Monotonic enqueue sequence, assigned in queue_request().
+    uint64_t next_arrival_seq = 0;
+    // Only warn once when a priority is supplied in FCFS mode.
+    bool warned_priority_ignored = false;
+
+    // running stays arrival-ordered: allocator order and eviction depend on it.
     llama_sequence_group_list running;
-    llama_sequence_group_list swapped;
-    llama_sequence_group_list waiting;
+    // waiting / swapped use the strategy selected by priority_enabled_.
+    std::unique_ptr<llama_paged_queue> swapped;
+    std::unique_ptr<llama_paged_queue> waiting;
 
     // Used for fast lookups
     std::unordered_map<int32_t, llama_sequence_group *> id_to_group;
@@ -86,7 +105,7 @@ class llama_paged_scheduler_impl {
     const uint32_t         n_seq_max_ctx;
     const uint32_t         block_size;
     const int32_t          n_batch;
-    const int32_t          n_pos_per_embd;  // 1, or 4 for mrope models (12.4)
+    const int32_t          n_pos_per_embd;  // 1, or 4 for mrope models (9.4)
     llama_kv_cache_paged * kv_cache_manager = nullptr;
     llama_memory_hybrid_paged * hybrid_memory_manager = nullptr;
     llama_paged_batch_info curr_info = {};

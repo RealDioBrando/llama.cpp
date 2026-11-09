@@ -26,9 +26,12 @@
 #include "../ggml-impl.h"
 #include "../include/ggml-cann.h"
 #include "../include/ggml.h"
+#include "gdn_route.h"
 
 #include <acl/acl.h>
 #include <unistd.h>
+#include <array>
+#include <utility>
 
 #include <atomic>
 #include <condition_variable>
@@ -36,6 +39,7 @@
 #include <functional>
 #include <iostream>
 #include <list>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -120,18 +124,28 @@ static inline size_t ggml_cann_w8a8_hp_elements(const ggml_tensor * tensor) {
     return static_cast<size_t>(k1) * static_cast<size_t>(n1) * 16 * 32;
 }
 
+size_t ggml_cann_w8a8_expert_transformed_size(const ggml_tensor * tensor);
+
 /** @brief Byte offset of the resident FP32 per-channel scale array. */
 static inline size_t ggml_cann_w8a8_scale_offset(const ggml_tensor * tensor) {
     return GGML_PAD(ggml_cann_w8a8_hp_elements(tensor), 128);
 }
 
-/** @brief Whether the DynamicQuant + QuantMatmulV5 A8 path is selected. */
-static inline bool ggml_cann_w8a8_a8_enabled() {
-    static const bool enabled =
-        parse_bool(get_env_as_lowercase("GGML_CANN_W8A8_A8").value_or("on"));
-    return enabled;
+/** @brief Byte offset of the resident FP32 per-expert/per-channel scale plane. */
+static inline size_t ggml_cann_w8a8_expert_scale_offset(const ggml_tensor * tensor) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_W8A8);
+    return GGML_PAD(ggml_cann_w8a8_expert_transformed_size(tensor), 128);
 }
 
+/**
+ * @brief Whether the tensor is a 3D W8A8 expert weight.
+ *
+ * Dense W8A8 weights are 2D [K,N]. Expert weights are 3D [K,N,E], which lets
+ * the CANN backend distinguish the MoE path from the dense path.
+ */
+static inline bool ggml_cann_w8a8_is_expert(const ggml_tensor * tensor) {
+    return tensor->type == GGML_TYPE_W8A8 && tensor->ne[2] > 1 && tensor->ne[3] == 1;
+}
 /**
  * @brief Abstract base class for memory pools used by CANN.
  */
@@ -452,6 +466,8 @@ struct ggml_cann_graph {
 #endif
 
     std::vector<ggml_graph_node_properties> ggml_graph_properties;
+    // RoPE generation, parameter epoch, and producer recorded during capture.
+    std::vector<std::array<size_t, 3>> rope_refs;
 
     /**
      * @brief Create a new CANN graph from a ggml computation graph.
@@ -647,15 +663,93 @@ struct ggml_cann_graph_lru_cache {
 #endif  // USE_ACL_GRAPH
 
 struct ggml_cann_rope_cache {
+    static bool lifetime_fix() {
+        static const bool enabled = []() {
+            const char * e = getenv("GGML_CANN_ROPE_LIFETIME_FIX");
+            return e && strcmp(e, "1") == 0;
+        }();
+        return enabled;
+    }
+
+    struct generation {
+        void * sin;
+        void * cos;
+        size_t bytes;
+        bool live;
+    };
+    std::vector<generation> generations;
+    size_t active_generation = 0;
+    size_t pair_capacity = 0;
+    size_t live_bytes = 0;
+    size_t param_epoch = 0;
+
+    bool generation_live(size_t id) const {
+        return id > 0 && id <= generations.size() && generations[id - 1].live;
+    }
+
+    void note_param_change() {
+        ++param_epoch;
+    }
+
+    void retire_pair(bool release) {
+        if (!active_generation) return;
+        auto & old = generations[active_generation - 1];
+        GGML_ASSERT(old.live);
+        if (release) {
+            ACL_CHECK(aclrtFree(old.sin));
+            ACL_CHECK(aclrtFree(old.cos));
+            old.live = false;
+            live_bytes -= 2 * old.bytes;
+        }
+    }
+
+    void ensure_pair(int64_t dims, int64_t tokens, bool capturing) {
+        GGML_ASSERT(dims > 0 && tokens > 0);
+        const size_t limit = std::numeric_limits<size_t>::max();
+        GGML_ASSERT((uint64_t) dims <= limit / sizeof(float) / 2);
+        const size_t row_bytes = (size_t) dims * sizeof(float) * 2;
+        GGML_ASSERT((uint64_t) tokens <= limit / row_bytes);
+        const size_t required = row_bytes * (size_t) tokens;
+        const bool fix = lifetime_fix();
+        const bool grow = fix ? required > pair_capacity : tokens > position_length;
+        if (!grow) return;
+        GGML_ASSERT(!capturing);
+        size_t capacity = required;
+        if (fix) {
+            capacity = pair_capacity ? pair_capacity : 256;
+            while (capacity < required) {
+                if (capacity > limit / 2) { capacity = required; break; }
+                capacity *= 2;
+            }
+        } else {
+            retire_pair(true);
+        }
+        GGML_ASSERT(capacity <= (limit - live_bytes) / 2);
+        void * new_sin = nullptr;
+        void * new_cos = nullptr;
+        ACL_CHECK(aclrtMalloc(&new_sin, capacity, ACL_MEM_MALLOC_HUGE_FIRST));
+        ACL_CHECK(aclrtMalloc(&new_cos, capacity, ACL_MEM_MALLOC_HUGE_FIRST));
+        if (fix) retire_pair(false);
+        generations.push_back({new_sin, new_cos, capacity, true});
+        active_generation = generations.size();
+        sin_cache = new_sin;
+        cos_cache = new_cos;
+        pair_capacity = capacity;
+        live_bytes += 2 * capacity;
+        position_length = tokens;
+    }
+
     ~ggml_cann_rope_cache() {
         if (theta_scale_cache) {
             ACL_CHECK(aclrtFree(theta_scale_cache));
         }
-        if (sin_cache) {
-            ACL_CHECK(aclrtFree(sin_cache));
-        }
-        if (cos_cache) {
-            ACL_CHECK(aclrtFree(cos_cache));
+        // The context synchronizes streams and destroys graphs before this.
+        for (size_t i = 0; i < generations.size(); ++i) {
+            auto & g = generations[i];
+            if (g.live) {
+                ACL_CHECK(aclrtFree(g.sin));
+                ACL_CHECK(aclrtFree(g.cos));
+            }
         }
         if (position_select_index) {
             ACL_CHECK(aclrtFree(position_select_index));
@@ -749,6 +843,211 @@ struct ggml_cann_tensor_cache {
 
     void *  cache = nullptr;
     int64_t size  = 0;
+    ggml_type dtype = GGML_TYPE_COUNT;
+};
+
+/**
+ * @brief Device-side index buffers for the gated delta net aclnn op calls.
+ *
+ * @details The aclnn op takes seq_lens and state_indices as device tensors.
+ *          Buffers are allocated ONCE at a fixed capacity and never
+ *          reallocated - a realloc on growth would invalidate device pointers
+ *          held by already-captured ACL graphs. Content is prefix-stable, so
+ *          graphs captured with a smaller batch keep reading valid data.
+ *          Growth needs a host-to-device copy and must happen outside of ACL
+ *          graph capture.
+ */
+struct ggml_cann_gdn_cache {
+    ~ggml_cann_gdn_cache() {
+        release_all();
+    }
+
+    // Ownership:
+    //  - generations_ + seq_lens/state_indices/block_indices: the index buffers.
+    //    Growth allocates a NEW generation and keeps every old allocation alive
+    //    (ACL graphs may still reference the old addresses); release_all() frees
+    //    everything at teardown, where no graph can still reference them.
+    //  - block_lens: singleton {1..8}, allocated once.
+    //  - prefill_map_: one immutable device buffer per distinct (batch, t)
+    //    holding [t]*batch. Entries are never rewritten after creation, so
+    //    graphs captured for one (batch, t) replay with the right lengths even
+    //    after other shapes run. Distinct-shape entries accumulate for the
+    //    context lifetime (each costs batch*4 device bytes plus a host map
+    //    node); entry_count()/device_bytes() expose the current footprint.
+    //  - No pointer is owned by more than one container.
+    void * seq_lens      = nullptr; /**< int32[max_batch], all ones (decode). */
+    void * state_indices = nullptr; /**< int32[max_batch], value = index (decode). */
+    void * block_lens    = nullptr; /**< int32[8] = {1..8}, a [1] view at (len-1) holds len. */
+    void * block_indices = nullptr; /**< int32[max_batch*8], row b = [b]*8 (prefill blocks). */
+    int64_t max_batch    = 0;
+
+    std::vector<std::array<void *, 3>> generations_; /**< superseded index-buffer generations (kept alive for old graphs). */
+    std::map<std::pair<int64_t, int64_t>, void *> prefill_map_; /**< (batch, t) -> immutable [t]*batch device buffer. */
+    std::map<std::array<int64_t, 3>, void *> snapshot_map_;
+    size_t prefill_entries_ = 0;
+    size_t prefill_device_bytes_ = 0;
+
+    size_t entry_count() const { return prefill_entries_; }
+    size_t device_bytes() const { return prefill_device_bytes_; }
+
+    /**
+     * @brief Grow the device index buffers to cover the given batch size.
+     *
+     * @details Growth allocates a new generation; the previous generation's
+     *          pointers move to generations_ (NOT freed - captured graphs may
+     *          still reference them). Content is prefix-stable (ones, identity
+     *          indices, per-sequence rows), so graphs captured with a smaller
+     *          batch keep reading valid data. Must be called outside ACL graph
+     *          capture (host-to-device copy).
+     */
+    void ensure_batch(int64_t batch) {
+        if (batch <= max_batch) {
+            return;
+        }
+        int32_t * host = (int32_t *) malloc(batch * 8 * sizeof(int32_t));
+        GGML_ASSERT(host != nullptr);
+        void * new_seq = nullptr;
+        void * new_state = nullptr;
+        void * new_block_idx = nullptr;
+        ACL_CHECK(aclrtMalloc(&new_seq, batch * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST));
+        ACL_CHECK(aclrtMalloc(&new_state, batch * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST));
+        ACL_CHECK(aclrtMalloc(&new_block_idx, batch * 8 * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST));
+        for (int64_t i = 0; i < batch; i++) {
+            host[i] = 1;
+        }
+        ACL_CHECK(aclrtMemcpy(new_seq, batch * sizeof(int32_t), host, batch * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE));
+        for (int64_t i = 0; i < batch; i++) {
+            host[i] = (int32_t) i;
+        }
+        ACL_CHECK(aclrtMemcpy(new_state, batch * sizeof(int32_t), host, batch * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE));
+        for (int64_t b = 0; b < batch; b++) {
+            for (int64_t i = 0; i < 8; i++) {
+                host[b * 8 + i] = (int32_t) b;
+            }
+        }
+        ACL_CHECK(aclrtMemcpy(new_block_idx, batch * 8 * sizeof(int32_t), host, batch * 8 * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE));
+        free(host);
+        if (block_lens == nullptr) {
+            int32_t lens[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+            ACL_CHECK(aclrtMalloc(&block_lens, 8 * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST));
+            ACL_CHECK(aclrtMemcpy(block_lens, 8 * sizeof(int32_t), lens, 8 * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE));
+        }
+        // retire the current generation (may be all-null on the first call)
+        generations_.push_back({ seq_lens, state_indices, block_indices });
+        seq_lens       = new_seq;
+        state_indices  = new_state;
+        block_indices  = new_block_idx;
+        max_batch      = batch;
+    }
+
+    /**
+     * @brief Return the immutable [t]*batch device buffer, creating it once.
+     *
+     * @details The entry is created on first request and never rewritten, so
+     *          every captured graph keeps reading its own correct lengths on
+     *          replay. The GDN glue preloads all needed entries BEFORE graph
+     *          capture; a call inside capture therefore only finds an existing
+     *          entry (no aclrtMalloc, no H2D copy). Outside capture an eager
+     *          call may create the entry. Repeated same-key calls do not
+     *          allocate again.
+     */
+    void * ensure_prefill_lens(int64_t batch, int64_t t) {
+        const auto key = std::make_pair(batch, t);
+        const auto it  = prefill_map_.find(key);
+        if (it != prefill_map_.end()) {
+            return it->second;
+        }
+        int32_t * host = (int32_t *) malloc(batch * sizeof(int32_t));
+        GGML_ASSERT(host != nullptr);
+        for (int64_t i = 0; i < batch; i++) {
+            host[i] = (int32_t) t;
+        }
+        void * dev = nullptr;
+        ACL_CHECK(aclrtMalloc(&dev, batch * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST));
+        ACL_CHECK(aclrtMemcpy(dev, batch * sizeof(int32_t), host, batch * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE));
+        free(host);
+        prefill_map_.emplace(key, dev);
+        prefill_entries_ += 1;
+        prefill_device_bytes_ += (size_t) batch * sizeof(int32_t);
+        return dev;
+    }
+
+    /**
+     * @brief Graph-capture preparation: size the capacity AND create the
+     *        (batch, t) prefill entry before the capture interval starts.
+     */
+    void prepare_prefill(int64_t batch, int64_t t) {
+        ensure_batch(batch);
+        ensure_prefill_lens(batch, t);
+    }
+
+    void * ensure_snapshot_indices(int64_t batch, int64_t t, int64_t k) {
+        const std::array<int64_t, 3> key = {batch, t, k};
+        const auto it = snapshot_map_.find(key);
+        if (it != snapshot_map_.end()) {
+            return it->second;
+        }
+        std::vector<int32_t> host(batch * t);
+        for (int64_t b = 0; b < batch; ++b) {
+            for (int64_t j = 0; j < t; ++j) {
+                host[b * t + j] = (int32_t) gdn_route::snapshot_index(b, j, batch, t, k);
+            }
+        }
+        void * dev = nullptr;
+        const size_t bytes = host.size() * sizeof(int32_t);
+        ACL_CHECK(aclrtMalloc(&dev, bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+        ACL_CHECK(aclrtMemcpy(dev, bytes, host.data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE));
+        snapshot_map_.emplace(key, dev);
+        return dev;
+    }
+
+    /**
+     * @brief Free every device allocation owned by this cache. Idempotent.
+     *
+     * @details Must only run when no ACL graph can still reference these
+     *          buffers (the backend context destroys its graph cache first -
+     *          see ~ggml_backend_cann_context). Clears the containers and
+     *          resets the capacity so a repeated call is a no-op.
+     */
+    void release_all() {
+        for (const auto & gen : generations_) {
+            for (void * p : gen) {
+                if (p != nullptr) {
+                    ACL_CHECK(aclrtFree(p));
+                }
+            }
+        }
+        generations_.clear();
+        if (seq_lens != nullptr) {
+            ACL_CHECK(aclrtFree(seq_lens));
+            seq_lens = nullptr;
+        }
+        if (state_indices != nullptr) {
+            ACL_CHECK(aclrtFree(state_indices));
+            state_indices = nullptr;
+        }
+        if (block_indices != nullptr) {
+            ACL_CHECK(aclrtFree(block_indices));
+            block_indices = nullptr;
+        }
+        if (block_lens != nullptr) {
+            ACL_CHECK(aclrtFree(block_lens));
+            block_lens = nullptr;
+        }
+        for (const auto & kv : prefill_map_) {
+            if (kv.second != nullptr) {
+                ACL_CHECK(aclrtFree(kv.second));
+            }
+        }
+        prefill_map_.clear();
+        for (const auto & kv : snapshot_map_) {
+            ACL_CHECK(aclrtFree(kv.second));
+        }
+        snapshot_map_.clear();
+        prefill_entries_ = 0;
+        prefill_device_bytes_ = 0;
+        max_batch = 0;
+    }
 };
 
 /**
@@ -784,6 +1083,7 @@ struct ggml_backend_cann_context {
 #ifdef USE_ACL_GRAPH
     /// Cached CANN ACL graph used for executing the current ggml computation graph.
     ggml_cann_graph_lru_cache graph_lru_cache;
+    const int *               graph_decode_mode_ptr = nullptr; // Borrowed from the owning llama_context.
     bool                      acl_graph_mode = true;
     bool                      piecewise_mode = false;
     bool                      capturing       = false;   /**< true between CaptureBegin/End. */
@@ -794,6 +1094,8 @@ struct ggml_backend_cann_context {
     // Constant Pool
     ggml_cann_tensor_cache rms_norm_one_tensor_cache;
     ggml_cann_tensor_cache rms_norm_zero_tensor_cache;
+    // Gated delta net index cache
+    ggml_cann_gdn_cache    gdn_cache;
 
     aclrtStream streams[GGML_CANN_MAX_STREAMS] = { nullptr }; /**< Array of streams for the device. */
 
@@ -818,9 +1120,25 @@ struct ggml_backend_cann_context {
 
     /**
      * @brief Destructor for cleaning up resources.
+     *
+     * @details Order matters: complete pending work, destroy the graphs (they
+     *          may reference gdn_cache device buffers), then free the cache.
+     *          Assumes no concurrent submissions - ggml backend destruction
+     *          happens after the scheduler and graphs are done with the
+     *          context. Sync failures follow the project error policy
+     *          (ACL_CHECK); they are not silently ignored.
      */
     ~ggml_backend_cann_context() {
         ggml_cann_set_device(device);
+        for (int i = 0; i < GGML_CANN_MAX_STREAMS; ++i) {
+            if (streams[i] != nullptr) {
+                ACL_CHECK(aclrtSynchronizeStream(streams[i]));
+            }
+        }
+#ifdef USE_ACL_GRAPH
+        graph_lru_cache.clear();
+#endif
+        gdn_cache.release_all();
         if (copy_event != nullptr) {
             ACL_CHECK(aclrtDestroyEvent(copy_event));
         }

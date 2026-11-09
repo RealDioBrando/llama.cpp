@@ -13,6 +13,9 @@ struct llama_paged_scheduler {
                           llama_kv_cache_paged * kv_manager,
                           llama_memory_hybrid_paged * hybrid_memory) :
         impl(n_ctx, block_sz, n_batch, n_pos_per_embd, kv_manager, hybrid_memory) {}
+                          llama_memory_hybrid_paged * hybrid_memory,
+                          bool priority_enabled) :
+        impl(n_ctx, block_sz, n_batch, n_pos_per_embd, kv_manager, hybrid_memory, priority_enabled) {}
 };
 
 LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama_context * ctx) {
@@ -46,6 +49,8 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
 
     try {
         return new llama_paged_scheduler(n_ctx, block_sz, n_batch, n_pos_per_embd, paged_kv, hybrid_memory);
+        return new llama_paged_scheduler(n_ctx, block_sz, n_batch, n_pos_per_embd, paged_kv, hybrid_memory,
+                                         ctx->paged_priority());
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("%s: Error when creating llama_paged_scheduler: %s\n", __func__, e.what());
         return nullptr;
@@ -78,7 +83,7 @@ LLAMA_API bool llama_paged_scheduler_warmup(struct llama_paged_scheduler * sched
             tokens[0] = bos;
         }
 
-        if (!llama_paged_scheduler_add_request(sched, tokens.data(), (int32_t) tokens.size(), 0)) {
+        if (!llama_paged_scheduler_add_request(sched, tokens.data(), (int32_t) tokens.size(), 0, /*priority=*/0)) {
             return false;
         }
 
@@ -149,7 +154,8 @@ LLAMA_API bool llama_paged_scheduler_prepare_batch(struct llama_paged_scheduler 
 LLAMA_API bool llama_paged_scheduler_add_request(struct llama_paged_scheduler * sched,
                                                  const llama_token *            tokens,
                                                  int32_t                        n_tokens,
-                                                 int32_t                        request_id) {
+                                                 int32_t                        request_id,
+                                                 int32_t                        priority) {
     if (!sched || !tokens) {
         return false;
     }
@@ -159,10 +165,11 @@ LLAMA_API bool llama_paged_scheduler_add_request(struct llama_paged_scheduler * 
     group.n_prompt   = n_tokens;
     group.n_decoded  = 0;
     group.n_past     = 0;
+    group.priority   = priority;  // clamping and warnings happen in queue_request()
     for (int i = 0; i < n_tokens; ++i) {
         group.logical_seq.push_back(tokens[i]);
     }
-    group.t_arrival_time = ggml_time_us();  // int64_t milliseconds
+    group.t_arrival_time = ggml_time_us();  // microseconds
 
     return sched->impl.queue_request(group);
 }
@@ -327,6 +334,25 @@ LLAMA_API bool llama_paged_scheduler_get_seq_state(struct llama_paged_scheduler 
     out_state->paused           = group->paused_external ? 1 : 0;
     out_state->t_arrival_us     = group->t_arrival_time;
     out_state->t_first_token_us = group->t_first_token_us;
+    out_state->priority         = group->priority;
+
+    switch (group->status) {
+        case llama_sequence_group_status::PENDING:
+            out_state->status = LLAMA_PAGED_SEQ_STATUS_UNKNOWN;
+            break;
+        case llama_sequence_group_status::WAITING:
+            out_state->status = LLAMA_PAGED_SEQ_STATUS_WAITING;
+            break;
+        case llama_sequence_group_status::RUNNING:
+            out_state->status = LLAMA_PAGED_SEQ_STATUS_RUNNING;
+            break;
+        case llama_sequence_group_status::SWAPPED:
+            out_state->status = LLAMA_PAGED_SEQ_STATUS_SWAPPED;
+            break;
+        case llama_sequence_group_status::FINISHED:
+            out_state->status = LLAMA_PAGED_SEQ_STATUS_FINISHED;
+            break;
+    }
     return true;
 }
 

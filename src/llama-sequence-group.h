@@ -14,11 +14,13 @@ enum class llama_sequence_group_status {
     SWAPPED,
     FINISHED,
     PAUSED_EXTERNAL  // 12.4: waiting for the server to append a media segment's embeddings
+    PAUSED_EXTERNAL  // 9.4: waiting for the server to append a media segment's embeddings
 };
 
 using llama_block_ids = std::vector<uint32_t>;
 
 // multimodal (12.4): one ordered piece of a request's prompt. text rows carry
+// multimodal (9.4): one ordered piece of a request's prompt. text rows carry
 // token ids in logical_seq; media rows occupy one KV position each but their
 // input embeddings come from the vision encoder (server-owned buffer), and
 // each media row carries n_pos_per_embd mrope positions instead of one.
@@ -38,6 +40,13 @@ struct llama_sequence_group {
     int64_t t_arrival_time   = 0;
     int64_t t_first_token_us = 0;
 
+    // Request priority: smaller values are served first, default 0.
+    // Read-only after queue_request().
+    int32_t priority = 0;
+    // Monotonic enqueue sequence assigned by the scheduler in queue_request().
+    // Only used to break ties between equal (priority, t_arrival_time).
+    uint64_t arrival_seq = 0;
+
     uint32_t n_prompt  = 0;
     uint32_t n_prompt_total = 0;  // prompt length before any prefix-cache split
     uint32_t n_decoded = 0;
@@ -52,6 +61,7 @@ struct llama_sequence_group {
     std::vector<llama_token> pending_draft;
 
     // multimodal (12.4): ordered segmentation covering all rows; empty for
+    // multimodal (9.4): ordered segmentation covering all rows; empty for
     // legacy text-only requests. media segments are appended with their
     // encoder output by the server when the scheduler pauses on them.
     std::vector<llama_seq_segment> segments;
@@ -77,5 +87,5 @@ struct llama_sequence_group {
 };
 
 using llama_sequence_group_raw_list = std::vector<llama_sequence_group *>;
-using llama_sequence_group_ptr      = std::unique_ptr<llama_sequence_group>;
+using llama_sequence_group_ptr      = std::shared_ptr<llama_sequence_group>;
 using llama_sequence_group_list     = std::list<llama_sequence_group_ptr>;

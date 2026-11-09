@@ -20,10 +20,11 @@ struct common_params;
 struct common_speculative;
 struct server_queue;
 
-// host services a scheduler may use. implemented by server_context_impl.
+// port on server_context_impl exposing the services a scheduler may use.
+// implemented by server_context_impl.
 // all methods are called from the main loop thread only.
-struct server_scheduler_host {
-    virtual ~server_scheduler_host() = default;
+struct server_context_port {
+    virtual ~server_context_port() = default;
 
     virtual common_params & params() = 0;
     virtual llama_context * ctx() = 0;
@@ -90,4 +91,4 @@ struct server_scheduler_interface {
 
 // returns the paged scheduler when params.kv_paged is set, nullptr otherwise
 // (the default path stays inline in server-context.cpp)
-std::unique_ptr<server_scheduler_interface> server_scheduler_create(server_scheduler_host & host);
+std::unique_ptr<server_scheduler_interface> server_scheduler_create(server_context_port & port);

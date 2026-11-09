@@ -29,6 +29,17 @@ extern "C" {
     typedef struct ggml_backend_reg * ggml_backend_reg_t;
     typedef struct ggml_backend_device * ggml_backend_dev_t;
 
+    enum ggml_graph_phase {
+        GGML_GRAPH_PHASE_UNSPECIFIED    = 0,
+        GGML_GRAPH_PHASE_PREFILL        = 1,
+        GGML_GRAPH_PHASE_DECODE         = 2,
+        GGML_GRAPH_PHASE_MIXED          = 3,
+        GGML_GRAPH_PHASE_DRAFT_KV_INJECT = 4,
+        GGML_GRAPH_PHASE_DRAFT_GENERATE  = 5,
+        GGML_GRAPH_PHASE_VISION_ENCODE  = 6,
+        GGML_GRAPH_PHASE_DRAFT_KV_INJECT_DECODE = 7,
+    };
+
 
     //
     // Backend buffer type
