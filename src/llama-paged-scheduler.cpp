@@ -93,11 +93,6 @@ LLAMA_API bool llama_paged_scheduler_warmup(struct llama_paged_scheduler * sched
             if (batch.n_tokens == 0) {
                 break;
             }
-            // Set graph phase so CANN graph capture is enabled during warmup.
-            // Without this, the new graph_decode_mode gate in ggml-cann.cpp
-            // disables graph capture (use_cann_graph=false), causing aclnnMm
-            // to execute directly and fail tiling on FRACTAL_NZ weights.
-            ctx->graph_decode_mode = GGML_GRAPH_PHASE_DECODE;
             if (llama_decode(ctx, batch) != 0) {
                 return false;
             }
