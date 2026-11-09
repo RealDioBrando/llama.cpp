@@ -20,6 +20,12 @@ private:
     bool req_stop_sleeping = false;
     int64_t time_last_task = 0;
 
+    // when set, inference (COMPLETION) tasks are served in ascending
+    // task_params::priority order (lower value first, ties keep arrival order);
+    // non-inference tasks keep their arrival order and are served first.
+    // only enabled for the paged scheduler with --enable-priority.
+    bool priority_order = false;
+
     // queues
     std::deque<server_task> queue_tasks;
     std::deque<server_task> queue_tasks_deferred;
@@ -125,6 +131,12 @@ public:
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    // serve COMPLETION tasks by ascending task_params::priority instead of FCFS
+    // (paged scheduler with --enable-priority). call before start_loop().
+    void set_priority_order(bool enabled) {
+        priority_order = enabled;
     }
 
     // Register callback for sleeping state change; multiple callbacks are allowed

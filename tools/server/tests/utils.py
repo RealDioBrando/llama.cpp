@@ -87,6 +87,7 @@ class ServerProcess:
     server_metrics: bool | None = False
     kv_unified: bool | None = False
     kv_paged: bool | None = False
+    enable_priority: bool | None = False
     swa_full: bool | None = False
     server_slots: bool | None = False
     pooling: str | None = None
@@ -206,6 +207,8 @@ class ServerProcess:
             server_args.append("--kv-unified")
         if self.kv_paged:
             server_args.append("--kv-paged")
+        if self.enable_priority:
+            server_args.append("--enable-priority")
         if self.swa_full:
             server_args.append("--swa-full")
         if self.server_slots:

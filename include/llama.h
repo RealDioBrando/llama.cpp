@@ -1743,10 +1743,16 @@ extern "C" {
         const llama_pos *   pos;         // media mrope positions [n_tokens x 4] row-major; NULL for text
     };
 
+    // same queueing and `priority` semantics as llama_paged_scheduler_add_request().
     LLAMA_API bool llama_paged_scheduler_add_request_segs(struct llama_paged_scheduler *      sched,
                                                            const struct llama_paged_segment * segs,
                                                            int32_t                             n_segs,
-                                                           int32_t                             request_id);
+                                                           int32_t                             request_id,
+                                                           int32_t                             priority
+#if defined(__cplusplus)
+                                                           = 0
+#endif
+                                                           );
 
     // append the encoder output for a media segment the scheduler paused on.
     // pos carries n_tokens x 4 mrope positions starting at the paused

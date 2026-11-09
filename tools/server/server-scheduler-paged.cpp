@@ -153,7 +153,8 @@ bool server_scheduler_paged::launch(server_task && task) {
             return true;
         }
 
-        if (!llama_paged_scheduler_add_request(sched, prompt_tokens.data(), (int32_t) prompt_tokens.size(), s.id)) {
+        if (!llama_paged_scheduler_add_request(sched, prompt_tokens.data(), (int32_t) prompt_tokens.size(), s.id,
+                                               s.task->params.priority)) {
             port.send_error(s, "failed to queue the request in the paged scheduler", ERROR_TYPE_SERVER);
             s.release();
             return true;
@@ -677,7 +678,8 @@ bool server_scheduler_paged::launch_multimodal(server_task && task) {
         segs.push_back(seg);
     }
 
-    if (!llama_paged_scheduler_add_request_segs(sched, segs.data(), (int32_t) segs.size(), s.id)) {
+    if (!llama_paged_scheduler_add_request_segs(sched, segs.data(), (int32_t) segs.size(), s.id,
+                                               s.task->params.priority)) {
         port.send_error(s, "failed to queue the multimodal request in the paged scheduler", ERROR_TYPE_SERVER);
         s.release();
         return true;
