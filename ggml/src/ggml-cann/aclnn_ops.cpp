@@ -4457,6 +4457,73 @@ void ggml_cann_mul_mat_id(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
 
 #ifdef ASCEND_310P
 
+// GQA head expansion for one k/v batch-element slab: (K, Nk, D) -> (K, N, D)
+// with Q head n reading KV head n / ratio. IFA on 310P rejects GQA when
+// head_dim > 128, so the KV heads must be materialized to MHA before the call.
+// All mechanisms below produce byte-identical output (the same
+// (K, N, D) contiguous layout the IFA k/v descriptors assume); they only
+// differ in kernel efficiency. msprof #56/#58/#59 showed the expansion is
+// 87% of the FA decode device time and the RepeatInterleave kernel runs ~5x
+// below copy speed, while the Cat-based variant halves it (-56% expansion,
+// -49% FA section). Env GGML_CANN_FA_EXPAND, sampled once:
+//   cat (default)  aclnnCat of N strided single-head views (D, 1, K) along dim 1
+//   ri             aclnnRepeatInterleaveIntWithDim on the flat row view (D, K*Nk, 1)
+static void ggml_cann_fa_gqa_expand_310p(ggml_backend_cann_context & ctx, const void * src, void * dst,
+                                         int64_t D, int64_t K, int64_t Nk, int64_t N) {
+    static const int mode = []() {
+        const char * e = getenv("GGML_CANN_FA_EXPAND");
+        if (e != nullptr && e[0] != '\0') {
+            if ((e[0] | 0x20) == 'r') return 0;                 // ri
+        }
+        return 2;                                               // cat (default)
+    }();
+    const int64_t ratio = N / Nk;
+    const size_t   es    = sizeof(uint16_t);
+
+    if (mode == 2) {
+        // N single-head strided views (D, 1, K) concatenated along the head
+        // dim -> (D, N, K); input order [h0 x ratio, h1 x ratio, ...] gives
+        // the head order n -> n / ratio that the IFA contract expects.
+        int64_t view_ne[3] = { D, 1, K };
+        size_t  view_nb[3] = { es, (size_t) D * es, (size_t) Nk * D * es };
+        int64_t out_ne[3]  = { D, N, K };
+        size_t  out_nb[3];
+        out_nb[0] = es;
+        for (int i = 1; i < 3; ++i) {
+            out_nb[i] = out_nb[i - 1] * out_ne[i - 1];
+        }
+        std::vector<acl_tensor_ptr> views;
+        views.reserve(N);
+        for (int64_t n = 0; n < N; ++n) {
+            const char * head_base = (const char *) src + (n / ratio) * D * es;
+            views.push_back(ggml_cann_create_tensor((void *) head_base, ACL_FLOAT16, es, view_ne, view_nb, 3));
+        }
+        acl_tensor_list_ptr view_list = ggml_cann_create_tensor_list(views);
+        acl_tensor_ptr      acl_out   = ggml_cann_create_tensor(dst, ACL_FLOAT16, es, out_ne, out_nb, 3);
+        GGML_CANN_CALL_ACLNN_OP(ctx, Cat, view_list.get(), (int64_t) 1, acl_out.get());
+        return;
+    }
+
+    int64_t src_ne[3];
+    size_t  src_nb[3];
+    int64_t dst_ne[3];
+    size_t  dst_nb[3];
+    // flat row view: (D, K*Nk, 1) -> interleave dim 1 -> (D, K*N, 1)
+    src_ne[0] = D; src_ne[1] = K * Nk; src_ne[2] = 1;
+    dst_ne[0] = D; dst_ne[1] = K * N;  dst_ne[2] = 1;
+    const int64_t inter_dim_size = K * N;  // size of the interleaved dim after expansion
+    src_nb[0] = es;
+    dst_nb[0] = es;
+    for (int i = 1; i < 3; ++i) {
+        src_nb[i] = src_nb[i - 1] * src_ne[i - 1];
+        dst_nb[i] = dst_nb[i - 1] * dst_ne[i - 1];
+    }
+    acl_tensor_ptr acl_src = ggml_cann_create_tensor((void *) src, ACL_FLOAT16, es, src_ne, src_nb, 3);
+    acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst, ACL_FLOAT16, es, dst_ne, dst_nb, 3);
+    GGML_CANN_CALL_ACLNN_OP(ctx, RepeatInterleaveIntWithDim, acl_src.get(), ratio, (int64_t) 1, inter_dim_size,
+                            acl_dst.get());
+}
+
 // FlashAttention on Ascend 310P, based on ops-transformer kernels:
 //  - prefill (q_len > 1): aclnnPromptFlashAttentionV3
 //  - decode  (q_len == 1): aclnnIncreFlashAttentionV4
@@ -4519,68 +4586,36 @@ static void ggml_cann_flash_attn_ext_310p(ggml_backend_cann_context & ctx, ggml_
 
     if (q_len == 1) {
         // ================= decode: aclnnIncreFlashAttentionV4 =================
-        // k/v: (B, K, Nk, D) -> expand heads to N (order-preserving) when GQA
-        int64_t            kv_ne[GGML_MAX_DIMS];
-        size_t             kv_nb[GGML_MAX_DIMS];
-        acl_tensor_ptr     acl_k, acl_v;
-        ggml_cann_pool_alloc k_exp_allocator(ctx.pool());
-        ggml_cann_pool_alloc v_exp_allocator(ctx.pool());
-
-        bsnd(kv_ne, kv_nb, D, N, K, B, sizeof(uint16_t));
-
-        if (Nk != N) {
-            const int64_t ratio = N / Nk;
-            void * k_exp = k_exp_allocator.alloc((size_t) B * K * N * D * sizeof(uint16_t));
-            void * v_exp = v_exp_allocator.alloc((size_t) B * K * N * D * sizeof(uint16_t));
-
-            // same buffer reinterpreted as (B, K*Nk, D); interleave along dim 1 gives (B, K*N, D)
-            // with head order [0,0,...,1,1,...] matching the GQA mapping h -> h / ratio
-            int64_t flat_ne[3] = { D, K * Nk, B };
-            size_t  flat_nb[3] = { sizeof(uint16_t), (size_t) D * sizeof(uint16_t),
-                                   (size_t) D * K * Nk * sizeof(uint16_t) };
-            int64_t expd_ne[3] = { D, K * N, B };
-            size_t  expd_nb[3] = { sizeof(uint16_t), (size_t) D * sizeof(uint16_t),
-                                   (size_t) D * K * N * sizeof(uint16_t) };
-
-            for (int i = 0; i < 2; i++) {
-                ggml_tensor * src   = i == 0 ? src1 : src2;
-                void *        dst_b = i == 0 ? k_exp : v_exp;
-                acl_tensor_ptr acl_flat =
-                    ggml_cann_create_tensor(src->data, ACL_FLOAT16, sizeof(uint16_t), flat_ne, flat_nb, 3);
-                acl_tensor_ptr acl_expd =
-                    ggml_cann_create_tensor(dst_b, ACL_FLOAT16, sizeof(uint16_t), expd_ne, expd_nb, 3);
-                GGML_CANN_CALL_ACLNN_OP(ctx, RepeatInterleaveIntWithDim, acl_flat.get(), ratio, (int64_t) 1,
-                                        K * N, acl_expd.get());
+        // IFA consumes ONE k/v tensor-list entry per batch element. Two ways
+        // to satisfy that contract:
+        //  - per-batch-element loop (DEFAULT): one IFA call per element, the
+        //    verified contract from the multi-sequence zero-output fix (the
+        //    historical single-entry list left every element beyond the first
+        //    uncomputed: b=0 correct, b>=1 exactly zero). msprof #56/#57
+        //    showed this path also carries an L2 locality bonus: the per-b
+        //    expansion reuses one pool block, keeping the working set hot.
+        //  - batched (opt-in): ONE IFA call over the whole ubatch with a
+        //    B-entry tensor list. Measured NO gain and -0.5..-2% end-to-end
+        //    at pl10/pl32: under ACL graph replay the launch count is
+        //    already amortized, and the IFA kernel processes list entries
+        //    strictly serially (avg duration scales exactly with B), so the
+        //    only remaining effect is the lost locality. Kept behind
+        //    GGML_CANN_FA_BATCH=on|1|true for experimentation.
+        // The switch is sampled once at the first FA op, so a captured graph
+        // bakes exactly one of the two paths.
+        static const bool fa_batch = []() {
+            const char * e = getenv("GGML_CANN_FA_BATCH");
+            if (e == nullptr || e[0] == '\0') {
+                return false;
             }
+            if ((e[0] | 0x20) == 'o' && (e[1] | 0x20) == 'n') return true;  // on
+            if (e[0] == '1' || (e[0] | 0x20) == 't' || (e[0] | 0x20) == 'y') return true;
+            return false;
+        }();
 
-            acl_k = ggml_cann_create_tensor(k_exp, ACL_FLOAT16, sizeof(uint16_t), kv_ne, kv_nb, GGML_MAX_DIMS);
-            acl_v = ggml_cann_create_tensor(v_exp, ACL_FLOAT16, sizeof(uint16_t), kv_ne, kv_nb, GGML_MAX_DIMS);
-        } else {
-            acl_k = ggml_cann_create_tensor(src1->data, ACL_FLOAT16, sizeof(uint16_t), kv_ne, kv_nb, GGML_MAX_DIMS);
-            acl_v = ggml_cann_create_tensor(src2->data, ACL_FLOAT16, sizeof(uint16_t), kv_ne, kv_nb, GGML_MAX_DIMS);
-        }
-
-        // mask (B,1,1,K) f16 -> repeat across heads -> (B,N,1,K) pseShift
-        ggml_cann_pool_alloc pse_allocator(ctx.pool());
-        void *               pse_buf = pse_allocator.alloc((size_t) B * N * K * sizeof(uint16_t));
-        acl_tensor_ptr       acl_pse;
-        {
-            int64_t mask_ne[GGML_MAX_DIMS];
-            size_t  mask_nb[GGML_MAX_DIMS];
-            int64_t pse_ne[GGML_MAX_DIMS];
-            size_t  pse_nb[GGML_MAX_DIMS];
-            bsnd(mask_ne, mask_nb, K, 1, 1, B, sizeof(uint16_t));
-            // pseShift layout for IFA: ACL (B, N, 1, K)
-            bsnd(pse_ne, pse_nb, K, 1, N, B, sizeof(uint16_t));
-            acl_tensor_ptr acl_mask =
-                ggml_cann_create_tensor(src3->data, ACL_FLOAT16, sizeof(uint16_t), mask_ne, mask_nb, GGML_MAX_DIMS);
-            acl_pse = ggml_cann_create_tensor(pse_buf, ACL_FLOAT16, sizeof(uint16_t), pse_ne, pse_nb, GGML_MAX_DIMS);
-            // repeats in ACL dim order (B, N, S, K)
-            int64_t repeats[] = { 1, N, 1, 1 };
-            aclnn_repeat(ctx, acl_mask.get(), acl_pse.get(), repeats);
-        }
-
-        acl_tensor_ptr acl_q = ggml_cann_create_tensor(q_f16, ACL_FLOAT16, sizeof(uint16_t), q_ne, q_nb, GGML_MAX_DIMS);
+        // k/v: (B, K, Nk, D) -> per-b slab -> expand heads to N when GQA
+        const size_t q_b_stride = (src0->type == GGML_TYPE_F16) ? src0->nb[3]
+                                                                 : (size_t) N * D * sizeof(uint16_t);
 
         // output f16 (B,1,N,D)
         ggml_cann_pool_alloc out_f16_allocator(ctx.pool());
@@ -4588,148 +4623,346 @@ static void ggml_cann_flash_attn_ext_310p(ggml_backend_cann_context & ctx, ggml_
         if (dst->type != GGML_TYPE_F16) {
             out_f16 = out_f16_allocator.alloc((size_t) B * N * D * sizeof(uint16_t));
         }
-        acl_tensor_ptr acl_out =
-            ggml_cann_create_tensor(out_f16, ACL_FLOAT16, sizeof(uint16_t), q_ne, q_nb, GGML_MAX_DIMS);
 
-        acl_tensor_list_ptr acl_k_list = ggml_cann_create_tensor_list(std::move(acl_k));
-        acl_tensor_list_ptr acl_v_list = ggml_cann_create_tensor_list(std::move(acl_v));
+        if (fa_batch && B <= 64) {
+            // ---- batched: single IFA call, B-entry k/v tensor lists ----
+            ggml_cann_pool_alloc k_exp_allocator(ctx.pool());
+            ggml_cann_pool_alloc v_exp_allocator(ctx.pool());
+            void *               k_exp = nullptr;
+            void *               v_exp = nullptr;
 
-        int64_t act_seq_lens_buf[256];
-        for (int64_t i = 0; i < B; i++) {
-            act_seq_lens_buf[i] = K;
+            // per-entry descriptor: (1, K, N, D) BSND contiguous
+            int64_t entry_ne[GGML_MAX_DIMS];
+            size_t  entry_nb[GGML_MAX_DIMS];
+            bsnd(entry_ne, entry_nb, D, N, K, 1, sizeof(uint16_t));
+
+            std::vector<acl_tensor_ptr> k_entries;
+            std::vector<acl_tensor_ptr> v_entries;
+            k_entries.reserve(B);
+            v_entries.reserve(B);
+
+            for (int64_t b = 0; b < B; ++b) {
+                char * k_b = (char *) src1->data + b * src1->nb[3];
+                char * v_b = (char *) src2->data + b * src2->nb[3];
+                char * k_entry;
+                char * v_entry;
+
+                if (Nk != N) {
+                    const size_t slab = (size_t) K * N * D * sizeof(uint16_t);
+                    if (b == 0) {
+                        k_exp = k_exp_allocator.alloc((size_t) B * slab);
+                        v_exp = v_exp_allocator.alloc((size_t) B * slab);
+                    }
+                    k_entry = (char *) k_exp + b * slab;
+                    v_entry = (char *) v_exp + b * slab;
+
+                    ggml_cann_fa_gqa_expand_310p(ctx, k_b, k_entry, D, K, Nk, N);
+                    ggml_cann_fa_gqa_expand_310p(ctx, v_b, v_entry, D, K, Nk, N);
+                } else {
+                    // MHA: the list entries point straight into the cache view slabs
+                    k_entry = k_b;
+                    v_entry = v_b;
+                }
+
+                k_entries.push_back(ggml_cann_create_tensor(k_entry, ACL_FLOAT16, sizeof(uint16_t), entry_ne,
+                                                            entry_nb, GGML_MAX_DIMS));
+                v_entries.push_back(ggml_cann_create_tensor(v_entry, ACL_FLOAT16, sizeof(uint16_t), entry_ne,
+                                                            entry_nb, GGML_MAX_DIMS));
+            }
+
+            // whole-batch pseShift: (B,1,1,K) -> repeat across heads -> (B,N,1,K)
+            ggml_cann_pool_alloc pse_allocator(ctx.pool());
+            void *               pse_buf = pse_allocator.alloc((size_t) B * N * K * sizeof(uint16_t));
+            acl_tensor_ptr       acl_pse;
+            {
+                int64_t mask_ne[GGML_MAX_DIMS];
+                size_t  mask_nb[GGML_MAX_DIMS];
+                int64_t pse_ne[GGML_MAX_DIMS];
+                size_t  pse_nb[GGML_MAX_DIMS];
+                bsnd(mask_ne, mask_nb, K, 1, 1, B, sizeof(uint16_t));
+                mask_nb[3] = src3->nb[3];  // honor the mask tensor's batch stride
+                // pseShift layout for IFA: ACL (B, N, 1, K)
+                bsnd(pse_ne, pse_nb, K, 1, N, B, sizeof(uint16_t));
+                acl_tensor_ptr acl_mask = ggml_cann_create_tensor(src3->data, ACL_FLOAT16, sizeof(uint16_t), mask_ne,
+                                                                  mask_nb, GGML_MAX_DIMS);
+                acl_pse =
+                    ggml_cann_create_tensor(pse_buf, ACL_FLOAT16, sizeof(uint16_t), pse_ne, pse_nb, GGML_MAX_DIMS);
+                // repeats in ACL dim order (B, N, S, K)
+                int64_t repeats[] = { 1, N, 1, 1 };
+                aclnn_repeat(ctx, acl_mask.get(), acl_pse.get(), repeats);
+            }
+
+            // whole-batch q (B,1,N,D) and out (B,1,N,D)
+            int64_t qb_ne[GGML_MAX_DIMS];
+            size_t  qb_nb[GGML_MAX_DIMS];
+            bsnd(qb_ne, qb_nb, D, N, 1, B, sizeof(uint16_t));
+            qb_nb[3] = q_b_stride;  // honor the q view's batch stride
+            acl_tensor_ptr acl_q =
+                ggml_cann_create_tensor(q_f16, ACL_FLOAT16, sizeof(uint16_t), qb_ne, qb_nb, GGML_MAX_DIMS);
+            int64_t ob_ne[GGML_MAX_DIMS];
+            size_t  ob_nb[GGML_MAX_DIMS];
+            bsnd(ob_ne, ob_nb, D, N, 1, B, sizeof(uint16_t));
+            acl_tensor_ptr acl_out =
+                ggml_cann_create_tensor(out_f16, ACL_FLOAT16, sizeof(uint16_t), ob_ne, ob_nb, GGML_MAX_DIMS);
+
+            acl_tensor_list_ptr acl_k_list = ggml_cann_create_tensor_list(k_entries);
+            acl_tensor_list_ptr acl_v_list = ggml_cann_create_tensor_list(v_entries);
+
+            std::vector<int64_t> act_seq_lens_buf(B, K);
+            acl_int_array_ptr    act_seq_lens = ggml_cann_create_int_array(act_seq_lens_buf.data(), B);
+            char                 layout[]     = "BSND";
+            GGML_CANN_CALL_ACLNN_OP(ctx, IncreFlashAttentionV4, acl_q.get(), acl_k_list.get(), acl_v_list.get(),
+                                    acl_pse.get(),                        // pseShift (additive mask)
+                                    nullptr,                              // attenMask
+                                    act_seq_lens.get(),                   // actualSeqLengths
+                                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                    nullptr,                              // quant/antiquant/blocktable/kvPadding
+                                    N, (double) scaleValue, layout, N, (int64_t) 0, (int64_t) 1, acl_out.get());
+        } else {
+            // ---- per-batch-element loop (default, verified contract) ----
+        for (int64_t b = 0; b < B; ++b) {
+            char * q_b    = (char *) q_f16      + b * q_b_stride;
+            char * k_b    = (char *) src1->data + b * src1->nb[3];
+            char * v_b    = (char *) src2->data + b * src2->nb[3];
+            char * mask_b = (char *) src3->data + b * src3->nb[3];
+            char * out_b  = (char *) out_f16    + b * (size_t) N * D * sizeof(uint16_t);
+
+            int64_t            kv_ne[GGML_MAX_DIMS];
+            size_t             kv_nb[GGML_MAX_DIMS];
+            acl_tensor_ptr     acl_k, acl_v;
+            ggml_cann_pool_alloc k_exp_allocator(ctx.pool());
+            ggml_cann_pool_alloc v_exp_allocator(ctx.pool());
+            void *               k_exp_ptr = k_b;
+            void *               v_exp_ptr = v_b;
+
+            bsnd(kv_ne, kv_nb, D, N, K, 1, sizeof(uint16_t));
+
+            if (Nk != N) {
+                void * k_exp = k_exp_allocator.alloc((size_t) K * N * D * sizeof(uint16_t));
+                void * v_exp = v_exp_allocator.alloc((size_t) K * N * D * sizeof(uint16_t));
+                k_exp_ptr = k_exp;
+                v_exp_ptr = v_exp;
+
+                ggml_cann_fa_gqa_expand_310p(ctx, k_b, k_exp, D, K, Nk, N);
+                ggml_cann_fa_gqa_expand_310p(ctx, v_b, v_exp, D, K, Nk, N);
+
+                acl_k = ggml_cann_create_tensor(k_exp, ACL_FLOAT16, sizeof(uint16_t), kv_ne, kv_nb, GGML_MAX_DIMS);
+                acl_v = ggml_cann_create_tensor(v_exp, ACL_FLOAT16, sizeof(uint16_t), kv_ne, kv_nb, GGML_MAX_DIMS);
+            } else {
+                acl_k = ggml_cann_create_tensor(k_b, ACL_FLOAT16, sizeof(uint16_t), kv_ne, kv_nb, GGML_MAX_DIMS);
+                acl_v = ggml_cann_create_tensor(v_b, ACL_FLOAT16, sizeof(uint16_t), kv_ne, kv_nb, GGML_MAX_DIMS);
+            }
+
+            // per-b mask (1,1,1,K) f16 -> repeat across heads -> (1,N,1,K) pseShift
+            ggml_cann_pool_alloc pse_allocator(ctx.pool());
+            void *               pse_buf = pse_allocator.alloc((size_t) N * K * sizeof(uint16_t));
+            acl_tensor_ptr       acl_pse;
+            {
+                int64_t mask_ne[GGML_MAX_DIMS];
+                size_t  mask_nb[GGML_MAX_DIMS];
+                int64_t pse_ne[GGML_MAX_DIMS];
+                size_t  pse_nb[GGML_MAX_DIMS];
+                bsnd(mask_ne, mask_nb, K, 1, 1, 1, sizeof(uint16_t));
+                // pseShift layout for IFA: ACL (B, N, 1, K)
+                bsnd(pse_ne, pse_nb, K, 1, N, 1, sizeof(uint16_t));
+                acl_tensor_ptr acl_mask =
+                    ggml_cann_create_tensor(mask_b, ACL_FLOAT16, sizeof(uint16_t), mask_ne, mask_nb, GGML_MAX_DIMS);
+                acl_pse = ggml_cann_create_tensor(pse_buf, ACL_FLOAT16, sizeof(uint16_t), pse_ne, pse_nb, GGML_MAX_DIMS);
+                // repeats in ACL dim order (B, N, S, K)
+                int64_t repeats[] = { 1, N, 1, 1 };
+                aclnn_repeat(ctx, acl_mask.get(), acl_pse.get(), repeats);
+            }
+
+            int64_t q1_ne[GGML_MAX_DIMS];
+            size_t  q1_nb[GGML_MAX_DIMS];
+            bsnd(q1_ne, q1_nb, D, N, 1, 1, sizeof(uint16_t));
+            acl_tensor_ptr acl_q = ggml_cann_create_tensor(q_b, ACL_FLOAT16, sizeof(uint16_t), q1_ne, q1_nb, GGML_MAX_DIMS);
+            acl_tensor_ptr acl_out =
+                ggml_cann_create_tensor(out_b, ACL_FLOAT16, sizeof(uint16_t), q1_ne, q1_nb, GGML_MAX_DIMS);
+
+            acl_tensor_list_ptr acl_k_list = ggml_cann_create_tensor_list(std::move(acl_k));
+            acl_tensor_list_ptr acl_v_list = ggml_cann_create_tensor_list(std::move(acl_v));
+
+            int64_t            act_seq_lens_buf[1] = { K };
+            acl_int_array_ptr  act_seq_lens = ggml_cann_create_int_array(act_seq_lens_buf, 1);
+            char               layout[]     = "BSND";
+            GGML_CANN_CALL_ACLNN_OP(ctx, IncreFlashAttentionV4, acl_q.get(), acl_k_list.get(), acl_v_list.get(),
+                                    acl_pse.get(),                        // pseShift (additive mask)
+                                    nullptr,                              // attenMask
+                                    act_seq_lens.get(),                   // actualSeqLengths
+                                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                    nullptr,                              // quant/antiquant/blocktable/kvPadding
+                                    N, (double) scaleValue, layout, N, (int64_t) 0, (int64_t) 1, acl_out.get());
         }
-        acl_int_array_ptr act_seq_lens = ggml_cann_create_int_array(act_seq_lens_buf, B);
-        char layout[] = "BSND";
-        GGML_CANN_CALL_ACLNN_OP(ctx, IncreFlashAttentionV4, acl_q.get(), acl_k_list.get(), acl_v_list.get(),
-                                acl_pse.get(),                        // pseShift (additive mask)
-                                nullptr,                              // attenMask
-                                act_seq_lens.get(),                   // actualSeqLengths
-                                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                                nullptr,                              // quant/antiquant/blocktable/kvPadding
-                                N, (double) scaleValue, layout, N, (int64_t) 0, (int64_t) 1, acl_out.get());
+        }  // end per-batch-element fallback loop
 
         if (dst->type != GGML_TYPE_F16) {
+            int64_t      out_ne[GGML_MAX_DIMS];
+            size_t       out_nb[GGML_MAX_DIMS];
+            bsnd(out_ne, out_nb, D, N, 1, B, sizeof(uint16_t));
+            acl_tensor_ptr acl_out_full =
+                ggml_cann_create_tensor(out_f16, ACL_FLOAT16, sizeof(uint16_t), out_ne, out_nb, GGML_MAX_DIMS);
             acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
-            aclnn_cast(ctx, acl_out.get(), acl_dst.get(), ggml_cann_type_mapping(dst->type));
+            aclnn_cast(ctx, acl_out_full.get(), acl_dst.get(), ggml_cann_type_mapping(dst->type));
         }
     } else {
         // ================= prefill: aclnnPromptFlashAttentionV3 =================
-        GGML_ASSERT(B == 1);
+        // One PFA call per batch element. Every element owns contiguous
+        // q/k/v/mask/dst slabs, so the verified B==1 contract applies verbatim
+        // at per-b offsets. (This op used to be rejected to the CPU backend
+        // for B > 1; the scheduler-side input materialization for those views
+        // was broken there — v/mask arrived zeroed on the host — which
+        // corrupted multi-sequence prefill and poisoned all downstream
+        // state: the llama-server multi-slot GSM8K collapse.)
 
         const int64_t act_q = (2 * q_len <= K) ? K / 2 : K;
 
-        // 1) pad q along S to K
-        ggml_cann_pool_alloc q_pad_allocator(ctx.pool());
-        void *               q_pad = q_pad_allocator.alloc((size_t) K * N * D * sizeof(uint16_t));
-        {
-            int64_t pad_ne[GGML_MAX_DIMS];
-            size_t  pad_nb[GGML_MAX_DIMS];
-            bsnd(pad_ne, pad_nb, D, N, K, B, sizeof(uint16_t));
-            acl_tensor_ptr acl_q =
-                ggml_cann_create_tensor(q_f16, ACL_FLOAT16, sizeof(uint16_t), q_ne, q_nb, GGML_MAX_DIMS);
+        // 0) cast q to f16 once for the whole batch (BSND contiguous)
+        // (q_f16 already holds the f16 q when src0 is f16)
+        const size_t q_b_stride = (src0->type == GGML_TYPE_F16) ? src0->nb[3]
+                                                                : (size_t) q_len * N * D * sizeof(uint16_t);
+
+        for (int64_t b = 0; b < B; ++b) {
+            char * q_b    = (char *) q_f16      + b * q_b_stride;
+            char * k_b    = (char *) src1->data + b * src1->nb[3];
+            char * v_b    = (char *) src2->data + b * src2->nb[3];
+            char * mask_b = (char *) src3->data + b * src3->nb[3];
+            char * dst_b  = (char *) dst->data  + b * dst->nb[3];
+
+            // 1) pad q along S to K
+            ggml_cann_pool_alloc q_pad_allocator(ctx.pool());
+            void *               q_pad = q_pad_allocator.alloc((size_t) K * N * D * sizeof(uint16_t));
+            {
+                int64_t pad_ne[GGML_MAX_DIMS];
+                size_t  pad_nb[GGML_MAX_DIMS];
+                int64_t q_b_ne[GGML_MAX_DIMS];
+                size_t  q_b_nb[GGML_MAX_DIMS];
+                bsnd(pad_ne, pad_nb, D, N, K, 1, sizeof(uint16_t));
+                bsnd(q_b_ne, q_b_nb, D, N, q_len, 1, sizeof(uint16_t));
+                acl_tensor_ptr acl_q =
+                    ggml_cann_create_tensor(q_b, ACL_FLOAT16, sizeof(uint16_t), q_b_ne, q_b_nb, GGML_MAX_DIMS);
+                acl_tensor_ptr acl_q_pad =
+                    ggml_cann_create_tensor(q_pad, ACL_FLOAT16, sizeof(uint16_t), pad_ne, pad_nb, GGML_MAX_DIMS);
+                // paddings in ACL dim order: [D_f, D_b, N_f, N_b, S_f, S_b, B_f, B_b]
+                int64_t paddings[GGML_MAX_DIMS * 2] = { 0, 0, 0, 0, 0, K - q_len, 0, 0 };
+                aclnn_pad(ctx, acl_q.get(), acl_q_pad.get(), paddings);
+            }
+
+            // 2) bool mask buffer (1,1,K,K): fill false, then cast the f16 mask prefix (1,1,q_len,K)
+            ggml_cann_pool_alloc mask_allocator(ctx.pool());
+            void *               mask_buf = mask_allocator.alloc((size_t) K * K);
+            {
+                int64_t mask_full_ne[GGML_MAX_DIMS];
+                size_t  mask_full_nb[GGML_MAX_DIMS];
+                bsnd(mask_full_ne, mask_full_nb, K, K, 1, 1, 1);
+                acl_tensor_ptr acl_mask_full =
+                    ggml_cann_create_tensor(mask_buf, ACL_BOOL, sizeof(uint8_t), mask_full_ne, mask_full_nb, GGML_MAX_DIMS);
+                bool fill = false;
+                // note: ACL_BOOL scalar is one byte
+                acl_scalar_ptr acl_fill = ggml_cann_create_scalar(&fill, ACL_BOOL);
+                GGML_CANN_CALL_ACLNN_OP(ctx, InplaceFillScalar, acl_mask_full.get(), acl_fill.get());
+
+                // per-b f16 mask slab [K, q_len] -> ACL (1,1,q_len,K);
+                // keep src3's own strides (robust to non-contiguous masks)
+                int64_t mask_f16_ne[GGML_MAX_DIMS];
+                size_t  mask_f16_nb[GGML_MAX_DIMS];
+                for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                    mask_f16_ne[i] = (i < 4) ? src3->ne[i] : 1;
+                    mask_f16_nb[i] = src3->nb[i];
+                }
+                mask_f16_ne[3] = 1;  // per-b slab
+                acl_tensor_ptr acl_mask_f16 =
+                    ggml_cann_create_tensor(mask_b, ACL_FLOAT16, sizeof(uint16_t), mask_f16_ne, mask_f16_nb, GGML_MAX_DIMS);
+                int64_t        mask_dst_ne[GGML_MAX_DIMS];
+                size_t         mask_dst_nb[GGML_MAX_DIMS];
+                bsnd(mask_dst_ne, mask_dst_nb, K, q_len, 1, 1, 1);
+                acl_tensor_ptr acl_mask_bool =
+                    ggml_cann_create_tensor(mask_buf, ACL_BOOL, sizeof(uint8_t), mask_dst_ne, mask_dst_nb, GGML_MAX_DIMS);
+                // f16 0 -> false (keep), -inf -> true (masked)
+                aclnn_cast(ctx, acl_mask_f16.get(), acl_mask_bool.get(), ACL_BOOL);
+            }
+
+            // 3) PFA V3
+            int64_t            pad_ne[GGML_MAX_DIMS];
+            size_t             pad_nb[GGML_MAX_DIMS];
+            int64_t            kv_ne[GGML_MAX_DIMS];
+            size_t             kv_nb[GGML_MAX_DIMS];
+            bsnd(pad_ne, pad_nb, D, N, K, 1, sizeof(uint16_t));
+            bsnd(kv_ne, kv_nb, D, Nk, K, 1, sizeof(uint16_t));
             acl_tensor_ptr acl_q_pad =
                 ggml_cann_create_tensor(q_pad, ACL_FLOAT16, sizeof(uint16_t), pad_ne, pad_nb, GGML_MAX_DIMS);
-            // paddings in ACL dim order: [D_f, D_b, N_f, N_b, S_f, S_b, B_f, B_b]
-            int64_t paddings[GGML_MAX_DIMS * 2] = { 0, 0, 0, 0, 0, K - q_len, 0, 0 };
-            aclnn_pad(ctx, acl_q.get(), acl_q_pad.get(), paddings);
-        }
+            acl_tensor_ptr acl_k = ggml_cann_create_tensor(k_b, ACL_FLOAT16, sizeof(uint16_t), kv_ne, kv_nb, GGML_MAX_DIMS);
+            acl_tensor_ptr acl_v = ggml_cann_create_tensor(v_b, ACL_FLOAT16, sizeof(uint16_t), kv_ne, kv_nb, GGML_MAX_DIMS);
 
-        // 2) bool mask buffer (1,1,K,K): fill false, then cast the f16 mask prefix (1,1,q_len,K)
-        ggml_cann_pool_alloc mask_allocator(ctx.pool());
-        void *               mask_buf = mask_allocator.alloc((size_t) K * K);
-        {
-            int64_t mask_full_ne[GGML_MAX_DIMS];
-            size_t  mask_full_nb[GGML_MAX_DIMS];
-            bsnd(mask_full_ne, mask_full_nb, K, K, 1, 1, 1);
-            acl_tensor_ptr acl_mask_full =
-                ggml_cann_create_tensor(mask_buf, ACL_BOOL, sizeof(uint8_t), mask_full_ne, mask_full_nb, GGML_MAX_DIMS);
-            bool fill = false;
-            // note: ACL_BOOL scalar is one byte
-            acl_scalar_ptr acl_fill = ggml_cann_create_scalar(&fill, ACL_BOOL);
-            GGML_CANN_CALL_ACLNN_OP(ctx, InplaceFillScalar, acl_mask_full.get(), acl_fill.get());
-
-            // src3 ggml [K, q_len, 1, B] -> ACL (B,1,q_len,K); B == 1 here
-            acl_tensor_ptr acl_mask_f16 = ggml_cann_create_tensor(src3);
-            int64_t        mask_dst_ne[GGML_MAX_DIMS];
-            size_t         mask_dst_nb[GGML_MAX_DIMS];
-            bsnd(mask_dst_ne, mask_dst_nb, K, q_len, 1, 1, 1);
-            acl_tensor_ptr acl_mask_bool =
-                ggml_cann_create_tensor(mask_buf, ACL_BOOL, sizeof(uint8_t), mask_dst_ne, mask_dst_nb, GGML_MAX_DIMS);
-            // f16 0 -> false (keep), -inf -> true (masked)
-            aclnn_cast(ctx, acl_mask_f16.get(), acl_mask_bool.get(), ACL_BOOL);
-        }
-
-        // 3) PFA V3
-        int64_t            pad_ne[GGML_MAX_DIMS];
-        size_t             pad_nb[GGML_MAX_DIMS];
-        int64_t            kv_ne[GGML_MAX_DIMS];
-        size_t             kv_nb[GGML_MAX_DIMS];
-        bsnd(pad_ne, pad_nb, D, N, K, B, sizeof(uint16_t));
-        bsnd(kv_ne, kv_nb, D, Nk, K, B, sizeof(uint16_t));
-        acl_tensor_ptr acl_q_pad =
-            ggml_cann_create_tensor(q_pad, ACL_FLOAT16, sizeof(uint16_t), pad_ne, pad_nb, GGML_MAX_DIMS);
-        acl_tensor_ptr acl_k = ggml_cann_create_tensor(src1->data, ACL_FLOAT16, sizeof(uint16_t), kv_ne, kv_nb, GGML_MAX_DIMS);
-        acl_tensor_ptr acl_v = ggml_cann_create_tensor(src2->data, ACL_FLOAT16, sizeof(uint16_t), kv_ne, kv_nb, GGML_MAX_DIMS);
-
-        ggml_cann_pool_alloc out_f16_allocator(ctx.pool());
-        void *               out_f16 = out_f16_allocator.alloc((size_t) K * N * D * sizeof(uint16_t));
-        {
-            int64_t out_ne[GGML_MAX_DIMS];
-            size_t  out_nb[GGML_MAX_DIMS];
-            bsnd(out_ne, out_nb, D, N, K, B, sizeof(uint16_t));
-            acl_tensor_ptr acl_out =
-                ggml_cann_create_tensor(out_f16, ACL_FLOAT16, sizeof(uint16_t), out_ne, out_nb, GGML_MAX_DIMS);
-            int64_t mask_full_ne[GGML_MAX_DIMS];
-            size_t  mask_full_nb[GGML_MAX_DIMS];
-            bsnd(mask_full_ne, mask_full_nb, K, K, 1, 1, 1);
-            acl_tensor_ptr acl_mask_full =
-                ggml_cann_create_tensor(mask_buf, ACL_BOOL, sizeof(uint8_t), mask_full_ne, mask_full_nb, GGML_MAX_DIMS);
-
-            acl_int_array_ptr act_seq_lens = ggml_cann_create_int_array(&act_q, 1);
-            char layout[] = "BSND";
-            GGML_CANN_CALL_ACLNN_OP(ctx, PromptFlashAttentionV3, acl_q_pad.get(), acl_k.get(), acl_v.get(),
-                                    nullptr,                            // pseShift (unsupported on 310P)
-                                    acl_mask_full.get(),                // attenMask
-                                    act_seq_lens.get(),                 // actualSeqLengths
-                                    nullptr,                            // actualSeqLengthsKv
-                                    nullptr, nullptr, nullptr, nullptr, nullptr,  // quant scales
-                                    N, (double) scaleValue,
-                                    (int64_t) 2147483647, (int64_t) 2147483647,  // preTokens, nextTokens
-                                    layout, Nk,
-                                    (int64_t) 0,                        // sparseMode
-                                    (int64_t) 1,                        // innerPrecise
-                                    acl_out.get());
-        }
-
-        // 4) slice [0, q_len) along S and cast into dst (dst is already BSND contiguous)
-        {
-            acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
-            if (dst->type == GGML_TYPE_F16) {
+            ggml_cann_pool_alloc out_f16_allocator(ctx.pool());
+            void *               out_f16 = out_f16_allocator.alloc((size_t) K * N * D * sizeof(uint16_t));
+            {
                 int64_t out_ne[GGML_MAX_DIMS];
                 size_t  out_nb[GGML_MAX_DIMS];
-                bsnd(out_ne, out_nb, D, N, K, B, sizeof(uint16_t));
+                bsnd(out_ne, out_nb, D, N, K, 1, sizeof(uint16_t));
                 acl_tensor_ptr acl_out =
                     ggml_cann_create_tensor(out_f16, ACL_FLOAT16, sizeof(uint16_t), out_ne, out_nb, GGML_MAX_DIMS);
-                GGML_CANN_CALL_ACLNN_OP(ctx, Slice, acl_out.get(), (int64_t) -3, (int64_t) 0, q_len,
-                                        (int64_t) 1, acl_dst.get());
-            } else {
-                ggml_cann_pool_alloc sliced_allocator(ctx.pool());
-                void *               sliced_f16 =
-                    sliced_allocator.alloc((size_t) q_len * N * D * sizeof(uint16_t));
-                int64_t sliced_ne[GGML_MAX_DIMS];
-                size_t  sliced_nb[GGML_MAX_DIMS];
-                bsnd(sliced_ne, sliced_nb, D, N, q_len, B, sizeof(uint16_t));
-                acl_tensor_ptr acl_sliced =
-                    ggml_cann_create_tensor(sliced_f16, ACL_FLOAT16, sizeof(uint16_t), sliced_ne, sliced_nb,
-                                            GGML_MAX_DIMS);
-                int64_t out_ne[GGML_MAX_DIMS];
-                size_t  out_nb[GGML_MAX_DIMS];
-                bsnd(out_ne, out_nb, D, N, K, B, sizeof(uint16_t));
-                acl_tensor_ptr acl_out =
-                    ggml_cann_create_tensor(out_f16, ACL_FLOAT16, sizeof(uint16_t), out_ne, out_nb, GGML_MAX_DIMS);
-                GGML_CANN_CALL_ACLNN_OP(ctx, Slice, acl_out.get(), (int64_t) -3, (int64_t) 0, q_len,
-                                        (int64_t) 1, acl_sliced.get());
-                aclnn_cast(ctx, acl_sliced.get(), acl_dst.get(), ggml_cann_type_mapping(dst->type));
+                int64_t mask_full_ne[GGML_MAX_DIMS];
+                size_t  mask_full_nb[GGML_MAX_DIMS];
+                bsnd(mask_full_ne, mask_full_nb, K, K, 1, 1, 1);
+                acl_tensor_ptr acl_mask_full =
+                    ggml_cann_create_tensor(mask_buf, ACL_BOOL, sizeof(uint8_t), mask_full_ne, mask_full_nb, GGML_MAX_DIMS);
+
+                acl_int_array_ptr act_seq_lens = ggml_cann_create_int_array(&act_q, 1);
+                char layout[] = "BSND";
+                GGML_CANN_CALL_ACLNN_OP(ctx, PromptFlashAttentionV3, acl_q_pad.get(), acl_k.get(), acl_v.get(),
+                                        nullptr,                            // pseShift (unsupported on 310P)
+                                        acl_mask_full.get(),                // attenMask
+                                        act_seq_lens.get(),                 // actualSeqLengths
+                                        nullptr,                            // actualSeqLengthsKv
+                                        nullptr, nullptr, nullptr, nullptr, nullptr,  // quant scales
+                                        N, (double) scaleValue,
+                                        (int64_t) 2147483647, (int64_t) 2147483647,  // preTokens, nextTokens
+                                        layout, Nk,
+                                        (int64_t) 0,                        // sparseMode
+                                        (int64_t) 1,                        // innerPrecise
+                                        acl_out.get());
+            }
+
+            // 4) slice [0, q_len) along S and cast into the per-b dst slab
+            {
+                int64_t dst_ne[GGML_MAX_DIMS];
+                size_t  dst_nb[GGML_MAX_DIMS];
+                for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                    dst_ne[i] = (i < 4) ? dst->ne[i] : 1;
+                    dst_nb[i] = dst->nb[i];
+                }
+                dst_ne[3] = 1;  // per-b slab
+                acl_tensor_ptr acl_dst =
+                    ggml_cann_create_tensor(dst_b, ggml_cann_type_mapping(dst->type),
+                                            ggml_type_size(dst->type), dst_ne, dst_nb, GGML_MAX_DIMS);
+                if (dst->type == GGML_TYPE_F16) {
+                    int64_t out_ne[GGML_MAX_DIMS];
+                    size_t  out_nb[GGML_MAX_DIMS];
+                    bsnd(out_ne, out_nb, D, N, K, 1, sizeof(uint16_t));
+                    acl_tensor_ptr acl_out =
+                        ggml_cann_create_tensor(out_f16, ACL_FLOAT16, sizeof(uint16_t), out_ne, out_nb, GGML_MAX_DIMS);
+                    GGML_CANN_CALL_ACLNN_OP(ctx, Slice, acl_out.get(), (int64_t) -3, (int64_t) 0, q_len,
+                                            (int64_t) 1, acl_dst.get());
+                } else {
+                    ggml_cann_pool_alloc sliced_allocator(ctx.pool());
+                    void *               sliced_f16 =
+                        sliced_allocator.alloc((size_t) q_len * N * D * sizeof(uint16_t));
+                    int64_t sliced_ne[GGML_MAX_DIMS];
+                    size_t  sliced_nb[GGML_MAX_DIMS];
+                    bsnd(sliced_ne, sliced_nb, D, N, q_len, 1, sizeof(uint16_t));
+                    acl_tensor_ptr acl_sliced =
+                        ggml_cann_create_tensor(sliced_f16, ACL_FLOAT16, sizeof(uint16_t), sliced_ne, sliced_nb,
+                                                GGML_MAX_DIMS);
+                    int64_t out_ne[GGML_MAX_DIMS];
+                    size_t  out_nb[GGML_MAX_DIMS];
+                    bsnd(out_ne, out_nb, D, N, K, 1, sizeof(uint16_t));
+                    acl_tensor_ptr acl_out =
+                        ggml_cann_create_tensor(out_f16, ACL_FLOAT16, sizeof(uint16_t), out_ne, out_nb, GGML_MAX_DIMS);
+                    GGML_CANN_CALL_ACLNN_OP(ctx, Slice, acl_out.get(), (int64_t) -3, (int64_t) 0, q_len,
+                                            (int64_t) 1, acl_sliced.get());
+                    aclnn_cast(ctx, acl_sliced.get(), acl_dst.get(), ggml_cann_type_mapping(dst->type));
+                }
             }
         }
     }

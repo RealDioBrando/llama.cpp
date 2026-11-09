@@ -29,6 +29,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <vector>
 
 /**
  * @brief	Maps a ggml_type to its corresponding aclDataType.
@@ -198,6 +199,34 @@ template <typename... acl_tensor_ptr> acl_tensor_list_ptr ggml_cann_create_tenso
     int             dummy[]       = { (tensors.release(), 0)... };
     GGML_UNUSED(dummy);
     return acl_tensor_list_ptr(raw);
+}
+
+/**
+ * @brief Create an ACL tensor list from a runtime-sized vector of tensors.
+ *
+ * Same ownership contract as the variadic overload above, for call sites
+ * whose entry count is only known at run time (e.g. the per-batch-element
+ * k/v lists consumed by aclnnIncreFlashAttentionV4, one entry per sequence
+ * in the ubatch).
+ *
+ * @param tensors  Vector of acl_tensor_ptr. Ownership of each tensor is
+ *                 transferred to the created list (each pointer is released).
+ *
+ * @return A smart pointer (acl_tensor_list_ptr) owning the created ACL tensor list.
+ */
+inline acl_tensor_list_ptr ggml_cann_create_tensor_list(std::vector<acl_tensor_ptr> & tensors) {
+    std::vector<aclTensor *> raw;
+    raw.reserve(tensors.size());
+    for (auto & t : tensors) {
+        raw.push_back(t.get());
+    }
+    aclTensorList * list = aclCreateTensorList(raw.data(), raw.size());
+    // aclTensor will release by aclTensorList, so release ownership without
+    // destroying the tensor
+    for (auto & t : tensors) {
+        t.release();
+    }
+    return acl_tensor_list_ptr(list);
 }
 
 /**
