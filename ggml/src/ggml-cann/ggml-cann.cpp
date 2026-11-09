@@ -3316,6 +3316,8 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 
 #ifdef USE_ACL_GRAPH
     if (use_cann_graph && cann_graph_capture_required) {  // Begin CANN graph capture
+        auto * capture_graph = cann_ctx->graph_lru_cache.cache_list.front();
+        capture_graph->rope_refs.clear();
         ACL_CHECK(aclmdlRICaptureBegin(cann_ctx->stream(), ACL_MODEL_RI_CAPTURE_MODE_GLOBAL));
         cann_ctx->capturing = true;
         // Register the OOM relief hook: evicts every cached graph except
@@ -3401,6 +3403,14 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
         }
 
         // Execute CANN graph
+        for (const auto & ref : matched_graph->rope_refs) {
+            const auto & cache = cann_ctx->rope_cache;
+            const bool live = cache.generation_live(ref[0]);
+            const bool params = ref[1] == cache.param_epoch;
+            if (cache.lifetime_fix()) {
+                GGML_ASSERT(live && params && ref[2]);
+            }
+        }
         ACL_CHECK(aclmdlRIExecuteAsync(matched_graph->graph, cann_ctx->stream()));
 
     }
@@ -3422,6 +3432,9 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
     ggml_cann_set_device(cann_ctx->device);
+#ifdef USE_ACL_GRAPH
+    GGML_ASSERT(!(cann_ctx->rope_cache.lifetime_fix() && cann_ctx->piecewise_mode));
+#endif
     // One-time summary of the switch state for this run.
     {
         static bool config_printed = false;
@@ -3966,9 +3979,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             return true;
         case GGML_OP_GATED_DELTA_NET:
             {
-                // fused path via the standard 310P APIs: decode is a single
-                // recurrent call, prefill is a single chunk call (8-token block
-                // loop as fallback)
+                // Select chunk or recurrent from shape and snapshot requirements.
                 if (!ggml_cann_gdn_available()) {
                     return false;
                 }
@@ -3979,8 +3990,8 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 if (g->ne[0] != 1) {
                     return false;
                 }
-                // single state snapshot
-                if (ggml_get_op_params_i32(op, 0) != 1) {
+                // Snapshot support is checked before submitting to ACLNN.
+                if (ggml_get_op_params_i32(op, 0) != 1 && !ggml_cann_gdn_snapshots_supported(op)) {
                     return false;
                 }
                 // kernel fold reduction is only correct for head dim 64 and 128, other sizes run on CPU
