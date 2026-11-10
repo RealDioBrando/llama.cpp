@@ -11,7 +11,7 @@ REPO_ID = "maoxx241/textvqa_subset"
 
 
 def http_get(url: str, output: Path | None = None) -> bytes:
-    request = urllib.request.Request(url, headers={"User-Agent": "llama-perf-regression"})
+    request = urllib.request.Request(url, headers={"User-Agent": "llama-model-integration"})
     with urllib.request.urlopen(request, timeout=120) as response:
         data = response.read()
     if output is not None:

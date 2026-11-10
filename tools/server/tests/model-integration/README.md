@@ -1,4 +1,4 @@
-# Performance regression cases
+# Model integration tests
 
 This directory contains three repeatable AISBench cases for llama-server and a vLLM Ascend baseline:
 
@@ -28,7 +28,7 @@ restore GPU offloading when that path is fixed.
 The scripts derive the repository root from their own location:
 
 ```bash
-llama.cpp/tests/perf_regression
+llama.cpp/tools/server/tests/model-integration
 ```
 
 Run from the CANN container. The default NPU is device 7, but every model path is supplied through environment variables.
