@@ -1,6 +1,7 @@
 #include "server-scheduler-paged.h"
 
 #include "common.h"
+#include "src/llama-context.h"
 #include "log.h"
 #include "mtmd.h"
 #include "sampling.h"
@@ -26,6 +27,34 @@ static bool paged_task_supported(const server_task & task) {
             return false;
     }
     return true;
+}
+
+static int paged_graph_phase(struct llama_paged_scheduler * sched,
+                             const llama_paged_batch_info * info,
+                             const llama_batch & batch) {
+    bool has_prompt = false;
+    bool has_decode = false;
+
+    for (int i = 0; i < info->n_seq; ++i) {
+        llama_paged_seq_state st = {};
+        const int32_t off = info->batch_offsets[i];
+        if (!llama_paged_scheduler_get_seq_state(sched, batch.seq_id[off][0], &st)) {
+            has_prompt = true;
+            continue;
+        }
+
+        // before the last prompt rows are decoded, n_past is still below the
+        // full prompt length. keep those steps eager so prefill masks and
+        // changing shapes never enter graph capture.
+        if (st.n_past < st.n_prompt_total) {
+            has_prompt = true;
+        } else {
+            has_decode = true;
+        }
+    }
+
+    return has_prompt ? (has_decode ? GGML_GRAPH_PHASE_MIXED : GGML_GRAPH_PHASE_PREFILL)
+                      : GGML_GRAPH_PHASE_DECODE;
 }
 
 server_scheduler_paged::~server_scheduler_paged() {
@@ -75,7 +104,16 @@ bool server_scheduler_paged::init() {
 
     // warm the clip encoder so the first image request does not pay the
     // clip graph first-compile cost
-    mm_warmup();
+    // The synthetic-image warmup can abort on unsupported vision RoPE shapes.
+    // Allow it to be disabled for headless accuracy runs.
+    if (getenv("LLAMA_PAGED_MM_WARMUP") != nullptr) {
+        const char * mm_warmup_env = getenv("LLAMA_PAGED_MM_WARMUP");
+        if (mm_warmup_env[0] != '0') {
+            mm_warmup();
+        }
+    } else {
+        mm_warmup();
+    }
 
     SRV_INF("%s", "paged scheduler initialized\n");
     return true;
@@ -424,6 +462,11 @@ void server_scheduler_paged::update() {
     n_empty_steps = 0;
 
     port.metrics_pre_decode();
+
+    const llama_paged_batch_info * preflight_info = llama_paged_scheduler_get_batch_info(sched);
+    if (preflight_info != nullptr) {
+        port.ctx()->graph_decode_mode = paged_graph_phase(sched, preflight_info, paged_batch);
+    }
 
     if (llama_decode(port.ctx(), paged_batch) != 0) {
         llama_synchronize(port.ctx());

@@ -1,4 +1,5 @@
 import base64
+import os
 import random
 
 from datasets import Dataset
@@ -16,7 +17,9 @@ class NullEvaluator(BaseEvaluator):
 class FixedTokenDataset(BaseDataset):
     @staticmethod
     def load(path, input_tokens=4096, request_count=10):
-        model_path = "/home/common/model/qwen3/Qwen3-1.7B"
+        model_path = os.environ.get("QWEN3_1_7B_PATH") or os.environ.get("TOKENIZER_PATH")
+        if not model_path:
+            raise ValueError("QWEN3_1_7B_PATH or TOKENIZER_PATH must be set")
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
         vocab_size = getattr(tokenizer, "vocab_size", None) or len(tokenizer)
         special_ids = set(tokenizer.all_special_ids)

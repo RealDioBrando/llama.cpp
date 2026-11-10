@@ -10,13 +10,13 @@ ROOT=${PERF_REGRESSION_ROOT:-$(dirname "${SCRIPT_DIR}")}
 
 case "${SCENARIO}" in
   text_10c)
-    DEFAULT_MODEL=/home/common/model/qwen3/Qwen3-1.7B
+    DEFAULT_MODEL=${VLLM_TEXT_MODEL:-${VLLM_MODEL:-}}
     DEFAULT_PORT=18110
     DEFAULT_MAX_LEN=12288
     DEFAULT_MAX_SEQS=16
     ;;
   vl_small|vl_large)
-    DEFAULT_MODEL=/home/common/model/qwen3/Qwen3-VL-4B-Instruct
+    DEFAULT_MODEL=${VLLM_VL_MODEL:-${VLLM_MODEL:-}}
     DEFAULT_PORT=18120
     DEFAULT_MAX_LEN=8192
     DEFAULT_MAX_SEQS=4
@@ -29,6 +29,10 @@ case "${SCENARIO}" in
 esac
 
 MODEL=${VLLM_MODEL:-${DEFAULT_MODEL}}
+if [[ -z "${MODEL}" ]]; then
+  echo "vLLM model path is not set; use VLLM_MODEL, VLLM_TEXT_MODEL or VLLM_VL_MODEL" >&2
+  exit 1
+fi
 PORT=${PERF_SERVER_PORT:-${DEFAULT_PORT}}
 MAX_LEN=${PERF_VLLM_MAX_LEN:-${DEFAULT_MAX_LEN}}
 MAX_SEQS=${PERF_VLLM_MAX_SEQS:-${DEFAULT_MAX_SEQS}}

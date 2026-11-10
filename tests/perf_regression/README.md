@@ -10,25 +10,40 @@ This directory contains three repeatable AISBench cases for llama-server and a v
 
 The llama.cpp case enables the CANN fast paths: ACL graph, FA V5, F16 activation cache, weight NZ, and the available GDN prefill/decode fused paths. GDN operators are model-dependent; they are enabled by environment variables and are skipped automatically when a model has no GDN layers.
 
+Accuracy cases use AISBench. The text case uses GSM8K and the VL case uses
+TextVQA val images from OpenImages. `run_all.py` uses the first 30 unique
+TextVQA images by default. To use the full dataset, pass `--accuracy-full`
+or set `--accuracy-num-prompts 0`.
+
+TextVQA generation is capped at 16 tokens. The VQA evaluator accepts a
+prediction when the normalized reference answer is its prefix, so a short
+answer followed by descriptive text is not counted as a mismatch.
+
+The VL cases use `--no-mmproj-offload` by default because the CANN GPU CLIP
+RoPE path aborts on the tested build. Set `PERF_LLAMA_MMPROJ_OFFLOAD=1` to
+restore GPU offloading when that path is fixed.
+
 ## Remote layout
 
-Copy this directory to:
+The scripts derive the repository root from their own location:
 
 ```bash
-/home/z00575061/llama.cpp-develop-qwen3-20261102/tests/perf_regression
+llama.cpp/tests/perf_regression
 ```
 
-Run from the CANN container. The default NPU is device 7.
+Run from the CANN container. The default NPU is device 7, but every model path is supplied through environment variables.
 
 ## Build and prepare
 
 ```bash
-cd /home/z00575061/perf_regression
 chmod +x scripts/*.sh
 python scripts/prepare_assets.py
+python scripts/prepare_accuracy_assets.py
 python scripts/validate_env.py
-LLAMA_SOURCE=/home/z00575061/llama.cpp-develop-qwen3-20261102 \
-  scripts/build_llama.sh
+LLAMA_TEXT_MODEL=/path/to/Qwen3-1.7B-F16.gguf \
+LLAMA_VL_MODEL=/path/to/Qwen3VL-4B-Instruct-F16.gguf \
+  python scripts/validate_env.py
+scripts/build_llama.sh
 ```
 
 `validate_env.py` fails if the llama-server build was not rebuilt with `USE_ACL_GRAPH=ON`.
@@ -38,7 +53,7 @@ LLAMA_SOURCE=/home/z00575061/llama.cpp-develop-qwen3-20261102 \
 llama.cpp:
 
 ```bash
-LLAMA_MODEL=/home/z00575061/models/Qwen3-1.7B-F16.gguf \
+LLAMA_TEXT_MODEL=/path/to/Qwen3-1.7B-F16.gguf \
 PERF_LLAMA_CTX=65536 \
 PERF_LLAMA_PARALLEL=10 \
 scripts/run_llama_server.sh
@@ -47,11 +62,18 @@ scripts/run_llama_server.sh
 vLLM baseline:
 
 ```bash
-VLLM_MODEL=/home/c30081098/models/Qwen3-1.7B \
+VLLM_TEXT_MODEL=/path/to/Qwen3-1.7B \
 scripts/run_vllm_server.sh
 ```
 
-For Qwen3 VL, change `LLAMA_MODEL` to `/home/common/model/qwen3/Qwen3-VL-4B-Instruct/Qwen3VL-4B-Instruct-F16.gguf`. The server uses `--mmproj-auto` because the GGUF contains the projector.
+For Qwen3 VL, set:
+
+```bash
+export LLAMA_VL_MODEL=/path/to/Qwen3VL-4B-Instruct-F16.gguf
+export VLLM_VL_MODEL=/path/to/Qwen3-VL-4B-Instruct
+```
+
+The server uses `--mmproj-auto` because the GGUF contains the projector. If the projector is a separate GGUF, set `LLAMA_VL_MMPROJ=/path/to/Qwen3VL-4B-Instruct-mmproj-f16.gguf`.
 
 ## Run cases
 
@@ -79,6 +101,19 @@ Generate the comparison:
 
 ```bash
 python scripts/compare_report.py
+```
+
+Run accuracy only:
+
+```bash
+python scripts/run_all.py --engine llama --scenario text_10c --accuracy-mode only
+python scripts/run_all.py --engine llama --scenario vl_small --accuracy-mode only
+```
+
+Run the full accuracy datasets:
+
+```bash
+python scripts/run_all.py --engine llama --scenario all --accuracy-mode only --accuracy-full
 ```
 
 Raw AISBench outputs are under `results/<engine>/<scenario>/<timestamp>`. Aggregated data is written to `results/summary.json`, `results/summary.md`, and `results/comparison.md`.

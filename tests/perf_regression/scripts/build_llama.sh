@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-LLAMA_SOURCE=${LLAMA_SOURCE:-/home/z00575061/llama.cpp-paged-integration-latest}
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+LLAMA_SOURCE=${LLAMA_SOURCE:-$(cd "${SCRIPT_DIR}/../.." && pwd)}
 BUILD_DIR=${LLAMA_BUILD_DIR:-${LLAMA_SOURCE}/build-cann-aclgraph}
 
 cmake -S "${LLAMA_SOURCE}" -B "${BUILD_DIR}" \

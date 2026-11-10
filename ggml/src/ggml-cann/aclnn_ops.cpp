@@ -2449,11 +2449,11 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
     switch (n_dims) {
         case 2:
             if (f16_prefill && weight_is_nz) {
-                // aclnnMm rejects FRACTAL_NZ weights, so aclnnMatmul is the
-                // fast path. Its tiling fails on some M boundaries (a
-                // -ub 2048 warmup builds M=2048, one of them), so probe
-                // first and fall back to the stable F32-activation Mm path
-                // when the probe rejects the shape.
+                // aclnnMatmul is the F16/NZ prefill fast path. CANN tiling
+                // rejects some M and mat2 shape combinations (M=2048 with
+                // K=2560/N=4096 is one), while ND mat2 or other NZ shapes
+                // can pass. Probe the executor first and use the stable
+                // F32-activation Mm path for rejected shapes.
                 uint64_t       probe_ws   = 0;
                 aclOpExecutor * probe_exec = nullptr;
                 if (aclnnMatmulGetWorkspaceSize(acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(),
@@ -3608,7 +3608,7 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     // The composite path below only supports full-width rotation
     // (n_dims == ne[0]); partial rope falls through to the generic
     // RotaryPositionEmbedding path (head/tail split).
-    if (!has_tail) {
+    if (!has_tail && n_dims == src0->ne[0]) {
     // Special ROPE operation for 310P
 
     // roll input
@@ -3694,7 +3694,7 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     }
 
     // TODO: n_dims < ne0
-    GGML_ASSERT(n_dims == src0->ne[0]);
+    GGML_ASSERT(n_dims == src0->ne[0] || is_vision);
 
     // input * scale
     ggml_cann_pool_alloc roll_mul_scale_allocator(ctx.pool(), ggml_nbytes(src0));

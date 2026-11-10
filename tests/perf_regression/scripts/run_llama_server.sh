@@ -7,18 +7,48 @@ SCENARIO=${1:-text_10c}
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=${PERF_REGRESSION_ROOT:-$(dirname "${SCRIPT_DIR}")}
-BUILD_DIR=${LLAMA_BUILD_DIR:-/home/z00575061/llama.cpp-paged-integration-latest/build-cann-aclgraph}
+REPO_ROOT=${LLAMA_SOURCE:-$(cd "${SCRIPT_DIR}/../.." && pwd)}
+BUILD_DIR=${LLAMA_BUILD_DIR:-${REPO_ROOT}/build-cann-aclgraph}
 
-# Source CANN environment and ATB libs so the server can find libascendcl etc.
-if [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
-  source /usr/local/Ascend/ascend-toolkit/set_env.sh
+# Source CANN and ATB environments so the server can find libascendcl and ATB.
+ASCEND_HOME=${ASCEND_HOME:-/usr/local/Ascend}
+CANN_SET_ENV=${CANN_SET_ENV:-}
+ATB_SET_ENV=${ATB_SET_ENV:-}
+
+if [[ -z "${CANN_SET_ENV}" && -n "${ASCEND_TOOLKIT_HOME:-}" ]]; then
+  CANN_SET_ENV="${ASCEND_TOOLKIT_HOME}/set_env.sh"
 fi
-export LD_LIBRARY_PATH=/home/z00575061/atb_home/lib:/usr/local/Ascend/cann-9.1.0/aarch64-linux/lib64:${LD_LIBRARY_PATH:-}
+if [[ -z "${CANN_SET_ENV}" && -f "${ASCEND_HOME}/ascend-toolkit/set_env.sh" ]]; then
+  CANN_SET_ENV="${ASCEND_HOME}/ascend-toolkit/set_env.sh"
+fi
+if [[ -z "${ATB_SET_ENV}" && -f "${ASCEND_HOME}/nnal/atb/set_env.sh" ]]; then
+  ATB_SET_ENV="${ASCEND_HOME}/nnal/atb/set_env.sh"
+fi
+
+if [[ -n "${CANN_SET_ENV}" && -f "${CANN_SET_ENV}" ]]; then
+  set +u
+  source "${CANN_SET_ENV}"
+  set -u
+fi
+
+if [[ -n "${ATB_SET_ENV}" && -f "${ATB_SET_ENV}" ]]; then
+  set +u
+  source "${ATB_SET_ENV}"
+  set -u
+fi
+
+# Keep these as fallbacks for images where the env scripts are not installed.
+if [[ -n "${ASCEND_TOOLKIT_HOME:-}" && -d "${ASCEND_TOOLKIT_HOME}/aarch64-linux/lib64" ]]; then
+  export LD_LIBRARY_PATH="${ASCEND_TOOLKIT_HOME}/aarch64-linux/lib64:${LD_LIBRARY_PATH:-}"
+fi
+if [[ -n "${ATB_HOME_PATH:-}" && -d "${ATB_HOME_PATH}/lib" ]]; then
+  export LD_LIBRARY_PATH="${ATB_HOME_PATH}/lib:${LD_LIBRARY_PATH:-}"
+fi
 
 # Per-scenario defaults (overridable by env vars)
 case "${SCENARIO}" in
   text_10c)
-    DEFAULT_MODEL=/home/common/model/qwen3/Qwen3-1.7B-F16.gguf
+    DEFAULT_MODEL=${LLAMA_TEXT_MODEL:-${LLAMA_MODEL:-}}
     DEFAULT_MMPROJ=""
     DEFAULT_PORT=18112
     DEFAULT_CTX=8192
@@ -26,8 +56,8 @@ case "${SCENARIO}" in
     DEFAULT_ACT_TYPE=f16
     ;;
   vl_small|vl_large)
-    DEFAULT_MODEL=/home/common/model/qwen3/Qwen3-VL-4B-Instruct/Qwen3VL-4B-Instruct-F16.gguf
-    DEFAULT_MMPROJ=/home/common/model/qwen3/Qwen3-VL-4B-Instruct/Qwen3VL-4B-Instruct-mmproj-f16.gguf
+    DEFAULT_MODEL=${LLAMA_VL_MODEL:-${LLAMA_MODEL:-}}
+    DEFAULT_MMPROJ=${LLAMA_VL_MMPROJ:-${LLAMA_MMPROJ:-}}
     DEFAULT_PORT=18113
     DEFAULT_CTX=32768
     DEFAULT_PARALLEL=4
@@ -41,6 +71,10 @@ case "${SCENARIO}" in
 esac
 
 MODEL=${LLAMA_MODEL:-${DEFAULT_MODEL}}
+if [[ -z "${MODEL}" ]]; then
+  echo "llama model path is not set; use LLAMA_MODEL, LLAMA_TEXT_MODEL or LLAMA_VL_MODEL" >&2
+  exit 1
+fi
 PORT=${PERF_SERVER_PORT:-${DEFAULT_PORT}}
 CTX=${PERF_LLAMA_CTX:-${DEFAULT_CTX}}
 PARALLEL=${PERF_LLAMA_PARALLEL:-${DEFAULT_PARALLEL}}
@@ -69,6 +103,10 @@ ACT_ARGS=()
 if [[ "${ACT_TYPE}" != "none" ]]; then
   ACT_ARGS=(-at "${ACT_TYPE}")
 fi
+MMPROJ_OFFLOAD_ARGS=()
+if [[ "${PERF_LLAMA_MMPROJ_OFFLOAD:-0}" != "1" ]]; then
+  MMPROJ_OFFLOAD_ARGS=(--no-mmproj-offload)
+fi
 
 "${BUILD_DIR}/bin/llama-server" \
   -m "${MODEL}" \
@@ -87,9 +125,10 @@ fi
   -b 2048 \
   -ub 2048 \
   "${ACT_ARGS[@]}" \
+  "${MMPROJ_OFFLOAD_ARGS[@]}" \
   --metrics \
   "${MMPROJ_ARGS[@]}" \
-  2>&1 | tee "${LOG}" &
+  >"${LOG}" 2>&1 &
 PID=$!
 echo "${PID}" > "${ROOT}/run/llama-server-${PORT}.pid"
 trap 'kill "${PID}" 2>/dev/null || true' EXIT INT TERM
