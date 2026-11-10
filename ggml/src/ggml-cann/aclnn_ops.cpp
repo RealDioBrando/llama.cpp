@@ -3694,7 +3694,7 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     }
 
     // TODO: n_dims < ne0
-    GGML_ASSERT(n_dims == src0->ne[0] || is_vision);
+    GGML_ASSERT(n_dims == src0->ne[0] || is_vision || mrope_used);
 
     // input * scale
     ggml_cann_pool_alloc roll_mul_scale_allocator(ctx.pool(), ggml_nbytes(src0));
