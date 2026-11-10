@@ -19,9 +19,9 @@ TextVQA generation is capped at 16 tokens. The VQA evaluator accepts a
 prediction when the normalized reference answer is its prefix, so a short
 answer followed by descriptive text is not counted as a mismatch.
 
-The VL cases use `--no-mmproj-offload` by default because the CANN GPU CLIP
-RoPE path aborts on the tested build. Set `PERF_LLAMA_MMPROJ_OFFLOAD=1` to
-restore GPU offloading when that path is fixed.
+The VL cases enable mmproj offload by default. Set
+`PERF_LLAMA_MMPROJ_OFFLOAD=0` to keep the CLIP encoder on CPU when
+debugging CANN-specific regressions.
 
 ## Remote layout
 

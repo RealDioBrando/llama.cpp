@@ -104,7 +104,7 @@ if [[ "${ACT_TYPE}" != "none" ]]; then
   ACT_ARGS=(-at "${ACT_TYPE}")
 fi
 MMPROJ_OFFLOAD_ARGS=()
-if [[ "${PERF_LLAMA_MMPROJ_OFFLOAD:-0}" != "1" ]]; then
+if [[ "${PERF_LLAMA_MMPROJ_OFFLOAD:-1}" != "1" ]]; then
   MMPROJ_OFFLOAD_ARGS=(--no-mmproj-offload)
 fi
 
