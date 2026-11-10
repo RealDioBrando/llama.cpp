@@ -14,7 +14,7 @@ llama_paged_tag_manager::snapshot llama_paged_tag_manager::materialize(
 
     // owned: reusable blocks grouped by the owner tag stored on the physical
     // block. collect_tag_blocks() applies the liveness filter (GPU-resident,
-    // referenced, generation unchanged).
+    // still owning the hash; ref_count may be 0 for cache-resident blocks).
     std::unordered_set<uint32_t> reusable_full;
     full_cache->collect_tag_blocks(s.owned_full, &reusable_full);
     if (linear_cache != nullptr) {
@@ -148,11 +148,15 @@ llama_paged_pool_stats llama_paged_tag_manager::block_stats() const {
 
     out.full.total_blocks = full_cache->get_num_gpu_blocks();
     out.full.free_blocks  = full_cache->n_free_gpu_blocks();
+    out.full.cached_blocks = full_cache->n_cached_gpu_blocks();
+    out.full.allocatable_blocks = full_cache->n_allocatable_gpu_blocks();
     out.full.used_blocks  = out.full.total_blocks - out.full.free_blocks;
 
     if (linear_cache != nullptr) {
         out.linear.total_blocks = linear_cache->get_num_gpu_blocks();
         out.linear.free_blocks  = linear_cache->n_free_gpu_blocks();
+        out.linear.cached_blocks = linear_cache->n_cached_gpu_blocks();
+        out.linear.allocatable_blocks = linear_cache->n_allocatable_gpu_blocks();
         out.linear.used_blocks  = out.linear.total_blocks - out.linear.free_blocks;
     }
     return out;

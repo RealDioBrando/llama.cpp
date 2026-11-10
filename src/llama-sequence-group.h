@@ -43,7 +43,6 @@ struct llama_prefix_candidate {
     uint64_t  checkpoint_hash = 0;
 
     std::vector<uint32_t> block_ids;    // [n_blocks]
-    std::vector<uint32_t> generations;  // [n_blocks] KV block generations
     std::vector<uint64_t> hashes;       // [n_blocks] chain hashes
 };
 

@@ -352,8 +352,9 @@ void llama_paged_scheduler_impl::finish(llama_sequence_group & group) {
     } else {
         LLAMA_LOG_DEBUG("%s: Request: %d generated %d tokens.\n", __func__, group.request_id, group.n_decoded);
     }
-    // Registered prefix blocks stay cache-resident (ref stays 1) until
-    // evicted under allocation pressure; the linear active state is released.
+    // Released blocks return to the free queue with their hash retained: they
+    // stay cache-resident (ref_count == 0) until a checkout evicts them. The
+    // linear active state is released here.
     cache_manager->release_request(group);
 }
 
@@ -477,10 +478,10 @@ void llama_paged_scheduler_impl::process_running_list(llama_sequence_group_raw_l
             LLAMA_LOG_DEBUG("%s: (running_pending) request_id=%d: requires a new block to decode.\n", __func__,
                             group->request_id);
             bool success = cache_manager->allocate_blocks(*group, rows);  // decode phase
-            while (!success && cache_manager->evict_cached_blocks()) {
-                success = cache_manager->allocate_blocks(*group, rows);
-            }
             if (!success) {
+                // Allocation evicts cache-resident prefix blocks lazily. A
+                // failure now means the pool cannot satisfy the request even
+                // after eviction, so fall through to request preemption.
                 if (running.size() > 1) {
                     llama_sequence_group_ptr victim = evict();
                     if (victim) {
@@ -573,11 +574,8 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
     llama_sequence_group * group = waiting->peek();
     GGML_ASSERT(group && "the waiting group is nullptr.");
 
-    // The cache may have grown since this request was queued.
-    if (!cache_manager->reserve_prefix_candidate(*group)) {
-        return;
-    }
-
+    // Budget gate first: do not take any reservation for a step that cannot
+    // run the request anyway. While waiting, n_prompt == n_prompt_total.
     const int32_t chunk_tokens = std::min<int32_t>((int32_t) group->n_prompt, row_budget);
     if (chunk_tokens <= 0) {
         // Do not leave a WAITING request holding refs / an active state block.
@@ -587,18 +585,15 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
         return;  // token budget exhausted for this step
     }
 
-    // Reserve the full prompt plus one decode slot; only chunk_tokens run now.
-    bool success = cache_manager->allocate_blocks(*group, 1);
-    while (!success && cache_manager->evict_cached_blocks()) {
-        success = cache_manager->allocate_blocks(*group, 1);
-    }
-    if (!success) {
+    // Admission transaction: linear ACTIVE state block + prefix refs + full
+    // KV slots succeed or fail together. On failure the reservation was rolled
+    // back inside the manager, so the request simply stays at the head of the
+    // waiting queue (vLLM allocate_slots() semantics; no partial scheduling).
+    // `1` reserves the full prompt plus one decode slot: allocate() adds
+    // n_past + n_prompt internally and only `chunk_tokens` rows run now.
+    if (!cache_manager->allocate_blocks(*group, 1)) {
         // Strict head-of-queue semantics (matches vLLM): do not skip an
-        // inadmissible head to serve later requests. Drop the reservation so
-        // a waiting request never holds block refs or an active state block.
-        cache_manager->release_request(*group);
-        group->n_past   = 0;
-        group->n_prompt = group->n_prompt_total;
+        // inadmissible head to serve later requests.
         LLAMA_LOG_DEBUG("%s: head request_id=%d (prio=%d) is inadmissible, stop scheduling waiting this step\n",
                         __func__, group->request_id, group->priority);
         return;
@@ -1052,8 +1047,10 @@ bool llama_paged_scheduler_impl::fork_request(int32_t src_id, int32_t dst_id) {
     child.cache_reserved   = true;
     child.status = llama_sequence_group_status::PENDING;
 
-    if (!cache_manager->full()->add_ref_blocks(child.block_table)) {
-        cache_manager->full()->free_blocks(child);
+    // The parent may be running (blocks live) or finished (blocks are
+    // cache-resident in the free queue). acquire_blocks handles both and is
+    // all-or-nothing, so no compensating free is needed on failure.
+    if (!cache_manager->full()->acquire_blocks(child.block_table)) {
         LLAMA_LOG_ERROR("%s: failed to share blocks for dst request %d.\n", __func__, dst_id);
         return false;
     }

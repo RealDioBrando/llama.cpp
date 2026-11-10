@@ -120,20 +120,15 @@ public:
 
     uint32_t n_free_gpu_blocks() const;
     uint32_t n_free_cpu_blocks() const;
+    uint32_t n_allocatable_gpu_blocks() const;
+    uint32_t n_cached_gpu_blocks() const;
     uint32_t get_num_gpu_blocks() const;
     uint32_t get_num_cpu_blocks() const;
     bool     has_free_gpu_blocks(uint32_t n) const;
     bool     has_free_cpu_blocks(uint32_t n) const;
 
-    // GPU-cached checkpoints may be demoted to the CPU pool under GPU
-    // pressure; CACHED blocks may be evicted entirely. ACTIVE blocks are
-    // never touched.
-    bool demote_one_checkpoint();
-    // Evict one CACHED checkpoint. `placement` selects the pool: -1 = any,
-    // 0 = CPU pool only, 1 = GPU pool only. Callers that need a block from a
-    // specific pool must not fall back to the other one: evicting there frees
-    // nothing useful and throws away checkpoints that could still be forked.
-    bool evict_one_checkpoint(int placement = -1);
+    // Cache-resident checkpoints are evicted lazily by checkout when the
+    // pool needs their block; ACTIVE blocks are never touched.
 
     //
     // Batch mapping
@@ -174,11 +169,11 @@ private:
     bool allocate_cpu_block(uint32_t & block_id);
     void release_block(uint32_t block_id);
 
-    bool demote_checkpoint(uint64_t chain_hash, llama_linear_prefix_entry e);
-    bool evict_checkpoint(uint64_t chain_hash, llama_linear_prefix_entry e);
+    // Checkout choke points: drop checkpoint-index entries for lazily evicted
+    // cache-resident state blocks.
+    std::vector<uint32_t> checkout_gpu_blocks(uint32_t n);
+    std::vector<uint32_t> checkout_cpu_blocks(uint32_t n);
 
-    // placement filter: -1 any, 0 CPU, 1 GPU
-    const llama_linear_prefix_entry * oldest_checkpoint(int placement) const;
     bool alloc_checkpoint_block(uint32_t & block_id);
 
     const uint32_t n_rs_seq;

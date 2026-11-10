@@ -1526,9 +1526,11 @@ json server_task_result_kv_stats::to_json() {
     auto pool = [](const llama_paged_kv_cache_pool_stats & p) {
         auto blocks = [](const llama_paged_kv_cache_block_stats & b) {
             return json{
-                {"total_blocks", b.total_blocks},
-                {"used_blocks",  b.used_blocks},
-                {"free_blocks",  b.free_blocks},
+                {"total_blocks",       b.total_blocks},
+                {"used_blocks",        b.used_blocks},
+                {"free_blocks",        b.free_blocks},
+                {"cached_blocks",      b.cached_blocks},
+                {"allocatable_blocks", b.allocatable_blocks},
             };
         };
         return json{

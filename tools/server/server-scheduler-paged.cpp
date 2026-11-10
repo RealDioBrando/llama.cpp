@@ -1036,17 +1036,20 @@ static tag_block_ids fetch_tag_block_ids(llama_paged_scheduler * sched, const st
     ids.full_shared.resize(n_full_shared);
     ids.linear_owned.resize(n_linear_owned);
 
-    // phase 2: fill. Retry when the materialization grew between the phases;
-    // an empty list keeps its NULL pointer, which the API reports as length 0.
+    // phase 2: fill. Retry when the materialization grew between the phases.
+    // Empty vectors must still pass a non-NULL pointer: the API treats NULL as
+    // "report the required length only", which would otherwise let an empty
+    // phase-1 list resize to N zeros and stop the retry loop.
+    static uint32_t empty_out = 0;
     for (int attempt = 0; attempt < 8; ++attempt) {
         size_t c_full_owned   = ids.full_owned.size();
         size_t c_full_shared  = ids.full_shared.size();
         size_t c_linear_owned = ids.linear_owned.size();
         const bool ok = llama_paged_scheduler_get_tag_block_ids(
                 sched, tag.c_str(),
-                ids.full_owned.empty()   ? nullptr : ids.full_owned.data(),   &c_full_owned,
-                ids.full_shared.empty()  ? nullptr : ids.full_shared.data(),  &c_full_shared,
-                ids.linear_owned.empty() ? nullptr : ids.linear_owned.data(), &c_linear_owned);
+                ids.full_owned.empty()   ? &empty_out : ids.full_owned.data(),   &c_full_owned,
+                ids.full_shared.empty()  ? &empty_out : ids.full_shared.data(),  &c_full_shared,
+                ids.linear_owned.empty() ? &empty_out : ids.linear_owned.data(), &c_linear_owned);
         ids.full_owned.resize(c_full_owned);
         ids.full_shared.resize(c_full_shared);
         ids.linear_owned.resize(c_linear_owned);

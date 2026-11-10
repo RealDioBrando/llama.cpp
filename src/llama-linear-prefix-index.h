@@ -11,12 +11,11 @@
 // A checkpoint is a read-only copy of the complete recurrent state at a
 // token-block boundary. It is keyed by the full token-block hash chain
 // (including the block that ends at the boundary). The index stores the
-// physical state block and its generation; liveness is validated against
-// the linear cache's block manager.
+// physical state block; liveness is validated against the linear cache's
+// block manager (the block must still own the chain hash).
 struct llama_linear_prefix_entry {
     uint64_t  chain_hash = 0;
     uint32_t  block_id   = 0;   // physical state block holding the checkpoint
-    uint32_t  generation = 0;
     llama_pos pos        = -1;  // token boundary covered by the checkpoint
     int64_t   last_used  = 0;
 };
@@ -29,7 +28,7 @@ class llama_linear_prefix_index {
     // Insert or replace the checkpoint for this hash chain. The previous
     // entry, if any, is returned through old_block_id so the caller can
     // release it.
-    bool insert(uint64_t chain_hash, uint32_t block_id, uint32_t generation, llama_pos pos,
+    bool insert(uint64_t chain_hash, uint32_t block_id, llama_pos pos,
                 uint32_t * old_block_id = nullptr);
 
     const llama_linear_prefix_entry * find(uint64_t chain_hash) const;
@@ -42,11 +41,14 @@ class llama_linear_prefix_index {
 
     bool remove(uint64_t chain_hash);
 
+    // Remove the entry only when it still points at `block_id`.
+    bool remove_if_block(uint64_t chain_hash, uint32_t block_id);
+
     // Drop every entry pointing at the given physical block.
     void invalidate_block(uint32_t block_id);
 
     // LRU eviction over checkpoints, oldest first.
-    bool pop_lru(uint64_t & chain_hash, uint32_t & block_id, uint32_t & generation);
+    bool pop_lru(uint64_t & chain_hash, uint32_t & block_id);
 
     void touch(uint64_t chain_hash);
 

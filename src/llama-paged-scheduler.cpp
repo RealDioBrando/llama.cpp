@@ -394,9 +394,11 @@ static void fill_tag_block_usage(const llama_paged_tag_usage & usage, struct lla
 }
 
 static void fill_block_stats(const llama_paged_block_stats & in, struct llama_paged_kv_cache_block_stats * out) {
-    out->total_blocks = in.total_blocks;
-    out->used_blocks  = in.used_blocks;
-    out->free_blocks  = in.free_blocks;
+    out->total_blocks       = in.total_blocks;
+    out->used_blocks        = in.used_blocks;
+    out->free_blocks        = in.free_blocks;
+    out->cached_blocks      = in.cached_blocks;
+    out->allocatable_blocks = in.allocatable_blocks;
 }
 
 LLAMA_API bool llama_paged_scheduler_set_request_tag(struct llama_paged_scheduler * sched,

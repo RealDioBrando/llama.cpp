@@ -39,10 +39,11 @@ class llama_kv_cache_paged : public llama_memory_i {
 
     bool allocate(int32_t num_tokens, llama_sequence_group & group);
     void free_blocks(llama_sequence_group & group);
-    void free_blocks(llama_sequence_group & group, const llama_block_ids & keep);
     bool release_block(uint32_t block_id);
     uint32_t n_free_gpu_blocks() const;
     uint32_t n_free_cpu_blocks() const;
+    uint32_t n_allocatable_gpu_blocks() const;
+    uint32_t n_cached_gpu_blocks() const;
     bool swap_in(llama_sequence_group & group);
     bool swap_out(llama_sequence_group & group);
     bool can_swap_in(llama_sequence_group & group) const;
@@ -51,9 +52,14 @@ class llama_kv_cache_paged : public llama_memory_i {
     // Prefix cache support: share already populated blocks by reference.
     bool share_blocks(llama_sequence_group & group, const llama_block_ids & src_ids);
     bool add_ref_blocks(const llama_block_ids & ids);
+    // Acquire refs for a block list whose blocks may be either live or
+    // cache-resident (ref_count == 0). Cache-resident blocks are taken out of
+    // the free queue. All-or-nothing; on failure every acquired ref is undone.
+    bool acquire_blocks(const llama_block_ids & ids);
     uint32_t block_ref_count(uint32_t block_id) const;
-    uint32_t block_generation(uint32_t block_id) const;
     bool is_block_gpu(uint32_t block_id) const;
+    bool block_has_hash(uint32_t block_id) const;
+    uint64_t block_hash(uint32_t block_id) const;
 
     // Copy the KV content of one allocated block into another allocated
     // block (same pool). Used by fork to give a child its own copy of a
@@ -66,7 +72,7 @@ class llama_kv_cache_paged : public llama_memory_i {
     bool prefix_enabled() const;
 
     // Returns the entry only when it still points at a live, GPU-resident
-    // block with a matching generation.
+    // block that owns the hash.
     const llama_full_prefix_entry * find_prefix_block(uint64_t    hash,
                                                       llama_token first_tok,
                                                       llama_token last_tok) const;
@@ -78,18 +84,13 @@ class llama_kv_cache_paged : public llama_memory_i {
                                llama_token first_tok,
                                llama_token last_tok);
 
-    // Release request blocks, keeping full blocks that are safe to reuse
-    // cache-resident. Updates the prefix index accordingly.
-    void release_sequence(llama_sequence_group & group);
+    // Entry liveness without touching refs: GPU-resident and still owns hash.
+    bool prefix_block_is_live(uint32_t block_id, uint64_t hash) const;
 
-    // Transfer a cache-resident prefix block to the live request that just
-    // took a reference on it: the entry stops being evictable and the cache's
-    // own reference is dropped. No-op unless the entry is cached and still
-    // points at this block.
-    bool take_cached_ref(uint64_t hash, uint32_t block_id);
-
-    // Evict the least-recently-used cache-resident prefix block.
-    bool evict_cached_prefix_block();
+    // Drop the prefix-index entry that points at this block (if any) and clear
+    // its hash. Used when the block contents are about to be discarded
+    // (truncation/speculative rollback).
+    void invalidate_prefix_block(uint32_t block_id);
 
     void     set_paged_batch_info(const llama_paged_batch_info * info);
     uint32_t get_num_gpu_blocks() const;
@@ -161,6 +162,10 @@ class llama_kv_cache_paged : public llama_memory_i {
   private:
     void concat_block_ids(llama_block_ids & to_block_table, const llama_block_ids & from_block_table);
     void do_block_copy(const llama_block_ids & src_ids, const llama_block_ids & new_ids, bool to_gpu);
+
+    // Single checkout choke point: pops blocks from the free queue and drops
+    // the prefix-index entries of lazily evicted cache-resident blocks.
+    llama_block_ids checkout_gpu_blocks(uint32_t num_blocks);
 
     // Master physical buffers. One K pool and one V pool per layer, both with
     // ND shape [num_blocks, n_heads_kv, block_size, head_dim]. Backends are

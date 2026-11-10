@@ -1837,8 +1837,10 @@ extern "C" {
 
     struct llama_paged_kv_cache_block_stats {
         uint64_t total_blocks;
-        uint64_t used_blocks;
-        uint64_t free_blocks;
+        uint64_t used_blocks;        /* in_use + cache-resident (free_blocks excluded) */
+        uint64_t free_blocks;        /* free and not cache-resident */
+        uint64_t cached_blocks;      /* free but cache-resident: evictable on allocation */
+        uint64_t allocatable_blocks; /* free_blocks + cached_blocks */
     };
 
     struct llama_paged_kv_cache_pool_stats {
@@ -1900,7 +1902,9 @@ extern "C" {
         uint32_t * linear_owned_out, size_t * n_linear_owned);
 
     // npu.full / npu.linear pool statistics. cpu.* is reserved and all zero.
-    // free_blocks is the raw free count (the watermark is not subtracted).
+    // used   = in-use + cache-resident blocks (evictable prefix cache).
+    // free   = free and NOT cache-resident (the watermark is not subtracted).
+    // cached = free but cache-resident; allocatable = free + cached.
     LLAMA_API bool llama_paged_scheduler_get_kv_cache_stats(struct llama_paged_scheduler * sched,
                                                             struct llama_paged_kv_cache_stats * out);
 

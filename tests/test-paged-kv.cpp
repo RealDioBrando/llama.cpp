@@ -467,29 +467,7 @@ TEST(test_scheduler_multi_request_decode) {
 
 // Testing prefix cache
 
-TEST(test_block_manager_generation) {
-    llama_block_manager bm;
-    bm.init(/*n_gpu=*/4, /*n_cpu=*/2, 0.0f);
-
-    auto ids = bm.checkout_gpu_blocks(1);
-    EXPECT_EQ(ids.size(), 1u);
-    const uint32_t id = ids[0];
-    const uint32_t g0 = bm.block_generation(id);
-
-    // Allocated blocks keep their generation; releasing bumps it so stale
-    // prefix entries can detect the reuse.
-    EXPECT_EQ(bm.block_generation(id), g0);
-    bm.release_gpu_blocks({ id });
-    EXPECT_EQ(bm.block_generation(id), g0 + 1);
-
-    auto ids2 = bm.checkout_gpu_blocks(1);
-    EXPECT_EQ(ids2.size(), 1u);
-    EXPECT_EQ(ids2[0], id);
-    EXPECT_EQ(bm.block_generation(id), g0 + 1);
-    bm.release_gpu_blocks(ids2);
-}
-
-TEST(test_prefix_block_stale_generation) {
+TEST(test_prefix_block_lazy_eviction) {
     auto kv = make_kv();
     kv.init(make_kv_backend(), make_kv_backend(), GGML_TYPE_F16, /*n_gpu=*/4, /*n_cpu=*/2, 0.0f);
 
@@ -503,11 +481,20 @@ TEST(test_prefix_block_stale_generation) {
     kv.register_prefix_block(/*hash=*/1234, id, /*owner=*/0, /*idx=*/0, /*first=*/1, /*last=*/2);
     EXPECT_TRUE(kv.find_prefix_block(1234, 1, 2) != nullptr);
 
-    // Once the block goes back to the pool the entry must not validate.
-    kv.release_block(id);
-    EXPECT_TRUE(kv.find_prefix_block(1234, 1, 2) == nullptr);
-
+    // Finishing the request returns the block to the free queue but keeps it
+    // cache-resident: ref_count == 0 and the entry is still live.
     kv.free_blocks(group);
+    EXPECT_EQ(kv.block_ref_count(id), 0u);
+    EXPECT_TRUE(kv.find_prefix_block(1234, 1, 2) != nullptr);
+
+    // Allocating the whole pool forces a checkout of the cached block; the
+    // wrapper drops the index entry (lazy eviction).
+    llama_sequence_group group2;
+    group2.request_id = 1;
+    group2.n_prompt   = 64;  // 4 blocks
+    EXPECT_TRUE(kv.allocate(0, group2));
+    EXPECT_TRUE(kv.find_prefix_block(1234, 1, 2) == nullptr);
+    kv.free_blocks(group2);
 }
 
 TEST(test_block_manager_add_ref) {
@@ -536,40 +523,100 @@ TEST(test_block_manager_add_ref) {
 
 TEST(test_prefix_cache_register_find) {
     llama_full_prefix_index pc;
-    pc.register_block(100, /*block_id=*/7, /*generation=*/3, /*owner=*/0, /*idx=*/0, /*first=*/1, /*last=*/2);
+    pc.register_block(100, /*block_id=*/7, /*owner=*/0, /*idx=*/0, /*first=*/1, /*last=*/2);
 
     const auto * e = pc.find(100, 1, 2);
     EXPECT_TRUE(e != nullptr);
     EXPECT_EQ(e->block_id, 7u);
-    EXPECT_EQ(e->generation, 3u);
     EXPECT_TRUE(pc.find(100, 9, 9) == nullptr);
 
-    EXPECT_TRUE(pc.update_block_id(100, 8, /*new_generation=*/4));
+    EXPECT_TRUE(pc.update_block_id(100, 8));
     EXPECT_EQ(pc.find(100, 1, 2)->block_id, 8u);
-    EXPECT_EQ(pc.find(100, 1, 2)->generation, 4u);
 }
 
-TEST(test_prefix_cache_cached_lifecycle) {
-    llama_full_prefix_index pc;
-    pc.register_block(1, 10, 0, 0, 0, 1, 1);
-    pc.register_block(2, 11, 0, 0, 1, 1, 1);
-    pc.set_cached_state(1, true);
-    pc.set_cached_state(2, true);
-    pc.set_cached_state(2, false);
+TEST(test_prefix_cache_lazy_eviction) {
+    llama_block_manager bm;
+    bm.init(/*n_gpu=*/4, /*n_cpu=*/2, 0.0f);
 
-    uint64_t h    = 0;
-    uint32_t id   = 0;
-    uint32_t gen  = 0;
-    EXPECT_TRUE(pc.pop_lru_cached(h, id, gen));
-    EXPECT_EQ(h, 1ull);
-    EXPECT_EQ(id, 10u);
-    EXPECT_FALSE(pc.pop_lru_cached(h, id, gen));
+    auto ids = bm.checkout_gpu_blocks(2);
+    EXPECT_EQ(ids.size(), 2u);
+    bm.set_block_hash(ids[0], 111);
+    bm.set_block_hash(ids[1], 222);
+
+    // Reverse release pushes the chain tail first: queue = [2, 3, 1, 0].
+    bm.release_gpu_blocks(ids);
+    EXPECT_EQ(bm.n_cached_gpu_blocks(), 2u);
+    EXPECT_EQ(bm.n_free_gpu_blocks(), 2u);          // non-cached: 2, 3
+    EXPECT_EQ(bm.n_allocatable_gpu_blocks(), 4u);   // cached blocks are allocatable
+
+    // Touch takes a cache-resident block out of the queue but keeps its hash.
+    EXPECT_TRUE(bm.touch_block(ids[1]));
+    EXPECT_EQ(bm.block_ref_count(ids[1]), 1u);
+    EXPECT_EQ(bm.n_cached_gpu_blocks(), 1u);
+    bm.release_gpu_blocks({ ids[1] });
+    EXPECT_EQ(bm.n_cached_gpu_blocks(), 2u);
+
+    // Draining the pool lazily evicts both cached blocks and reports the
+    // hashes so the prefix index can drop the entries.
+    std::vector<llama_block_manager::evicted_block> evicted;
+    auto all = bm.checkout_gpu_blocks(4, &evicted);
+    EXPECT_EQ(all.size(), 4u);
+    EXPECT_EQ(evicted.size(), 2u);
+    EXPECT_EQ(bm.n_cached_gpu_blocks(), 0u);
+    EXPECT_FALSE(bm.block_has_hash(ids[0]));
+    EXPECT_FALSE(bm.block_has_hash(ids[1]));
+    bm.release_gpu_blocks(all);
+}
+
+TEST(test_block_manager_reverse_free_order) {
+    llama_block_manager bm;
+    bm.init(/*n_gpu=*/4, /*n_cpu=*/2, 0.0f);
+
+    auto ids = bm.checkout_gpu_blocks(4);  // 0, 1, 2, 3
+    EXPECT_EQ(ids.size(), 4u);
+
+    // The cache releases a request's table in ascending order; the manager
+    // pushes back-to-front so the chain tail lands at the queue head.
+    bm.release_gpu_blocks(ids);
+    auto first = bm.checkout_gpu_blocks(1);
+    EXPECT_EQ(first.size(), 1u);
+    EXPECT_EQ(first[0], ids.back());
+    bm.release_gpu_blocks(first);
+}
+
+TEST(test_checkout_preflight_preserves_cache) {
+    llama_block_manager bm;
+    bm.init(/*n_gpu=*/4, /*n_cpu=*/2, 0.0f);
+
+    auto ids = bm.checkout_gpu_blocks(2);
+    bm.set_block_hash(ids[0], 111);
+    bm.set_block_hash(ids[1], 222);
+    bm.release_gpu_blocks(ids);  // all 4 blocks free, 2 cache-resident
+
+    // An unsatisfiable checkout must not touch the cache.
+    std::vector<llama_block_manager::evicted_block> evicted;
+    auto too_many = bm.checkout_gpu_blocks(5, &evicted);
+    EXPECT_TRUE(too_many.empty());
+    EXPECT_TRUE(evicted.empty());
+    EXPECT_EQ(bm.n_cached_gpu_blocks(), 2u);
+    EXPECT_EQ(bm.n_allocatable_gpu_blocks(), 4u);
+}
+
+TEST(test_prefix_index_identity_removal) {
+    llama_full_prefix_index pc;
+    pc.register_block(7, /*block_id=*/3, /*owner=*/0, /*idx=*/0, /*first=*/1, /*last=*/2);
+
+    // An eviction report for another physical block must not drop the entry.
+    EXPECT_FALSE(pc.remove_if_block(7, 4));
+    EXPECT_TRUE(pc.find_hash(7) != nullptr);
+    EXPECT_TRUE(pc.remove_if_block(7, 3));
+    EXPECT_TRUE(pc.find_hash(7) == nullptr);
 }
 
 TEST(test_prefix_cache_ckpt_slots) {
     llama_linear_prefix_index pc;
-    pc.insert(/*hash=*/42, /*block=*/6, /*gen=*/0, /*pos=*/64);
-    pc.insert(/*hash=*/43, /*block=*/7, /*gen=*/0, /*pos=*/128);
+    pc.insert(/*hash=*/42, /*block=*/6, /*pos=*/64);
+    pc.insert(/*hash=*/43, /*block=*/7, /*pos=*/128);
 
     EXPECT_TRUE(pc.find(42) != nullptr);
     EXPECT_EQ(pc.find(43)->pos, 128);
@@ -584,12 +631,11 @@ TEST(test_prefix_cache_ckpt_slots) {
 
     uint64_t h = 0;
     uint32_t id = 0;
-    uint32_t gen = 0;
-    EXPECT_TRUE(pc.pop_lru(h, id, gen));
+    EXPECT_TRUE(pc.pop_lru(h, id));
     EXPECT_EQ(h, 42ull);
-    EXPECT_TRUE(pc.pop_lru(h, id, gen));
+    EXPECT_TRUE(pc.pop_lru(h, id));
     EXPECT_EQ(h, 43ull);
-    EXPECT_FALSE(pc.pop_lru(h, id, gen));
+    EXPECT_FALSE(pc.pop_lru(h, id));
 }
 
 TEST(test_scheduler_prefix_cache_hit) {
@@ -610,10 +656,14 @@ TEST(test_scheduler_prefix_cache_hit) {
     llama_paged_feedback fb = { /*request_id=*/0, sampled.data(), (int32_t) sampled.size(), stop[0] };
     fixture.sched->update(&batch, &fb, 1);
 
-    // Finalizing the request keeps its registered blocks cache-resident.
+    // Finalizing the request returns the blocks to the free queue but keeps
+    // them cache-resident (ref == 0, hash retained).
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
-    EXPECT_EQ(fixture.kv->block_ref_count(blk0), 1u);
-    EXPECT_EQ(fixture.kv->block_ref_count(blk1), 1u);
+    EXPECT_EQ(fixture.kv->block_ref_count(blk0), 0u);
+    EXPECT_EQ(fixture.kv->block_ref_count(blk1), 0u);
+    EXPECT_TRUE(fixture.kv->block_has_hash(blk0));
+    EXPECT_TRUE(fixture.kv->block_has_hash(blk1));
+    EXPECT_TRUE(fixture.kv->n_cached_gpu_blocks() >= 2u);
 
     EXPECT_TRUE(fixture.sched->queue_request(make_group(1, /*n_prompt=*/48)));
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
@@ -623,8 +673,8 @@ TEST(test_scheduler_prefix_cache_hit) {
     EXPECT_EQ(g1->n_prompt, 16u);
     EXPECT_EQ(g1->block_table[0], blk0);
     EXPECT_EQ(g1->block_table[1], blk1);
-    // The cache's extra reference is transferred to the reusing request, so
-    // the block is owned exactly once while the request is running.
+    // Reuse touches the cached blocks out of the free queue: each is owned
+    // exactly once while the request is running.
     EXPECT_EQ(fixture.kv->block_ref_count(blk0), 1u);
 
     const llama_block_ids table1 = g1->block_table;
@@ -632,12 +682,14 @@ TEST(test_scheduler_prefix_cache_hit) {
     llama_paged_feedback fb1 = { /*request_id=*/1, sampled1.data(), (int32_t) sampled1.size(), stop[0] };
     fixture.sched->update(&batch, &fb1, 1);
     EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
-    EXPECT_EQ(fixture.kv->block_ref_count(blk0), 1u);
-    EXPECT_EQ(fixture.kv->block_ref_count(blk1), 1u);
-    // Req1 registered its first fresh block before finishing; it stays
-    // cache-resident while the remaining fresh blocks go back to the pool.
-    EXPECT_EQ(fixture.kv->block_ref_count(table1[2]), 1u);
+    EXPECT_EQ(fixture.kv->block_ref_count(blk0), 0u);
+    EXPECT_EQ(fixture.kv->block_ref_count(blk1), 0u);
+    // Req1 registered its first fresh full block before finishing; it stays
+    // cache-resident. The partial tail block has no hash and is plain free.
+    EXPECT_EQ(fixture.kv->block_ref_count(table1[2]), 0u);
+    EXPECT_TRUE(fixture.kv->block_has_hash(table1[2]));
     EXPECT_EQ(fixture.kv->block_ref_count(table1[3]), 0u);
+    EXPECT_FALSE(fixture.kv->block_has_hash(table1[3]));
 }
 
 TEST(test_scheduler_prefix_cache_zero_suffix) {
@@ -714,11 +766,13 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_scheduler_multi_request_decode);
 
     fprintf(stderr, "test-paged-kv: prefix cache\n");
-    RUN(test_block_manager_generation);
-    RUN(test_prefix_block_stale_generation);
+    RUN(test_prefix_block_lazy_eviction);
     RUN(test_block_manager_add_ref);
     RUN(test_prefix_cache_register_find);
-    RUN(test_prefix_cache_cached_lifecycle);
+    RUN(test_prefix_cache_lazy_eviction);
+    RUN(test_block_manager_reverse_free_order);
+    RUN(test_checkout_preflight_preserves_cache);
+    RUN(test_prefix_index_identity_removal);
     RUN(test_prefix_cache_ckpt_slots);
     RUN(test_scheduler_prefix_cache_hit);
     RUN(test_scheduler_prefix_cache_zero_suffix);

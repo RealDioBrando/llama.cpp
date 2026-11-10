@@ -21,9 +21,11 @@ struct llama_paged_tag_usage {
 };
 
 struct llama_paged_block_stats {
-    uint64_t total_blocks = 0;
-    uint64_t used_blocks  = 0;
-    uint64_t free_blocks  = 0;
+    uint64_t total_blocks       = 0;
+    uint64_t used_blocks        = 0;  // in_use + cache-resident
+    uint64_t free_blocks        = 0;  // free and NOT cache-resident
+    uint64_t cached_blocks      = 0;  // free but cache-resident (evictable)
+    uint64_t allocatable_blocks = 0;  // free_blocks + cached_blocks
 };
 
 struct llama_paged_pool_stats {
