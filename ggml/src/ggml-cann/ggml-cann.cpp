@@ -25,6 +25,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
 #include "ggml-cann/aclnn_ops.h"
+#include "ggml-cann/cann-comm.h"
 #include "ggml-cann/paged_attn.h"
 #include "ggml-cann/moe_ops.h"
 #include "ggml-cann/moe_fused_ops.h"
@@ -52,6 +53,7 @@
 #include <optional>
 #include <queue>
 #include <unordered_map>
+#include <array>
 #include <unordered_set>
 #include <vector>
 
@@ -74,6 +76,11 @@
     int32_t id = -1;
     aclrtGetDevice(&id);
 
+    // debug: direct fprintf, the async logger dies with the abort below
+    fprintf(stderr, "CANN error: %s\n", msg);
+    fprintf(stderr, "  current device: %d, in function %s at %s:%d\n", id, func, file, line);
+    fprintf(stderr, "  %s\n", stmt);
+    fflush(stderr);
     GGML_LOG_ERROR("CANN error: %s\n", msg);
     GGML_LOG_ERROR("  current device: %d, in function %s at %s:%d\n", id, func, file, line);
     GGML_LOG_ERROR("  %s\n", stmt);
@@ -105,6 +112,51 @@ void ggml_cann_set_device(const int32_t device) {
 
     // Update the global device record.
     g_current_cann_device = device;
+}
+
+// refcount of live CANN backends per device, so that a device is only reset
+// after its last user is gone (TP: several backends/devices share the process)
+static std::mutex g_cann_device_users_mutex;
+static int        g_cann_device_users[GGML_CANN_MAX_DEVICES] = { 0 };
+
+// backends that started a per-device worker, so buffer-level host copies can
+// reach the worker without a backend handle. Written by the same host thread
+// that calls the buffer hooks, no locking needed.
+static ggml_backend_cann_context * g_cann_dev_ctxs[GGML_CANN_MAX_DEVICES] = { nullptr };
+
+static void cann_device_users_acquire(int32_t device) {
+    std::lock_guard<std::mutex> lock(g_cann_device_users_mutex);
+    g_cann_device_users[device]++;
+}
+
+static bool cann_device_users_release(int32_t device) {
+    std::lock_guard<std::mutex> lock(g_cann_device_users_mutex);
+    GGML_ASSERT(g_cann_device_users[device] > 0);
+    return --g_cann_device_users[device] == 0;
+}
+
+// number of distinct CANN devices with live backends in this process
+static int cann_device_users_active() {
+    std::lock_guard<std::mutex> lock(g_cann_device_users_mutex);
+    int n = 0;
+    for (int i = 0; i < GGML_CANN_MAX_DEVICES; ++i) {
+        if (g_cann_device_users[i] > 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+int32_t ggml_backend_cann_device_id(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_cann(backend));
+    ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
+    return cann_ctx->device;
+}
+
+cann_worker * ggml_backend_cann_get_worker(ggml_backend_t backend) {
+    GGML_ASSERT(ggml_backend_is_cann(backend));
+    ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
+    return cann_ctx->worker.get();
 }
 
 /**
@@ -200,6 +252,24 @@ static ggml_cann_device_info ggml_cann_init() {
 const ggml_cann_device_info & ggml_cann_info() {
     static ggml_cann_device_info info = ggml_cann_init();
     return info;
+}
+
+// Per-device workers are enabled by default when more than one NPU is
+// present, see cann-tp-combined-design.md section 5. Kept switchable for
+// diagnosis via GGML_CANN_DISABLE_WORKER=1.
+static bool ggml_backend_cann_worker_disabled() {
+    static const bool disabled = []() {
+        const char * e = getenv("GGML_CANN_DISABLE_WORKER");
+        return e != nullptr && e[0] == '1';
+    }();
+    return disabled;
+}
+
+// Workers are needed only when this process actually drives more than one
+// NPU (TP, layer split, multiple contexts): a single-card model on a
+// multi-card machine stays on the direct submission path.
+static bool ggml_backend_cann_worker_enabled() {
+    return !ggml_backend_cann_worker_disabled() && cann_device_users_active() > 1;
 }
 
 //#define DEBUG_CANN_MALLOC
@@ -900,11 +970,6 @@ void ggml_cann_capture_pin_end(void * graph_key) {
         for (auto & b : g_cann_capture_arena->blocks) {
             graph->arena_blocks.push_back({b.ptr, b.size});
         }
-        if (getenv("GGML_CANN_DEBUG_DECISION")) {
-            fprintf(stderr, "[GDEC] capture-end: %zu arena blocks -> graph %p\n",
-                g_cann_capture_arena->blocks.size(), (void *) graph);
-            fflush(stderr);
-        }
     }
     g_cann_capture_pin_graph_key = nullptr;
     // keep g_cann_capture_arena alive-but-empty: its Block entries have
@@ -1099,8 +1164,28 @@ static const char * ggml_backend_cann_buffer_type_name(ggml_backend_buffer_type_
  * @return bool Returns true if the buffer type is associated with the CANN
  * backend, otherwise false.
  */
+static bool ggml_backend_buft_is_cann(ggml_backend_buffer_type_t buft);
+
+// a meta buffer type (tensor parallelism) wrapping only CANN buffer types
+// provides the same weight layout guarantees as a plain CANN buffer type
+static bool ggml_backend_buft_is_cann_impl(ggml_backend_buffer_type_t buft) {
+    if (buft->iface.get_name == ggml_backend_cann_buffer_type_name) {
+        return true;
+    }
+    if (ggml_backend_buft_is_meta(buft)) {
+        const size_t n_bufts = ggml_backend_meta_buft_n_bufts(buft);
+        for (size_t i = 0; i < n_bufts; i++) {
+            if (!ggml_backend_buft_is_cann_impl(ggml_backend_meta_buft_simple_buft(buft, i))) {
+                return false;
+            }
+        }
+        return n_bufts > 0;
+    }
+    return false;
+}
+
 static bool ggml_backend_buft_is_cann(ggml_backend_buffer_type_t buft) {
-    return buft->iface.get_name == ggml_backend_cann_buffer_type_name;
+    return buft != nullptr && ggml_backend_buft_is_cann_impl(buft);
 }
 
 #ifdef ASCEND_310P
@@ -1465,15 +1550,22 @@ static void kq_dequant_q6_k_block(const block_q6_K * x, float * y) {
  */
 static void ggml_backend_cann_transform_kq_w8(ggml_tensor * tensor, const void * src, void * dst) {
     const int64_t k = tensor->ne[0];
-    const int64_t n = tensor->ne[1];
+    // Expert stacks flatten ne[2] into n (rows (e, m) are linear in memory).
+    const int64_t n = tensor->ne[1] * (tensor->ne[2] > 1 ? tensor->ne[2] : 1);
+    const int64_t n_pad = (n + 15) & ~int64_t(15);  // fractal n0 (TP head slices)
     const int gs = ggml_cann_w8_group_size();
     const bool is_q5 = (tensor->type == GGML_TYPE_Q5_K);
     const size_t blk_size = is_q5 ? sizeof(block_q5_K) : sizeof(block_q6_K);
     const int64_t blocks_per_row = k / QK_K;
-    const int64_t ng_num = n / 16;  // n%16 checked by kq_matmul_path
+    const int64_t ng_num = n_pad / 16;  // n%16 checked by kq_matmul_path
 
     int8_t * quants = (int8_t *) dst;
-    float * scales = (float *) ((char *) dst + (size_t) (n * k));
+    float * scales = (float *) ((char *) dst + (size_t) (n_pad * k));
+
+    if (n_pad != n) {
+        // zero the pad rows/cols so the padded fractal computes clean zeros
+        memset(dst, 0, ggml_cann_kq_layout_size(tensor, GGML_CANN_KQ_W8A8));
+    }
 
     /* Q8_0 -> W8A8 is LOSSLESS: each 32-element block's int8 quants are copied
      * verbatim (they already are the kernel's int8 weight), and the fp16 block
@@ -1489,7 +1581,7 @@ static void ggml_backend_cann_transform_kq_w8(ggml_tensor * tensor, const void *
             const int64_t r = row & 15;
             for (int64_t b = 0; b < q8_blocks_per_row; b++) {
                 memcpy(quants + ((b * ng_num + ng) * 16 + r) * 32, g[b].qs, QK8_0);
-                scales[b * n + row] = GGML_FP16_TO_FP32(g[b].d);
+                scales[b * n_pad + row] = GGML_FP16_TO_FP32(g[b].d);
             }
         }
         return;
@@ -1526,7 +1618,7 @@ static void ggml_backend_cann_transform_kq_w8(ggml_tensor * tensor, const void *
                      * [kf=(kbase+i)/32][ng][r][col=(kbase+i)%32] */
                     quants[(((kbase + i) / 32) * ng_num + ng) * 512 + r * 32 + ((kbase + i) & 31)] = (int8_t) v;
                 }
-                scales[(kbase / gs) * n + row] = s;
+                scales[(kbase / gs) * n_pad + row] = s;
             }
         }
     }
@@ -1596,8 +1688,9 @@ static void ggml_backend_cann_transform_kq_w4(ggml_tensor * tensor, const void *
     }
 }
 
+
 static void ggml_backend_cann_transform_kq(ggml_tensor * tensor, const void * src, void * dst) {
-    const int path = ggml_cann_kq_matmul_path(tensor);
+    int path = ggml_cann_kq_matmul_path(tensor);
     if (path == GGML_CANN_KQ_W8A8) {
         ggml_backend_cann_transform_kq_w8(tensor, src, dst);
     } else if (path == GGML_CANN_KQ_W4A8) {
@@ -1773,7 +1866,7 @@ static void weight_format_to_nz(ggml_tensor * tensor, int device) {
 // Ask CANN for the exact device-side storage size of a 3D INT8 expert tensor.
 // The result can include backend padding, so E*N*K is not a safe substitute.
 size_t ggml_cann_w8a8_expert_transformed_size(const ggml_tensor * tensor) {
-    GGML_ASSERT(tensor->type == GGML_TYPE_W8A8);
+    GGML_ASSERT(ggml_cann_a8_grouped_expert(tensor));
     GGML_ASSERT(tensor->ne[3] == 1);
     int64_t shape[3] = { tensor->ne[2], tensor->ne[1], tensor->ne[0] };
     aclIntArray * shape_array = aclCreateIntArray(shape, 3);
@@ -1781,6 +1874,49 @@ size_t ggml_cann_w8a8_expert_transformed_size(const ggml_tensor * tensor) {
     ACL_CHECK(aclnnCalculateMatmulWeightSizeV2(shape_array, ACL_INT8, &transformed_size));
     ACL_CHECK(aclDestroyIntArray(shape_array));
     return static_cast<size_t>(transformed_size);
+}
+
+// Transform a 3D [K,N,E] A8 expert payload to the FRACTAL_NZ cube layout in
+// place and cache the NZ descriptor in tensor->extra. The grouped matmul
+// only reaches full speed with pre-transformed weights, so the one-time
+// transform moves every per-call transpose out of the hot path. The buffer
+// already reserves the transformed size (see get_alloc_size).
+static void ggml_backend_cann_expert_transform_nz(ggml_tensor * tensor,
+                                                   ggml_backend_cann_buffer_context * ctx) {
+    const int64_t expert_count = tensor->ne[2];
+    const int64_t expert_n     = tensor->ne[1];
+    const int64_t expert_k     = tensor->ne[0];
+
+    int64_t expert_weight_ne[3] = { expert_count, expert_n, expert_k };
+    int64_t expert_weight_nb[3] = { static_cast<int64_t>(expert_n * expert_k),
+                                    static_cast<int64_t>(expert_k), 1 };
+    int64_t expert_weight_storage = expert_count * expert_n * expert_k;
+    acl_tensor_ptr expert_weight(aclCreateTensor(expert_weight_ne, 3, ACL_INT8, expert_weight_nb, 0,
+                                                 ACL_FORMAT_ND, &expert_weight_storage, 1, tensor->data));
+
+    if (tensor->extra != nullptr) {
+        aclTensor * old = (aclTensor *) tensor->extra;
+        ctx->w8a8_tensors.erase(old);
+        ACL_CHECK(aclDestroyTensor(old));
+        tensor->extra = nullptr;
+    }
+
+    uint64_t       workspace_size = 0;
+    aclOpExecutor *executor       = nullptr;
+    ACL_CHECK(aclnnTransMatmulWeightGetWorkspaceSize(expert_weight.get(), &workspace_size, &executor));
+    const int32_t device = g_current_cann_device;
+    aclrtStream stream = nullptr;
+    ACL_CHECK(aclrtCreateStream(&stream));
+    {
+        std::lock_guard<std::mutex> lock(g_nz_workspaces[device].mtx);
+        g_nz_workspaces[device].realloc(workspace_size);
+        ACL_CHECK(aclnnTransMatmulWeight(g_nz_workspaces[device].get(), workspace_size, executor, stream));
+    }
+    ACL_CHECK(aclrtSynchronizeStream(stream));
+    ACL_CHECK(aclrtDestroyStream(stream));
+
+    tensor->extra = expert_weight.release();
+    ctx->w8a8_tensors.insert((aclTensor *) tensor->extra);
 }
 
 static void ggml_backend_cann_w8a8_upload_a8(ggml_tensor * tensor, const void * src,
@@ -1825,41 +1961,8 @@ static void ggml_backend_cann_w8a8_upload_a8(ggml_tensor * tensor, const void * 
             const size_t padding_size = scale_offset - weights.size();
             ACL_CHECK(aclrtMemset((char *) tensor->data + weights.size(), padding_size, 0, padding_size));
         }
-        // ND is the stable grouped layout. The NZ layout remains opt-in because
-        // the installed CANN build still has unresolved grouped-matmul issues.
-        const bool transform_expert_weight =
-            parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("off"));
-        if (transform_expert_weight) {
-        int64_t expert_weight_ne[3] = { expert_count, expert_n, expert_k };
-        int64_t expert_weight_nb[3] = { static_cast<int64_t>(expert_n * expert_k),
-                                        static_cast<int64_t>(expert_k), 1 };
-        int64_t expert_weight_storage = expert_count * expert_n * expert_k;
-        acl_tensor_ptr expert_weight(aclCreateTensor(expert_weight_ne, 3, ACL_INT8, expert_weight_nb, 0,
-                                                     ACL_FORMAT_ND, &expert_weight_storage, 1, tensor->data));
-
-        if (tensor->extra != nullptr) {
-            aclTensor * old = (aclTensor *) tensor->extra;
-            ctx->w8a8_tensors.erase(old);
-            ACL_CHECK(aclDestroyTensor(old));
-            tensor->extra = nullptr;
-        }
-
-        uint64_t       workspace_size = 0;
-        aclOpExecutor *executor       = nullptr;
-        ACL_CHECK(aclnnTransMatmulWeightGetWorkspaceSize(expert_weight.get(), &workspace_size, &executor));
-        const int32_t device = g_current_cann_device;
-        aclrtStream stream = nullptr;
-        ACL_CHECK(aclrtCreateStream(&stream));
-        {
-            std::lock_guard<std::mutex> lock(g_nz_workspaces[device].mtx);
-            g_nz_workspaces[device].realloc(workspace_size);
-            ACL_CHECK(aclnnTransMatmulWeight(g_nz_workspaces[device].get(), workspace_size, executor, stream));
-        }
-        ACL_CHECK(aclrtSynchronizeStream(stream));
-        ACL_CHECK(aclrtDestroyStream(stream));
-
-        tensor->extra = expert_weight.release();
-        ctx->w8a8_tensors.insert((aclTensor *) tensor->extra);
+        if (ggml_cann_moe_weight_nz_enabled()) {
+            ggml_backend_cann_expert_transform_nz(tensor, ctx);
         }
         return;
     }
@@ -1934,6 +2037,68 @@ static void ggml_backend_cann_w8a8_upload_a8(ggml_tensor * tensor, const void * 
     ctx->w8a8_tensors.insert((aclTensor *) tensor->extra);
 }
 
+// Re-quantize Q8_0 expert blocks into the grouped A8 layout: one symmetric
+// scale per [expert, output channel] (the row maximum of the per-block Q8_0
+// scales), then the int8 payload plane. Lossy, same scheme as the kq path.
+static void ggml_backend_cann_q8_expert_upload_a8(ggml_tensor * tensor, const void * src,
+                                                   ggml_backend_cann_buffer_context * ctx) {
+    GGML_ASSERT(tensor->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(tensor->ne[0] % QK8_0 == 0);
+    GGML_ASSERT(tensor->ne[2] > 1 && tensor->ne[3] == 1);
+
+    const int64_t expert_k       = tensor->ne[0];
+    const int64_t expert_n       = tensor->ne[1];
+    const int64_t expert_count   = tensor->ne[2];
+    const int64_t blocks_per_row = expert_k / QK8_0;
+    const size_t  scale_offset   = ggml_cann_w8a8_expert_scale_offset(tensor);
+
+    std::vector<int8_t> weights(static_cast<size_t>(expert_count * expert_n * expert_k));
+    std::vector<float>  scales(static_cast<size_t>(expert_count * expert_n));
+    std::vector<float>  block_d(static_cast<size_t>(blocks_per_row));
+    for (int64_t expert = 0; expert < expert_count; ++expert) {
+        for (int64_t row = 0; row < expert_n; ++row) {
+            const block_q8_0 * blocks = (const block_q8_0 *)
+                ((const char *) src + (size_t) (expert * expert_n + row) * blocks_per_row * sizeof(block_q8_0));
+            float d_row = 0.0f;
+            for (int64_t block = 0; block < blocks_per_row; ++block) {
+                block_d[block] = ggml_fp16_to_fp32(blocks[block].d);
+                if (block_d[block] > d_row) {
+                    d_row = block_d[block];
+                }
+            }
+            if (d_row <= 0.0f) {
+                d_row = 1.0f;
+            }
+            scales[static_cast<size_t>(expert * expert_n + row)] = d_row;
+            const float inv_d = 1.0f / d_row;
+            int8_t * out =
+                weights.data() + (size_t) (expert * expert_n + row) * expert_k;
+            for (int64_t block = 0; block < blocks_per_row; ++block) {
+                const float ratio = block_d[block] * inv_d;
+                for (int64_t j = 0; j < QK8_0; ++j) {
+                    int v = (int) lrintf(blocks[block].qs[j] * ratio);
+                    if (v > 127) v = 127;
+                    if (v < -127) v = -127;
+                    out[block * QK8_0 + j] = (int8_t) v;
+                }
+            }
+        }
+    }
+
+    ACL_CHECK(aclrtMemcpy(tensor->data, weights.size(), weights.data(), weights.size(),
+                          ACL_MEMCPY_HOST_TO_DEVICE));
+    ACL_CHECK(aclrtMemcpy((char *) tensor->data + scale_offset, scales.size() * sizeof(float),
+                          scales.data(), scales.size() * sizeof(float), ACL_MEMCPY_HOST_TO_DEVICE));
+    if (scale_offset > weights.size()) {
+        const size_t padding_size = scale_offset - weights.size();
+        ACL_CHECK(aclrtMemset((char *) tensor->data + weights.size(), padding_size, 0, padding_size));
+    }
+
+    if (ggml_cann_moe_weight_nz_enabled()) {
+        ggml_backend_cann_expert_transform_nz(tensor, ctx);
+    }
+}
+
 static void ggml_backend_cann_w8a8_get_tensor(const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     GGML_ASSERT(tensor->type == GGML_TYPE_W8A8);
     if (ggml_cann_w8a8_is_expert(tensor)) {
@@ -1945,8 +2110,37 @@ static void ggml_backend_cann_w8a8_get_tensor(const ggml_tensor * tensor, void *
 
         std::vector<int8_t> weights(static_cast<size_t>(expert_count * expert_n * expert_k));
         std::vector<float> scales(static_cast<size_t>(expert_count * expert_n));
-        ACL_CHECK(aclrtMemcpy(weights.data(), weights.size(), tensor->data, weights.size(),
-                              ACL_MEMCPY_DEVICE_TO_HOST));
+        if (tensor->extra != nullptr) {
+            // Reverse the private FRACTAL_NZ payload so callers always observe
+            // the public 34-byte W8A8 block representation. One int8 fractal
+            // block covers 16 rows x 32 K-elements, ordered expert, K-block,
+            // N-block, row; padded rows beyond expert_n are skipped.
+            std::vector<int8_t> payload(ggml_cann_w8a8_expert_transformed_size(tensor));
+            ACL_CHECK(aclrtMemcpy(payload.data(), payload.size(), tensor->data, payload.size(),
+                                  ACL_MEMCPY_DEVICE_TO_HOST));
+            const int64_t k_blocks = expert_k / 32;
+            const int64_t n_blocks = (expert_n + 15) / 16;
+            for (int64_t expert = 0; expert < expert_count; ++expert) {
+                for (int64_t kb = 0; kb < k_blocks; ++kb) {
+                    for (int64_t nb = 0; nb < n_blocks; ++nb) {
+                        for (int64_t ni = 0; ni < 16; ++ni) {
+                            const int64_t row = nb * 16 + ni;
+                            if (row >= expert_n) {
+                                break;
+                            }
+                            const size_t src_index = static_cast<size_t>(
+                                ((((expert * k_blocks + kb) * n_blocks + nb) * 16 + ni) * 32));
+                            const size_t dst_index = static_cast<size_t>(
+                                (expert * expert_n + row) * expert_k + kb * 32);
+                            memcpy(weights.data() + dst_index, payload.data() + src_index, 32);
+                        }
+                    }
+                }
+            }
+        } else {
+            ACL_CHECK(aclrtMemcpy(weights.data(), weights.size(), tensor->data, weights.size(),
+                                  ACL_MEMCPY_DEVICE_TO_HOST));
+        }
         ACL_CHECK(aclrtMemcpy(scales.data(), scales.size() * sizeof(float),
                               (const char *) tensor->data + scale_offset, scales.size() * sizeof(float),
                               ACL_MEMCPY_DEVICE_TO_HOST));
@@ -2004,6 +2198,21 @@ static void ggml_backend_cann_w8a8_get_tensor(const ggml_tensor * tensor, void *
 }
 
 // TODO: need handle tensor which has paddings.
+static void ggml_backend_cann_drain_device(int32_t device) {
+    ggml_backend_cann_context * owner = g_cann_dev_ctxs[device];
+    if (owner && owner->worker) {
+        ggml_cann_set_device(owner->device);
+        cann_worker_wait_idle(owner->worker.get());
+        ACL_CHECK(aclrtSynchronizeStream(owner->stream()));
+    }
+}
+
+static void ggml_backend_cann_drain_submit(ggml_backend_cann_context * cann_ctx) {
+    if (cann_ctx->worker) {
+        cann_worker_wait_idle(cann_ctx->worker.get());
+    }
+}
+
 /**
  * @brief Set tensor data in a CANN buffer.
  *
@@ -2030,6 +2239,7 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
     ggml_cann_set_device(ctx->device);
+    ggml_backend_cann_drain_device(ctx->device);
 
     // Only check env once.
     static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
@@ -2048,6 +2258,29 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
         tracker->bytes_written += size;
         if (tracker->bytes_written >= tracker->total_bytes) {
             ggml_backend_cann_w8a8_upload_a8(tensor, tracker->host_buffer.data(), ctx);
+            lock.unlock();
+            ctx->remove_tracker(tensor);
+        }
+        return;
+    }
+
+    if (ggml_cann_q8_moe_expert(tensor)) {
+        // Q8_0 MoE experts: same staging contract as W8A8, but the upload
+        // re-quantizes to one scale per [expert, output channel].
+        if (offset == 0 && size == ggml_nbytes(tensor)) {
+            ggml_backend_cann_q8_expert_upload_a8(tensor, data, ctx);
+            return;
+        }
+
+        TensorSetTracker * tracker = ctx->get_or_create_tracker(tensor);
+        std::unique_lock<std::mutex> lock(tracker->mtx);
+        if (tracker->host_buffer.empty()) {
+            tracker->host_buffer.resize(tracker->total_bytes);
+        }
+        memcpy(tracker->host_buffer.data() + offset, data, size);
+        tracker->bytes_written += size;
+        if (tracker->bytes_written >= tracker->total_bytes) {
+            ggml_backend_cann_q8_expert_upload_a8(tensor, tracker->host_buffer.data(), ctx);
             lock.unlock();
             ctx->remove_tracker(tensor);
         }
@@ -2194,6 +2427,100 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
     }
 }
 
+static void ggml_backend_cann_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor,
+                                                   const void * data, size_t offset, size_t size,
+                                                   size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
+
+    ggml_cann_set_device(ctx->device);
+    ggml_backend_cann_drain_device(ctx->device);
+
+    // Only check env once.
+    static const bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
+
+    const bool is_quantized = need_transform(tensor->type);
+#ifdef ASCEND_310P
+    int kq_path = ggml_cann_kq_matmul_path(tensor);
+#else
+    int kq_path = GGML_CANN_KQ_NONE;
+#endif
+    const bool is_kq = kq_path != GGML_CANN_KQ_NONE;
+    const bool is_nz = !is_quantized && !is_kq && tensor->type != GGML_TYPE_BF16 && weight_to_nz &&
+                       ggml_cann_is_weight_layout_candidate((const ggml_tensor *) tensor);
+
+    if (ggml_cann_q8_moe_expert(tensor) && stride_tensor == size && size > 0) {
+        TensorSetTracker * tracker = ctx->get_or_create_tracker(tensor);
+        std::unique_lock<std::mutex> lock(tracker->mtx);
+        if (tracker->host_buffer.empty()) {
+            tracker->host_buffer.resize(tracker->total_bytes);
+        }
+        uint8_t * dst = tracker->host_buffer.data() + offset;
+        for (size_t i = 0; i < n_copies; i++) {
+            memcpy(dst + i * stride_tensor, (const char *) data + i * stride_data, size);
+        }
+        tracker->bytes_written += size * n_copies;
+        if (tracker->bytes_written >= tracker->total_bytes) {
+            ggml_backend_cann_q8_expert_upload_a8(tensor, tracker->host_buffer.data(), ctx);
+            lock.unlock();
+            ctx->remove_tracker(tensor);
+        }
+        return;
+    }
+
+    // fast path: plain tensors with a contiguous destination are gathered on
+    // the host and uploaded in bulk. A k-axis split of a multi-dim tensor
+    // (e.g. MoE ffn_down_exps) would otherwise issue one tiny strided copy
+    // per row, which dominates the load time on large models. NZ tensors ride
+    // the same bulk upload with the ND bytes and defer the transform through
+    // the tracker, exactly like the chunked 1-D path.
+    static const bool set2d_fast = [] {
+        const char * e = getenv("GGML_CANN_SET2D_FAST");
+        return e == nullptr || e[0] != '0';
+    }();
+    if (set2d_fast && !is_quantized && !is_kq && stride_tensor == size && size > 0) {
+        char * dst = (char *) tensor->data + offset;
+        const size_t total = size * n_copies;
+        if (stride_data == size) {
+            ACL_CHECK(aclrtMemcpy(dst, total, data, total, ACL_MEMCPY_HOST_TO_DEVICE));
+        } else {
+            // strided source: stage contiguous batches of rows, then bulk-upload
+            const size_t rows_per_batch = std::max<size_t>(1, (256ull << 20) / size);
+            std::vector<char> stage(std::min(total, rows_per_batch * size));
+            for (size_t b0 = 0; b0 < n_copies; b0 += rows_per_batch) {
+                const size_t rows = std::min(rows_per_batch, n_copies - b0);
+                for (size_t i = 0; i < rows; i++) {
+                    memcpy(stage.data() + i*size, (const char *) data + (b0 + i)*stride_data, size);
+                }
+                ACL_CHECK(aclrtMemcpy(dst + b0*size, rows*size, stage.data(), rows*size, ACL_MEMCPY_HOST_TO_DEVICE));
+            }
+        }
+        if (is_nz) {
+            TensorSetTracker * tracker = ctx->get_or_create_tracker(tensor);
+            std::unique_lock<std::mutex> lock(tracker->mtx);
+            tracker->bytes_written += total;
+            if (tracker->bytes_written >= tracker->total_bytes) {
+                weight_format_to_nz(tensor, ctx->device);
+                lock.unlock();
+                ctx->remove_tracker(tensor);
+            }
+        }
+        return;
+    }
+
+    // contiguous destination but a layout the 2D copy can express directly
+    if (set2d_fast && !is_quantized && !is_kq && !is_nz) {
+        ACL_CHECK(aclrtMemcpy2d((char *) tensor->data + offset, stride_tensor, data, stride_data,
+                                size, n_copies, ACL_MEMCPY_HOST_TO_DEVICE));
+        return;
+    }
+
+    // transformed layouts must go through the tracker/transform logic
+    for (size_t i = 0; i < n_copies; i++) {
+        ggml_backend_cann_buffer_set_tensor(buffer, tensor, (const char *) data + i*stride_data,
+                                            offset + i*stride_tensor, size);
+    }
+}
+
 /**
  * @brief Get tensor data from a CANN buffer.
  *
@@ -2215,11 +2542,22 @@ static void ggml_backend_cann_buffer_get_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cann_buffer_context * ctx = (ggml_backend_cann_buffer_context *) buffer->context;
 
     ggml_cann_set_device(ctx->device);
+    ggml_backend_cann_drain_device(ctx->device);
 
     if (tensor->type == GGML_TYPE_W8A8) {
         ggml_backend_cann_w8a8_get_tensor(tensor, data, offset, size);
         return;
     }
+
+    if (ggml_cann_q8_moe_expert(tensor)) {
+        // Re-quantization is lossy: the original Q8_0 blocks cannot be recovered.
+        GGML_LOG_ERROR("cann get_tensor: '%s' (type %s) was re-quantized for the NPU grouped A8 matmul; "
+                       "original data is not recoverable, zero-filling\n",
+                       ggml_get_name(tensor), ggml_type_name(tensor->type));
+        memset(data, 0, size);
+        return;
+    }
+
 #ifdef ASCEND_310P
     if (ggml_cann_kq_matmul_path(tensor) != GGML_CANN_KQ_NONE) {
         // Re-quantization is lossy: the original GGUF bytes cannot be recovered.
@@ -2336,7 +2674,7 @@ static const ggml_backend_buffer_i ggml_backend_cann_buffer_interface = {
     /* .memset_tensor   = */ ggml_backend_cann_buffer_memset_tensor,
     /* .set_tensor      = */ ggml_backend_cann_buffer_set_tensor,
     /* .get_tensor      = */ ggml_backend_cann_buffer_get_tensor,
-    /* .set_tensor_2d   = */ NULL,
+    /* .set_tensor_2d   = */ ggml_backend_cann_buffer_set_tensor_2d,
     /* .get_tensor_2d   = */ NULL,
     /* .cpy_tensor      = */ ggml_backend_cann_buffer_cpy_tensor,
     /* .clear           = */ ggml_backend_cann_buffer_clear,
@@ -2417,7 +2755,7 @@ static size_t ggml_backend_cann_buffer_type_get_alloc_size(ggml_backend_buffer_t
     // K-quant matmul weight: reserve the re-quantized device layout size
     // (must agree with ggml_backend_cann_buffer_set_tensor).
     {
-        const int kq_path = ggml_cann_kq_matmul_path(tensor);
+        int kq_path = ggml_cann_kq_matmul_path(tensor);
         if (kq_path != GGML_CANN_KQ_NONE) {
             return ggml_cann_kq_layout_size(tensor, kq_path);
         }
@@ -2434,6 +2772,13 @@ static size_t ggml_backend_cann_buffer_type_get_alloc_size(ggml_backend_buffer_t
         const size_t private_size = ggml_cann_w8a8_is_expert(tensor)
             ? ggml_cann_w8a8_expert_scale_offset(tensor) + tensor->ne[1] * tensor->ne[2] * sizeof(float)
             : ggml_cann_w8a8_scale_offset(tensor) + tensor->ne[1] * sizeof(float);
+        return std::max(size, private_size);
+    }
+
+    if (ggml_cann_q8_moe_expert(tensor)) {
+        // Reserve the grouped A8 layout (payload plane + per-row scale plane).
+        const size_t private_size =
+            ggml_cann_w8a8_expert_scale_offset(tensor) + tensor->ne[1] * tensor->ne[2] * sizeof(float);
         return std::max(size, private_size);
     }
 
@@ -2798,8 +3143,10 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
                     GGML_ABORT("CANN W8A8 MoE requires a supported 3D expert tensor layout");
                 }
                 ggml_cann_mul_mat_id_grouped(ctx, dst);
-            } else if (parse_bool(get_env_as_lowercase("GGML_CANN_MOE_GROUPED").value_or("off")) &&
-                       ggml_cann_mul_mat_id_grouped_supported(dst)) {
+            } else if (ggml_cann_mul_mat_id_grouped_supported(dst)) {
+                // gate/up experts (F16) go through the grouped route when the
+                // layout contract holds; down experts are rejected there and
+                // handled by the whole-layer MoE fusion instead.
                 ggml_cann_mul_mat_id_grouped(ctx, dst);
             } else {
                 ggml_cann_mul_mat_id(ctx, dst);
@@ -2952,9 +3299,23 @@ static const char * ggml_backend_cann_name(ggml_backend_t backend) {
  */
 static void ggml_backend_cann_free(ggml_backend_t backend) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
+
+    // all pending submissions must be done before tearing anything down
+    g_cann_dev_ctxs[cann_ctx->device] = nullptr;
+    if (cann_ctx->worker) {
+        cann_worker_stop(cann_ctx->worker.get());
+    }
+
     ggml_cann_paged_attn_cleanup(*cann_ctx);
+    ggml_cann_set_device(cann_ctx->device);
     ACL_CHECK(aclrtSynchronizeDevice());
-    ACL_CHECK(aclrtResetDevice(cann_ctx->device));
+
+    // only the last backend on this device may reset it, sibling backends of
+    // a TP group (or a second meta backend holding the paged KV pools) may
+    // still use the device
+    if (cann_device_users_release(cann_ctx->device)) {
+        ACL_CHECK(aclrtResetDevice(cann_ctx->device));
+    }
 
     delete cann_ctx;
     delete backend;
@@ -2982,6 +3343,9 @@ static void ggml_backend_cann_set_tensor_async(ggml_backend_t backend,
     GGML_ASSERT(buf->buft == ggml_backend_cann_buffer_type(cann_ctx->device) && "unsupported buffer type");
     GGML_ASSERT(!ggml_is_quantized(tensor->type));
 
+    // the stream belongs to this device's context, so it must be the current one
+    ggml_cann_set_device(cann_ctx->device);
+    ggml_backend_cann_drain_submit(cann_ctx);
     ACL_CHECK(aclrtMemcpyAsync((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE,
                                cann_ctx->stream()));
 }
@@ -3008,6 +3372,9 @@ static void ggml_backend_cann_get_tensor_async(ggml_backend_t      backend,
     GGML_ASSERT(buf->buft == ggml_backend_cann_buffer_type(cann_ctx->device) && "unsupported buffer type");
     GGML_ASSERT(!ggml_is_quantized(tensor->type));
 
+    // the stream belongs to this device's context, so it must be the current one
+    ggml_cann_set_device(cann_ctx->device);
+    ggml_backend_cann_drain_submit(cann_ctx);
     ACL_CHECK(aclrtMemcpyAsync(data, size, (char *) tensor->data + offset, size, ACL_MEMCPY_DEVICE_TO_HOST,
                                cann_ctx->stream()));
 }
@@ -3070,6 +3437,8 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
         ACL_CHECK(aclrtDeviceEnablePeerAccess(cann_ctx_dst->device, 0));
 
         // wait for task_queue empty to keep task order.
+        ggml_backend_cann_drain_submit(cann_ctx_src);
+        ggml_backend_cann_drain_submit(cann_ctx_dst);
         ACL_CHECK(aclrtMemcpyAsync(dst->data, copy_size, src->data, copy_size, ACL_MEMCPY_DEVICE_TO_DEVICE,
                                    cann_ctx_src->stream()));
         // record event on src stream after the copy
@@ -3085,6 +3454,9 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
         ACL_CHECK(aclrtSynchronizeStream(cann_ctx_src->stream()));
     } else {
         // src and dst are on the same backend
+        // the stream belongs to this device's context, so it must be the current one
+        ggml_cann_set_device(cann_ctx_dst->device);
+        ggml_backend_cann_drain_submit(cann_ctx_dst);
         ACL_CHECK(aclrtMemcpyAsync(dst->data, copy_size, src->data, copy_size, ACL_MEMCPY_DEVICE_TO_DEVICE,
                                    cann_ctx_dst->stream()));
     }
@@ -3102,6 +3474,11 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
  */
 static void ggml_backend_cann_synchronize(ggml_backend_t backend) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
+    if (cann_ctx->worker) {
+        // wait for host-side submission of any pending job, then wait for the device
+        const ggml_status status = cann_worker_wait_idle(cann_ctx->worker.get());
+        GGML_ASSERT(status == GGML_STATUS_SUCCESS);
+    }
     ggml_cann_set_device(cann_ctx->device);
     ACL_CHECK(aclrtSynchronizeStream(cann_ctx->stream()));
 }
@@ -3122,23 +3499,31 @@ static void ggml_backend_cann_synchronize(ggml_backend_t backend) {
 static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
                                int                                 node_idx,
                                std::initializer_list<enum ggml_op> ops) {
+    // CANN backend supports fusing ADD + RMS_NORM operations
     if ((ops.size() == 2) && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_RMS_NORM) {
-        ggml_tensor * add_node       = cgraph->nodes[node_idx];
-        ggml_tensor * rms_norm_node  = cgraph->nodes[node_idx + 1];
-
-        if (add_node->op != GGML_OP_ADD || rms_norm_node->op != GGML_OP_RMS_NORM) {
+        if (node_idx + 1 >= cgraph->n_nodes) {
+            return false;
+        }
+        ggml_tensor * add_node  = cgraph->nodes[node_idx];
+        ggml_tensor * norm_node = cgraph->nodes[node_idx + 1];
+        if (add_node->op != GGML_OP_ADD || norm_node->op != GGML_OP_RMS_NORM) {
+            return false;
+        }
+        // The fused AddRmsNorm op writes both the sum (xout) and the norm
+        // output, so the ADD result may keep further consumers (residual
+        // chain). Skip ggml_can_fuse's single-use rule and check the pair
+        // directly.
+        if (norm_node->src[0] != add_node || !ggml_are_same_shape(norm_node, add_node)) {
+            return false;
+        }
+        if (add_node->type != norm_node->type) {
             return false;
         }
         if ((add_node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
-            (rms_norm_node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            (norm_node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             return false;
         }
-        if (rms_norm_node->src[0] != add_node) {
-            return false;
-        }
-        if (add_node->type != rms_norm_node->type) {
-            return false;
-        }
+        // TODO: support broadcast for ADD + RMS_NORM
         if (add_node->src[0]->ne[0] != add_node->src[1]->ne[0] || add_node->src[0]->ne[1] != add_node->src[1]->ne[1] ||
             add_node->src[0]->ne[2] != add_node->src[1]->ne[2] || add_node->src[0]->ne[3] != add_node->src[1]->ne[3]) {
             return false;
@@ -3419,7 +3804,7 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
  * @return enum ggml_status Returns GGML_STATUS_SUCCESS if computation
  *         completes successfully, otherwise an appropriate error status.
  */
-static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+static enum ggml_status ggml_backend_cann_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
     ggml_cann_set_device(cann_ctx->device);
     // One-time summary of the switch state for this run.
@@ -3495,6 +3880,9 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
         parse_bool(get_env_as_lowercase("GGML_CANN_PREFILL_USE_GRAPH").value_or(""));
     bool use_cann_graph = !graph_is_prefill(cgraph) || prefill_use_graph_override;
 
+    // gate ACL graphs by the explicit decode phase borrowed from the owning
+    // llama_context; piecewise mode bypasses the phase gate (it splits the
+    // graph itself and runs attention eagerly)
     if (!cann_ctx->piecewise_mode) {
         use_cann_graph = cann_ctx->graph_decode_mode_ptr &&
             (*cann_ctx->graph_decode_mode_ptr == GGML_GRAPH_PHASE_DECODE ||
@@ -3502,8 +3890,55 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
              *cann_ctx->graph_decode_mode_ptr == GGML_GRAPH_PHASE_DRAFT_KV_INJECT_DECODE);
     }
 
+    // TP worker captures are validated for single-token decode graphs only;
+    // multi-token batches (e.g. 32-slot server decode) stay eager, the 11-10
+    // host firmware wedge happened with such graphs captured
+    if (cann_ctx->worker && graph_is_prefill(cgraph)) {
+        use_cann_graph = false;
+    }
+
     if (!cann_ctx->acl_graph_mode) {
         use_cann_graph = false;
+    }
+
+    // Worker mode must not capture: the meta backend's fallback reductions
+    // use synchronous copies enqueued from the caller thread, which would
+    // race a capture region active on the worker stream. With a healthy HCCL
+    // comm the collectives are posted as worker callbacks (serialized by the
+    // same FIFO) and captures are safe in principle, but some models (e.g.
+    // dense GDN hybrids whose delta-net core runs on the CPU) get unstable
+    // split-tensor addresses every step, which degenerates the LRU cache
+    // into a recapture storm and eventually aborts. GGML_CANN_ACL_GRAPH_TP=1
+    // opts into worker captures for models where the addresses are stable
+    // (verified ~+5% tg on Qwen3.6-35B-A3B).
+    static const bool graph_tp = [] {
+        const char * e = getenv("GGML_CANN_ACL_GRAPH_TP");
+        return e != nullptr && e[0] == '1';
+    }();
+    if (!graph_tp && cann_ctx->worker) {
+        use_cann_graph = false;
+    }
+    if (ggml_backend_cann_worker_disabled()) {
+        use_cann_graph = false;
+    }
+
+    // Attention-family nodes bake host-side launch parameters (paged
+    // metadata, sequence lengths) into the captured graph and would replay
+    // with stale values, so any subgraph containing one stays eager. The
+    // remaining subgraphs (FFN blocks, projections, elementwise) have no
+    // such host dependency and capture whole.
+    // Verified by experiment (2026-11-02): force-capturing these ops with
+    // the preload gaps fixed still wedged the host driver (host-side sync
+    // inside the capture region), so the exclusion is a hard requirement.
+    if (use_cann_graph) {
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const enum ggml_op op = cgraph->nodes[i]->op;
+            if (op == GGML_OP_FLASH_ATTN_EXT || op == GGML_OP_PAGED_ATTN ||
+                    op == GGML_OP_GATED_DELTA_NET || op == GGML_OP_GATED_LINEAR_ATTN) {
+                use_cann_graph = false;
+                break;
+            }
+        }
     }
 
     if (use_cann_graph) {
@@ -3518,11 +3953,23 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
                 use_cann_graph = false;
                 break;
             }
+            // The NZ grouped-matmul workspace is not safe to replay from the
+            // ACL graph cache on CANN 9.1 (long decodes can fail inside the
+            // quant kernel with an invalid GM address), so NZ expert graphs
+            // always run eager.
+            if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr &&
+                ggml_cann_a8_grouped_expert(node->src[0]) && node->src[0]->extra != nullptr) {
+                static std::once_flag nz_moe_fallback_once;
+                std::call_once(nz_moe_fallback_once, []() {
+                    GGML_LOG_INFO("CANN graph: eager fallback for W8A8 MoE FRACTAL_NZ\n");
+                });
+                use_cann_graph = false;
+                break;
+            }
         }
     }
 
-    if (use_cann_graph && !cann_ctx->piecewise_mode) {
-        // LRU cache operations (skip when piecewise mode is on)
+    if (use_cann_graph) {
         // If no matching graph is found, the graph needs to be recaptured.
             // Debug switch: force re-capture every step. Read per call so
             // scoped toggles (paged warmup) take effect.
@@ -3578,7 +4025,6 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
-
         if (graph_capture_required) {
             // If no matching graph is found, add a new ACL graph.
             ggml_cann_graph * new_graph = ggml_cann_graph::create_from_cgraph(cgraph);
@@ -3649,6 +4095,50 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
 }
 
 /**
+ * @brief Computes a computational graph using a CANN backend.
+ *
+ * With multiple CANN devices (tensor parallelism) the graph is queued to the
+ * per-device worker thread, which keeps the device binding and the CANN
+ * thread-local execution caches single-device per thread. The call returns as
+ * soon as the graph is queued; host-side submission completion is observed via
+ * ggml_backend_synchronize or the ggml_backend_wait_submit proc (device
+ * completion is governed by stream ordering).
+ */
+static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
+
+    if (cann_ctx->worker == nullptr && ggml_backend_cann_worker_enabled()) {
+        // create the default stream on the calling thread before the worker
+        // starts, so later main-thread copies never race the lazy creation
+        ggml_cann_set_device(cann_ctx->device);
+        cann_ctx->stream();
+        cann_ctx->worker = std::make_unique<cann_worker>();
+        cann_worker_start(cann_ctx->worker.get(), backend, ggml_backend_cann_graph_compute_impl);
+        g_cann_dev_ctxs[cann_ctx->device] = cann_ctx;
+        GGML_LOG_INFO("cann worker started on device %d (active devices: %d)\n",
+                      cann_ctx->device, cann_device_users_active());
+    }
+
+    if (cann_ctx->worker) {
+        cann_worker_post_graph(cann_ctx->worker.get(), cgraph);
+        // Single-device use has nothing to overlap, so return only after
+        // submission: the scheduler enqueues split-boundary events and async
+        // tensor copies on this stream right after graph_compute, and those
+        // must stay ordered behind this graph (multi-split graphs with CPU
+        // islands, e.g. hybrid GDN models, would read stale data otherwise).
+        if (cann_device_users_active() <= 1) {
+            const ggml_status status = cann_worker_wait_idle(cann_ctx->worker.get());
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+        }
+        return GGML_STATUS_SUCCESS;
+    }
+
+    return ggml_backend_cann_graph_compute_impl(backend, cgraph);
+}
+
+/**
  * @brief Checks if the CANN backend supports a specific operation.
  *
  * This function checks whether the specified operation is supported by the
@@ -3705,6 +4195,15 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
 #endif
                     case GGML_TYPE_F16:
                     case GGML_TYPE_F32:
+                        // Same residency contract as the K-quant paths below:
+                        // the weight must already live in a CANN (or
+                        // CANN-only meta) buffer holding the device layout.
+                        // A weight in a host buffer holds raw bytes, e.g.
+                        // with -ngl 0, and must stay on its own backend.
+                        if (op->src[0]->buffer == nullptr ||
+                                !ggml_backend_buft_is_cann(op->src[0]->buffer->buft)) {
+                            return false;
+                        }
                         return true;
                     case GGML_TYPE_Q8_0:
                         // Q8_0 MUL_MAT on 310P: routed to the W8A8 K-quant path
@@ -3770,6 +4269,12 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             switch (op->src[0]->type) {
                 case GGML_TYPE_F16:
                 case GGML_TYPE_F32:
+                    // experts need the load-time fractal layout: same
+                    // residency contract as GGML_OP_MUL_MAT above
+                    if (op->src[0]->buffer == nullptr ||
+                            !ggml_backend_buft_is_cann(op->src[0]->buffer->buft)) {
+                        return false;
+                    }
                     return true;
 #ifdef ASCEND_310P
                 case GGML_TYPE_W8A8: {
@@ -3790,6 +4295,34 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 }
 #endif
                 case GGML_TYPE_Q8_0:
+#ifdef ASCEND_310P
+                    {
+                        // Per-group Q8 matmul is not supported on 310P; MoE
+                        // experts are re-quantized to the grouped A8 layout.
+                        if (!ggml_cann_q8_moe_expert(op->src[0])) {
+                            return false;
+                        }
+                        static const bool moe_cpu =
+                            parse_bool(get_env_as_lowercase("GGML_CANN_MOE_CPU").value_or("off"));
+                        if (moe_cpu) {
+                            return false;
+                        }
+                        if (op->src[0]->buffer == nullptr ||
+                                !ggml_backend_buft_is_cann(op->src[0]->buffer->buft)) {
+                            return false;
+                        }
+                        return op->src[0]->ne[0] % 32 == 0 &&
+                               op->src[0]->ne[1] % 16 == 0 &&
+                               op->src[0]->ne[3] == 1 &&
+                               (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
+                               (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
+                               op->src[2]->type == GGML_TYPE_I32 && op->src[2]->nb[0] == sizeof(int32_t) &&
+                               ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                               ggml_is_contiguous(op);
+                    }
+#endif
+                    // only support contiguous for quantized types.
+                    return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op);
                 case GGML_TYPE_Q4_0:
 #ifdef ASCEND_310P
                     // Q4 && Q8 per group is not support on 310p device
@@ -3871,11 +4404,18 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     return false;
                 }
 #ifdef ASCEND_310P
-                // CANN 310P IMROPE Q is unstable for one-token decode.
+                // Atlas inference products impose this documented constraint
+                // on aclnnRotaryPositionEmbedding for BNSD partial rotation:
+                // D <= 128, D % 32 == 0, and B * N <= S * 8. Do not send an
+                // out-of-contract shape to the vendor operator; its output is
+                // undefined. Full-width rotation uses the 310P composite path.
                 const int32_t * rope_params = (const int32_t *) op->op_params;
                 const int * sections = rope_params + 11;
+                const int64_t rope_dims = rope_params[1];
                 if (rope_params[2] == GGML_ROPE_TYPE_IMROPE && sections[3] == 0 &&
-                    op->ne[1] > 4 && op->ne[2] == 1) {
+                    rope_dims < op->ne[0] &&
+                    (rope_dims > 128 || rope_dims % 32 != 0 ||
+                     op->ne[1] * op->ne[3] > op->ne[2] * 8)) {
                     return false;
                 }
                 // Partial rope (n_dims < ne[0]) takes the
@@ -3966,6 +4506,10 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
             return true;
         case GGML_OP_GATED_DELTA_NET:
             {
+                // debug switch: force the GDN core onto the CPU backend
+                if (parse_bool(get_env_as_lowercase("GGML_CANN_GDN_CPU").value_or("off"))) {
+                    return false;
+                }
                 // fused path via the standard 310P APIs: decode is a single
                 // recurrent call, prefill is a single chunk call (8-token block
                 // loop as fallback)
@@ -3988,12 +4532,14 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     q->ne[1] > 256 || v->ne[1] > 256) {
                     return false;
                 }
-                // GQA head-mapping divergence: the V310 kernel (fla lineage)
+                // GQA head-mapping divergence: the kernel (fla lineage)
                 // maps v-head h to k-head h / (Nv/Nk), the llama.cpp reference
-                // kernels use modulo (h % Nk). The two only agree when
-                // NK == NV, so reject GQA shapes here and let them run on the
-                // CPU reference instead of mismatching.
-                if (q->ne[1] != v->ne[1]) {
+                // kernels use modulo (h % Nk). The glue gathers the v-head axis
+                // into the kernel's block grouping before the call and restores
+                // the llama.cpp order on the outputs, so GQA shapes run on
+                // device. GGML_CANN_GDN_GQA_PERM=0 disables the reorder and
+                // rejects GQA shapes again (CPU reference).
+                if (q->ne[1] != v->ne[1] && !ggml_cann_gdn_gqa_perm_enabled()) {
                     return false;
                 }
                 // the glue casts every source via F32 readers, an F16 (or
@@ -4159,6 +4705,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
  */
 static void ggml_backend_cann_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
+    ggml_backend_cann_drain_submit(cann_ctx);
     ACL_CHECK(aclrtRecordEvent((aclrtEvent) event->context, cann_ctx->stream()));
 }
 
@@ -4175,6 +4722,7 @@ static void ggml_backend_cann_event_record(ggml_backend_t backend, ggml_backend_
 static void ggml_backend_cann_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
     if (ggml_backend_is_cann(backend)) {
+        ggml_backend_cann_drain_submit(cann_ctx);
         ACL_CHECK(aclrtStreamWaitEvent(cann_ctx->stream(), (aclrtEvent) event->context));
     } else {
         GGML_ABORT("fatal error");
@@ -4422,8 +4970,43 @@ static void ggml_backend_cann_bind_graph_decode_mode(ggml_backend_t backend, con
 }
 #endif
 
+static void ggml_backend_cann_set_prefill(ggml_backend_t backend, bool prefill) {
+    ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
+    cann_ctx->prefill_phase = prefill;
+}
+// Wait until the worker finished host-side submission of everything posted to
+// this backend. Device execution may still be in flight (stream ordering).
+static ggml_status ggml_backend_cann_wait_submit(ggml_backend_t backend) {
+    ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
+    if (cann_ctx->worker) {
+        return cann_worker_wait_idle(cann_ctx->worker.get());
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+
 static void * ggml_backend_cann_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+
+    // tensor parallelism communication hooks, consumed by the meta backend
+    if (strcmp(name, "ggml_backend_comm_init") == 0) {
+        return (void *) ggml_backend_cann_comm_init;
+    }
+    if (strcmp(name, "ggml_backend_comm_free") == 0) {
+        return (void *) ggml_backend_cann_comm_free;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
+        return (void *) ggml_backend_cann_comm_allreduce_tensor;
+    }
+    // wait for pending host-side submissions, consumed by the meta backend
+    if (strcmp(name, "ggml_backend_wait_submit") == 0) {
+        return (void *) ggml_backend_cann_wait_submit;
+    }
+    // explicit prefill/decode phase, avoids guessing the phase from graph shapes
+    if (strcmp(name, "ggml_backend_cann_set_prefill") == 0) {
+        return (void *) ggml_backend_cann_set_prefill;
+    }
+
     GGML_UNUSED(name);
 #ifdef USE_ACL_GRAPH
     if (strcmp(name, "ggml_backend_bind_graph_decode_mode") == 0) {
@@ -4511,6 +5094,7 @@ ggml_backend_t ggml_backend_cann_init(int32_t device) {
         return nullptr;
     }
     ggml_cann_set_device(ctx->device);
+    cann_device_users_acquire(ctx->device);
     ggml_backend_t cann_backend =
         new ggml_backend{ /* .guid      = */ ggml_backend_cann_guid(),
                           /* .interface = */ ggml_backend_cann_interface,

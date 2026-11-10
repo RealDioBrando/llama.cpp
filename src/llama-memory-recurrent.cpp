@@ -17,6 +17,40 @@
 // llama_memory_recurrent
 //
 
+// The fused GDN core must run on the layer device for the s state to be
+// offloaded: when the device does not support the op, the state is produced
+// on the CPU, so keeping it there avoids split/scatter semantics under
+// tensor parallelism and saves a device roundtrip per step.
+static bool llama_dev_supports_gdn(ggml_backend_dev_t dev, const llama_hparams & hparams) {
+    // probe with the model's real head layout: GQA variants (n_k != n_v heads)
+    // are rejected by the fused kernels, so their state must stay on the CPU
+    const int64_t d_k = hparams.ssm_d_state;
+    const int64_t n_k = hparams.ssm_n_group;
+    const int64_t n_v = hparams.ssm_dt_rank;
+    const int64_t d_v = n_v > 0 ? hparams.ssm_d_inner / n_v : 0;
+    if (d_k == 0 || n_k == 0 || n_v == 0 || d_v == 0) {
+        return false;
+    }
+
+    ggml_init_params iparams = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*8,
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(iparams) };
+    if (!ctx) {
+        return false;
+    }
+    ggml_tensor * q    = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d_k, n_k, 1, 1);
+    ggml_tensor * k    = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d_k, n_k, 1, 1);
+    ggml_tensor * v    = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d_v, n_v, 1, 1);
+    ggml_tensor * g    = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 1, n_v, 1, 1);
+    ggml_tensor * beta = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, 1, n_v, 1, 1);
+    ggml_tensor * s    = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, d_v, d_v, n_v, 1);
+    ggml_tensor * op   = ggml_gated_delta_net(ctx.get(), q, k, v, g, beta, s, 1);
+    return op != nullptr && ggml_backend_dev_supports_op(dev, op);
+}
+
 llama_memory_recurrent::llama_memory_recurrent(
         const llama_model & model,
                 ggml_type   type_r,
@@ -83,10 +117,14 @@ llama_memory_recurrent::llama_memory_recurrent(
         const char * dev_name = "CPU";
 
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        ggml_backend_buffer_type_t buft_s = buft;
 
         if (offload) {
             auto * dev = model.dev_layer(i);
             buft = ggml_backend_dev_buffer_type(dev);
+            if (llama_dev_supports_gdn(dev, hparams)) {
+                buft_s = buft;
+            }
 
             dev_name = ggml_backend_dev_name(dev);
         }
@@ -97,10 +135,14 @@ llama_memory_recurrent::llama_memory_recurrent(
         if (!ctx) {
             throw std::runtime_error("failed to create ggml context for rs cache");
         }
+        ggml_context * ctx_s = ctx_for_buft(buft_s);
+        if (!ctx_s) {
+            throw std::runtime_error("failed to create ggml context for rs cache");
+        }
 
         const uint32_t n_rows = mem_size * (1 + n_rs_seq);
         ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx_s, type_s, hparams.n_embd_s(), n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;

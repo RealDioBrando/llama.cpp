@@ -1304,11 +1304,17 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
     const uint32_t head_dim   = llama_model_n_embd(model) / llama_model_n_head(model);
     const uint32_t block_size = params.block_size;
 
+    // n_ctx = 0 means the model default, resolve it the same way as the context
+    const uint32_t n_ctx = params.n_ctx != 0 ? (uint32_t) params.n_ctx : (uint32_t) llama_model_n_ctx_train(model);
+
     const size_t bytes_per_block = (size_t)2 * head_dim * n_heads_kv * block_size * n_layers * ggml_type_size(GGML_TYPE_F16);
 
-    const size_t margin = params.fit_params_target.empty()
-        ? (size_t)(total_vram * 0.05f)
-        : (size_t)params.fit_params_target[0];
+    // the margin is the only headroom left for runtime buffers and the ATB
+    // workspace: on a mostly free card the pool would otherwise squeeze them
+    // out and atb::CreateContext fails at the first paged decode
+    const size_t margin = std::max(
+        params.fit_params_target.empty() ? (size_t)(total_vram * 0.05f) : (size_t)params.fit_params_target[0],
+        (size_t)2 * 1024 * 1024 * 1024);
 
     if (free_vram <= margin) {
         LOG_ERR("%s: not enough free VRAM for paged KV blocks. "
@@ -1330,7 +1336,7 @@ static void common_fit_paged_kv_blocks(common_params& params, const llama_model 
     // Paged scheduler treats n_ctx as per-sequence capacity.
     const uint32_t n_seq_max = std::max(1u, (uint32_t) std::max(0, params.n_parallel));
     const double   watermark = std::clamp((double) params.kv_paged_watermark, 0.0, 0.99);
-    const uint64_t context_gpu_tokens = (uint64_t) params.n_ctx * n_seq_max;
+    const uint64_t context_gpu_tokens = (uint64_t) n_ctx * n_seq_max;
     const uint64_t context_gpu_blocks =
         (uint64_t) std::ceil((double) context_gpu_tokens / block_size / (1.0 - watermark));
     const uint32_t n_gpu_blocks =

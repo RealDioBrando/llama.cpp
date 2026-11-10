@@ -288,6 +288,8 @@ ggml_tensor * llama_model_qwen35moe::graph::build_norm_gated(
         int           layer) {
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
     ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
+    cb(normalized, "ng_normed", layer);
+    cb(gated_silu, "ng_silu", layer);
 
     return ggml_mul(ctx0, normalized, gated_silu);
 }
@@ -472,7 +474,11 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
-    //v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+    // v is a strided slice of the qkv conv row; the meta backend cannot gather
+    // a head-split strided view across devices when the GDN core runs on the
+    // CPU, so materialize it into its own contiguous tensor (q/k are already
+    // materialized by the l2 norm above)
+    v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
     // if head keys and value keys are different, repeat to force tensors into matching shapes
     // note: need explicit repeat only if we are not using the fused GDN.

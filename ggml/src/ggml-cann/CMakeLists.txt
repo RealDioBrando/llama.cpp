@@ -67,6 +67,7 @@ if (CANN_INSTALL_DIR)
         nnopbase
         opapi
         acl_op_compiler
+        hccl
     )
 
     file(GLOB GGML_SOURCES_CANN "*.cpp")
