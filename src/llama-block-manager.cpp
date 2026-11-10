@@ -101,6 +101,7 @@ void llama_block_manager::release_gpu_blocks(const physical_block_ids & freed_bl
         if (gpu_registry[id].ref_count <= 0) {
             gpu_registry[id].ref_count = 0;
             gpu_registry[id].generation += 1;
+            gpu_registry[id].tag.clear();
             free_gpu_ids.push_back(id);
         }
     }
@@ -117,6 +118,7 @@ void llama_block_manager::release_cpu_blocks(const physical_block_ids & freed_bl
         if (cpu_registry[id - total_num_gpu_blocks].ref_count <= 0) {
             cpu_registry[id - total_num_gpu_blocks].ref_count = 0;
             cpu_registry[id - total_num_gpu_blocks].generation += 1;
+            cpu_registry[id - total_num_gpu_blocks].tag.clear();
             free_cpu_ids.push_back(id);
         }
     }
@@ -162,4 +164,38 @@ uint32_t llama_block_manager::block_generation(uint32_t id) const {
         return 0;
     }
     return cpu_registry[cpu_id].generation;
+}
+
+void llama_block_manager::set_tag(uint32_t id, const std::string & tag) {
+    physical_block * blk = nullptr;
+    if (id < total_num_gpu_blocks) {
+        blk = &gpu_registry[id];
+    } else {
+        const uint32_t cpu_id = id - total_num_gpu_blocks;
+        if (cpu_id >= total_num_cpu_blocks) {
+            LLAMA_LOG_WARN("%s: tag write on invalid block %u\n", __func__, id);
+            return;
+        }
+        blk = &cpu_registry[cpu_id];
+    }
+    if (blk->ref_count == 0) {
+        // Tagging a free block would leave an owner on a block that has no
+        // request behind it; a later checkout outside allocate() (swap_in)
+        // would silently inherit that stale owner. Refuse and warn.
+        LLAMA_LOG_WARN("%s: tag '%s' rejected on free block %u\n", __func__, tag.c_str(), id);
+        return;
+    }
+    blk->tag = tag;
+}
+
+const std::string & llama_block_manager::tag(uint32_t id) const {
+    static const std::string empty;
+    if (id < total_num_gpu_blocks) {
+        return gpu_registry[id].tag;
+    }
+    const uint32_t cpu_id = id - total_num_gpu_blocks;
+    if (cpu_id >= total_num_cpu_blocks) {
+        return empty;
+    }
+    return cpu_registry[cpu_id].tag;
 }

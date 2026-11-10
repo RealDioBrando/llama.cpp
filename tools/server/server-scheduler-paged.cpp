@@ -7,7 +7,10 @@
 
 #include <algorithm>
 #include <cstring>
+#include <map>
+#include <string>
 #include <thread>
+#include <vector>
 
 static bool paged_task_supported(const server_task & task) {
     // chat templates are applied in the HTTP layer and arrive here as
@@ -157,6 +160,12 @@ bool server_scheduler_paged::launch(server_task && task) {
             port.send_error(s, "failed to queue the request in the paged scheduler", ERROR_TYPE_SERVER);
             s.release();
             return true;
+        }
+        // The tag must be attached before the request is first scheduled,
+        // i.e. before any KV block is allocated (doc tag-kv-block-usage).
+        if (!s.task->params.tag.empty() &&
+            !llama_paged_scheduler_set_request_tag(sched, s.id, s.task->params.tag.c_str())) {
+            SLT_WRN(s, "tag '%s' was rejected by the paged scheduler\n", s.task->params.tag.c_str());
         }
         return true;
     };
@@ -687,6 +696,10 @@ bool server_scheduler_paged::launch_multimodal(server_task && task) {
         s.release();
         return true;
     }
+    if (!s.task->params.tag.empty() &&
+        !llama_paged_scheduler_set_request_tag(sched, s.id, s.task->params.tag.c_str())) {
+        SLT_WRN(s, "tag '%s' was rejected by the paged scheduler\n", s.task->params.tag.c_str());
+    }
 
     // overlap the first media chunk's encode with the first scheduler steps
     start_mm_prefetch(s);
@@ -959,6 +972,161 @@ bool server_scheduler_paged::verify_slot(server_slot & slot, int32_t off, int32_
         port.send_final_response(slot);
     }
     return keep_generating;
+}
+
+bool server_scheduler_paged::get_kv_stats(llama_paged_kv_cache_stats & out) {
+    if (sched == nullptr) {
+        return false;
+    }
+    return llama_paged_scheduler_get_kv_cache_stats(sched, &out);
+}
+
+namespace {
+
+json tag_usage_to_json(const llama_paged_tag_block_usage & usage) {
+    auto pool = [](const llama_paged_tag_pool_usage & p) {
+        return json{
+            {"full_blocks",   p.full_blocks},
+            {"linear_blocks", p.linear_blocks},
+        };
+    };
+    return json{
+        {"npu", pool(usage.npu)},
+        {"cpu", pool(usage.cpu)},
+    };
+}
+
+struct tag_block_ids {
+    std::vector<uint32_t> full_owned;
+    std::vector<uint32_t> full_shared;
+    std::vector<uint32_t> linear_owned;
+
+    json blocks_json() const {
+        auto to_array = [](const std::vector<uint32_t> & ids) {
+            json arr = json::array();
+            for (const uint32_t id : ids) {
+                arr.push_back(id);
+            }
+            return arr;
+        };
+        return json{
+            {"full",   {{"owned", to_array(full_owned)}, {"shared", to_array(full_shared)}}},
+            {"linear", {{"owned", to_array(linear_owned)}, {"shared", json::array()}}},
+        };
+    }
+
+    llama_paged_tag_block_usage usage() const {
+        llama_paged_tag_block_usage out = {};
+        out.npu.full_blocks   = full_owned.size();
+        out.npu.linear_blocks = linear_owned.size();
+        return out;
+    }
+};
+
+static tag_block_ids fetch_tag_block_ids(llama_paged_scheduler * sched, const std::string & tag) {
+    tag_block_ids ids;
+
+    // phase 1: required lengths (all output arrays NULL)
+    size_t n_full_owned   = 0;
+    size_t n_full_shared  = 0;
+    size_t n_linear_owned = 0;
+    llama_paged_scheduler_get_tag_block_ids(sched, tag.c_str(), nullptr, &n_full_owned, nullptr, &n_full_shared,
+                                            nullptr, &n_linear_owned);
+    ids.full_owned.resize(n_full_owned);
+    ids.full_shared.resize(n_full_shared);
+    ids.linear_owned.resize(n_linear_owned);
+
+    // phase 2: fill. Retry when the materialization grew between the phases;
+    // an empty list keeps its NULL pointer, which the API reports as length 0.
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        size_t c_full_owned   = ids.full_owned.size();
+        size_t c_full_shared  = ids.full_shared.size();
+        size_t c_linear_owned = ids.linear_owned.size();
+        const bool ok = llama_paged_scheduler_get_tag_block_ids(
+                sched, tag.c_str(),
+                ids.full_owned.empty()   ? nullptr : ids.full_owned.data(),   &c_full_owned,
+                ids.full_shared.empty()  ? nullptr : ids.full_shared.data(),  &c_full_shared,
+                ids.linear_owned.empty() ? nullptr : ids.linear_owned.data(), &c_linear_owned);
+        ids.full_owned.resize(c_full_owned);
+        ids.full_shared.resize(c_full_shared);
+        ids.linear_owned.resize(c_linear_owned);
+        if (ok) {
+            break;
+        }
+    }
+    return ids;
+}
+
+struct tag_block_collector {
+    std::map<std::string, tag_block_ids> tags;
+};
+
+void collect_tag_block(const char * tag, int32_t kind, uint32_t block_id, int32_t owned, void * user_data) {
+    auto * c = static_cast<tag_block_collector *>(user_data);
+    tag_block_ids & ids = c->tags[tag];
+    if (kind == 0) {
+        (owned ? ids.full_owned : ids.full_shared).push_back(block_id);
+    } else {
+        ids.linear_owned.push_back(block_id);
+    }
+}
+
+struct tag_usage_collector {
+    std::map<std::string, llama_paged_tag_block_usage> tags;
+};
+
+void collect_tag_usage(const char * tag, const llama_paged_tag_block_usage * usage, void * user_data) {
+    auto * c = static_cast<tag_usage_collector *>(user_data);
+    c->tags[tag] = *usage;
+}
+
+} // namespace
+
+bool server_scheduler_paged::get_tag_usage(const std::string & tag, bool include_blocks, json & out) {
+    if (sched == nullptr) {
+        return false;
+    }
+
+    if (!tag.empty()) {
+        if (include_blocks) {
+            // one materialization gives both the ids and their counts
+            const tag_block_ids ids = fetch_tag_block_ids(sched, tag);
+            out = tag_usage_to_json(ids.usage());
+            out["tag"]    = tag;
+            out["blocks"] = ids.blocks_json();
+            return true;
+        }
+
+        llama_paged_tag_block_usage usage = {};
+        if (!llama_paged_scheduler_get_tag_block_usage(sched, tag.c_str(), &usage)) {
+            return false;
+        }
+        out = tag_usage_to_json(usage);
+        out["tag"] = tag;
+        return true;
+    }
+
+    // Listing: one materialization for the whole table. With ?blocks=1 the
+    // counts are derived from the same id lists, so count == len(owned)
+    // holds even if the scheduler advanced between two queries.
+    json tags = json::object();
+    if (include_blocks) {
+        tag_block_collector c;
+        llama_paged_scheduler_for_each_tag_block(sched, nullptr, collect_tag_block, &c);
+        for (const auto & [tag_name, ids] : c.tags) {
+            json entry = tag_usage_to_json(ids.usage());
+            entry["blocks"] = ids.blocks_json();
+            tags[tag_name]  = entry;
+        }
+    } else {
+        tag_usage_collector c;
+        llama_paged_scheduler_for_each_tag_block_usage(sched, collect_tag_usage, &c);
+        for (const auto & [tag_name, usage] : c.tags) {
+            tags[tag_name] = tag_usage_to_json(usage);
+        }
+    }
+    out = json{{"tags", tags}};
+    return true;
 }
 
 std::unique_ptr<server_scheduler_interface> server_scheduler_create(server_context_port & port) {

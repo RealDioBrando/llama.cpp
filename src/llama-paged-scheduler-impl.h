@@ -4,10 +4,16 @@
 #include "llama-memory-hybrid-paged.h"
 #include "llama-paged-cache-manager.h"
 #include "llama-paged-queue.h"
+#include "llama-paged-tag-manager.h"
 
 #include <clocale>
 #include <cstdlib>
+#include <functional>
+#include <map>
 #include <memory>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 enum class llama_scheduler_status {
@@ -44,7 +50,40 @@ class llama_paged_scheduler_impl {
     const llama_paged_batch_info * get_curr_batch_info() const;
     bool set_prefix_cache_enabled(bool enabled);
 
+    //
+    // Tag accounting (doc tag-kv-block-usage). All queries must run on the
+    // scheduler thread; nothing here takes a lock.
+    //
+
+    // Attach an owner tag to a not-yet-admitted request. Returns false when
+    // the request is unknown or already holds blocks / a cache reservation
+    // (tagging after the first schedule step is rejected).
+    bool set_request_tag(int32_t request_id, const std::string & tag);
+
+    // Per-tag usage derived from owned blocks only. Tags that merely share
+    // someone else's blocks appear with zero counts.
+    void all_tag_block_usage(std::map<std::string, llama_paged_tag_usage> & out) const;
+    bool tag_block_usage(const std::string & tag, llama_paged_tag_usage & out) const;
+
+    // Block id detail for one tag. Ids are sorted ascending and the two id
+    // spaces (full / linear) are independent.
+    bool tag_blocks(const std::string & tag,
+                    std::vector<uint32_t> & full_owned,
+                    std::vector<uint32_t> & full_shared,
+                    std::vector<uint32_t> & linear_owned) const;
+
+    // Visit (tag, kind, block_id, owned) for one tag or all tags when `tag`
+    // is nullptr. kind: 0 = full, 1 = linear.
+    void for_each_tag_block(const std::string * tag, const llama_paged_tag_manager::block_cb & cb) const;
+
+    void kv_cache_block_stats(llama_paged_pool_stats & out) const;
+
   private:
+    // Snapshot of the tag -> block mapping for all live requests. The tag
+    // aggregation itself lives in llama_paged_tag_manager; the scheduler only
+    // contributes the active block tables.
+    llama_paged_tag_manager::snapshot materialize_tag_blocks() const;
+
     void insert_sorted_by_arrival_time(llama_sequence_group_ptr new_group, llama_sequence_group_list & list);
 
     // Remove and release-ownership the group with this request_id, or nullptr.
@@ -108,6 +147,8 @@ class llama_paged_scheduler_impl {
     // Owns no cache; binds the full-attention cache and the optional linear
     // state cache and centralizes matching, reservation and eviction.
     std::unique_ptr<llama_paged_cache_manager> cache_manager;
+    // Query-time tag accounting over the same two caches.
+    std::unique_ptr<llama_paged_tag_manager> tag_manager;
     bool prefix_cache_enabled = true;
 
     // mrope models take a sectioned position array ([t][y][x][z]); owned by

@@ -1822,6 +1822,88 @@ extern "C" {
                                                        int32_t                        request_id,
                                                        struct llama_paged_seq_state * out_state);
 
+    //
+    // Tag -> KV block accounting (doc docs/kvcache-manager/tag-kv-block-usage.md)
+    //
+    // Requests may carry an optional owner tag. The accounting covers only
+    // blocks that can be reused through the prefix cache:
+    //   full-attention: live, GPU-resident prefix-index blocks;
+    //   linear-attention: live GPU checkpoints.
+    // Partial tail blocks, ACTIVE linear states, CPU-pool blocks and swapped
+    // blocks are not counted. Shared references are reported as block ids but
+    // never counted, so sum(tag counts) <= used blocks of that pool.
+    //
+    // All queries must run on the scheduler / main loop thread.
+
+    struct llama_paged_kv_cache_block_stats {
+        uint64_t total_blocks;
+        uint64_t used_blocks;
+        uint64_t free_blocks;
+    };
+
+    struct llama_paged_kv_cache_pool_stats {
+        struct llama_paged_kv_cache_block_stats full;
+        struct llama_paged_kv_cache_block_stats linear;
+    };
+
+    struct llama_paged_kv_cache_stats {
+        struct llama_paged_kv_cache_pool_stats npu;
+        struct llama_paged_kv_cache_pool_stats cpu;  /* reserved, all zero */
+    };
+
+    struct llama_paged_tag_pool_usage {
+        uint64_t full_blocks;    /* owner 的可复用 full block 数 */
+        uint64_t linear_blocks;  /* owner 的 GPU checkpoint 数 */
+    };
+
+    struct llama_paged_tag_block_usage {
+        struct llama_paged_tag_pool_usage npu;
+        struct llama_paged_tag_pool_usage cpu;  /* reserved, all zero */
+    };
+
+    // Attach an owner tag to a queued request. Must be called before the
+    // request is first scheduled: returns false if the request is unknown or
+    // already holds KV blocks / a cache reservation.
+    LLAMA_API bool llama_paged_scheduler_set_request_tag(struct llama_paged_scheduler * sched,
+                                                         int32_t request_id, const char * tag);
+
+    // Per-tag usage. Unknown tags are reported as all-zero and return true.
+    LLAMA_API bool llama_paged_scheduler_get_tag_block_usage(struct llama_paged_scheduler * sched,
+                                                             const char * tag,
+                                                             struct llama_paged_tag_block_usage * out);
+
+    typedef void (*llama_paged_tag_usage_cb)(const char * tag,
+                                             const struct llama_paged_tag_block_usage * usage,
+                                             void * user_data);
+    LLAMA_API void llama_paged_scheduler_for_each_tag_block_usage(struct llama_paged_scheduler * sched,
+                                                                  llama_paged_tag_usage_cb cb,
+                                                                  void * user_data);
+
+    /* kind: 0 = full, 1 = linear; owned: 1 = 计入计数，0 = 仅共享引用
+     * tag 为 NULL 时遍历所有 tag */
+    typedef void (*llama_paged_tag_block_cb)(const char * tag, int32_t kind, uint32_t block_id,
+                                             int32_t owned, void * user_data);
+    LLAMA_API bool llama_paged_scheduler_for_each_tag_block(struct llama_paged_scheduler * sched,
+                                                            const char * tag,
+                                                            llama_paged_tag_block_cb cb,
+                                                            void * user_data);
+
+    /* 单 tag 的 block id 明细，两段式：
+     *   1) 各 out 传 NULL：把所需长度写入 *n_*；
+     *   2) 传入数组、*n_* 传容量：足够则填充并返回 true；不足则写回所需长度并返回 false。
+     * id 按升序；unknown tag 长度为 0 并返回 true。full/linear id 空间独立。 */
+    LLAMA_API bool llama_paged_scheduler_get_tag_block_ids(
+        struct llama_paged_scheduler * sched,
+        const char * tag,
+        uint32_t * full_owned_out,   size_t * n_full_owned,
+        uint32_t * full_shared_out,  size_t * n_full_shared,
+        uint32_t * linear_owned_out, size_t * n_linear_owned);
+
+    // npu.full / npu.linear pool statistics. cpu.* is reserved and all zero.
+    // free_blocks is the raw free count (the watermark is not subtracted).
+    LLAMA_API bool llama_paged_scheduler_get_kv_cache_stats(struct llama_paged_scheduler * sched,
+                                                            struct llama_paged_kv_cache_stats * out);
+
     // Returns the current batch's paged routing metadata. Valid until the next
     // call to llama_paged_scheduler_prepare_batch on this scheduler. Do not free.
     LLAMA_API const struct llama_paged_batch_info * llama_paged_scheduler_get_batch_info(

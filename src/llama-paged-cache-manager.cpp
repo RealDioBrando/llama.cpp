@@ -166,7 +166,7 @@ bool llama_paged_cache_manager::reserve_prefix_candidate(llama_sequence_group & 
         return true;
     }
 
-    if (linear_cache && !linear_cache->ensure_active(seq_id)) {
+    if (linear_cache && !linear_cache->ensure_active(seq_id, group.tag)) {
         LLAMA_LOG_WARN("%s: request %d cannot obtain an active state block\n", __func__, seq_id);
         return false;
     }
@@ -192,13 +192,13 @@ bool llama_paged_cache_manager::reserve_prefix_candidate(llama_sequence_group & 
     // Copy the checkpoint into the active state block first: it can still
     // fail on generation/eviction and must not leave block refs behind.
     if (linear_cache && c.has_checkpoint) {
-        if (!linear_cache->fork_checkpoint(c.checkpoint_hash, seq_id)) {
+        if (!linear_cache->fork_checkpoint(c.checkpoint_hash, seq_id, group.tag)) {
             LLAMA_LOG_DEBUG("%s: request %d checkpoint became stale, rematching\n", __func__, seq_id);
             group.prefix_candidate = match_prefix_candidate(group.logical_seq);
             const llama_prefix_candidate c2 = group.prefix_candidate;
             if (!c2.valid || c2.n_blocks == 0 || !candidate_is_current(c2) ||
-                !linear_cache->fork_checkpoint(c2.checkpoint_hash, seq_id)) {
-                if (!linear_cache->ensure_active(seq_id)) {
+                !linear_cache->fork_checkpoint(c2.checkpoint_hash, seq_id, group.tag)) {
+                if (!linear_cache->ensure_active(seq_id, group.tag)) {
                     return false;
                 }
                 clear_prefix_for_full_prefill(group);
@@ -225,7 +225,7 @@ bool llama_paged_cache_manager::reserve_prefix_candidate(llama_sequence_group & 
     if (!full_cache->add_ref_blocks(c.block_ids)) {
         if (linear_cache) {
             linear_cache->release(seq_id);
-            linear_cache->ensure_active(seq_id);
+            linear_cache->ensure_active(seq_id, group.tag);
         }
         clear_prefix_for_full_prefill(group);
         group.cache_reserved = true;

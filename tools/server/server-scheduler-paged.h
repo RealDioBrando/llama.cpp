@@ -20,6 +20,8 @@ class server_scheduler_paged final : public server_scheduler_interface {
     bool launch(server_task && task) override;
     void cancel(int64_t id_task) override;
     void update() override;
+    bool get_kv_stats(llama_paged_kv_cache_stats & out) override;
+    bool get_tag_usage(const std::string & tag, bool include_blocks, json & out) override;
 
   private:
     server_slot * pick_idle_slot();

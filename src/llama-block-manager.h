@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 class llama_block_manager {
@@ -10,6 +11,9 @@ class llama_block_manager {
         uint32_t ref_count  = 0;
         uint32_t generation = 0;
         bool     is_gpu     = false;
+        // Owner tag of the request that first checked this block out. Cleared
+        // when the last reference goes away. Never copied between blocks.
+        std::string tag;
     };
 
     using physical_block_bool = std::vector<physical_block>;
@@ -51,6 +55,14 @@ class llama_block_manager {
     // that the physical block was released and possibly reused since the
     // entry was created.
     uint32_t block_generation(uint32_t id) const;
+
+    // Owner tag of the block that first checked it out. Writing a tag on a
+    // free block is a caller bug and only produces a warning. Unknown/invalid
+    // ids are ignored.
+    void set_tag(uint32_t id, const std::string & tag);
+
+    // Returns an empty string for free/unknown blocks and out-of-range ids.
+    const std::string & tag(uint32_t id) const;
 
     void release_gpu_blocks(const physical_block_ids & freed_blocks);
     void release_cpu_blocks(const physical_block_ids & freed_blocks);

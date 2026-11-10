@@ -9,6 +9,9 @@
 
 #include <cmath>
 #include <functional>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 //
 // llama_kv_cache_paged
@@ -90,7 +93,18 @@ class llama_kv_cache_paged : public llama_memory_i {
 
     void     set_paged_batch_info(const llama_paged_batch_info * info);
     uint32_t get_num_gpu_blocks() const;
+    uint32_t get_num_cpu_blocks() const;
     uint32_t get_n_seq_max() const { return n_seq_max; }
+
+    // Owner tag of a physical block (empty when untagged).
+    const std::string & block_tag(uint32_t block_id) const;
+
+    // Tag aggregation (query-time materialization, doc tag-kv-block-usage):
+    // walks the live, GPU-resident prefix entries and groups their block ids
+    // by owner tag. `reusable_ids`, when set, receives every live GPU-resident
+    // prefix block id regardless of whether it carries a tag.
+    void collect_tag_blocks(std::unordered_map<std::string, std::unordered_set<uint32_t>> & owned,
+                            std::unordered_set<uint32_t> * reusable_ids = nullptr) const;
 
     //
     // llama_memory_i

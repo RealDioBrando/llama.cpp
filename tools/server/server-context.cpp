@@ -1828,7 +1828,8 @@ private:
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
-        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
+        if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET &&
+            task.type != SERVER_TASK_TYPE_KV_STATS) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
         }
@@ -2008,6 +2009,37 @@ private:
                     res->slots_data   = std::move(slots_data);
                     res->n_idle_slots = n_idle_slots;
 
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_KV_STATS:
+                {
+                    // paged-only introspection; the default slot scheduler has
+                    // no block-level view of the KV cache
+                    if (!scheduler) {
+                        send_error(task, "This server does not support KV stats. Start it with `--kv-paged`",
+                                   ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+
+                    if (task.kv_stats_pools) {
+                        auto res = std::make_unique<server_task_result_kv_stats>();
+                        res->id = task.id;
+                        if (!scheduler->get_kv_stats(res->stats)) {
+                            send_error(task, "KV stats are not available", ERROR_TYPE_NOT_SUPPORTED);
+                            break;
+                        }
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    json payload;
+                    if (!scheduler->get_tag_usage(task.kv_tag, task.kv_include_blocks, payload)) {
+                        send_error(task, "Tag usage is not available", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    auto res = std::make_unique<server_task_result_tag_usage>();
+                    res->id      = task.id;
+                    res->payload = std::move(payload);
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_SAVE:
@@ -4290,6 +4322,61 @@ void server_routes::init_routes() {
         }
 
         res->ok(res_task->to_json());
+        return res;
+    };
+
+    this->get_kv_stats = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        {
+            server_task task(SERVER_TASK_TYPE_KV_STATS);
+            task.id             = res->rd.get_new_id();
+            task.kv_stats_pools = true;
+            res->rd.post_task(std::move(task), true); // high-priority task
+        }
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->get_tag_usage = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        const std::string tag    = req.get_param("tag");
+        const std::string blocks = req.get_param("blocks");
+
+        {
+            server_task task(SERVER_TASK_TYPE_KV_STATS);
+            task.id                = res->rd.get_new_id();
+            task.kv_tag            = tag;
+            // a single-tag query carries the block ids by default; the full
+            // listing only when ?blocks=1 is given
+            task.kv_include_blocks = tag.empty() ? (!blocks.empty() && blocks != "0")
+                                                 : (blocks.empty() || blocks != "0");
+            res->rd.post_task(std::move(task), true); // high-priority task
+        }
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        res->ok(result->to_json());
         return res;
     };
 

@@ -81,6 +81,8 @@ class llama_full_prefix_index {
 
     size_t size() const { return blocks_.size(); }
 
+    const std::unordered_map<uint64_t, llama_full_prefix_entry> & entries() const { return blocks_; }
+
   private:
     bool     enabled_ = true;
     uint64_t use_seq_ = 0;  // monotonic LRU stamp

@@ -132,6 +132,9 @@ struct server_routes {
     server_http_context::handler_t get_metrics;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
+    // paged KV block statistics and per-tag usage (--kv-paged only)
+    server_http_context::handler_t get_kv_stats;
+    server_http_context::handler_t get_tag_usage;
     server_http_context::handler_t get_props;
     server_http_context::handler_t post_props;
     server_http_context::handler_t post_infill;

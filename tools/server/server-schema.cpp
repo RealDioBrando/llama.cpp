@@ -2,6 +2,9 @@
 
 #include "json-schema-to-grammar.h"
 
+#include <stdexcept>
+#include <utility>
+
 namespace server_schema {
 
 //
@@ -30,6 +33,16 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
 
     add((new field_bool("cache_prompt", params.cache_prompt))
         ->set_desc("Re-use KV cache from a previous request if possible. This way the common prefix does not have to be re-processed, only the suffix that differs between the requests"));
+
+    add((new field_str("tag"))
+        ->set_desc("Owner tag recorded on the KV blocks this request allocates. Queryable via /tag_usage (requires --kv-paged); at most 128 characters")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            std::string tag = json_value(data, "tag", std::string());
+            if (tag.size() > 128) {
+                throw std::invalid_argument("tag must be at most 128 characters");
+            }
+            ctx.params.tag = std::move(tag);
+        }));
 
     add((new field_bool("return_tokens", params.return_tokens))
         ->set_desc("Return the raw generated token ids in the `tokens` field"));

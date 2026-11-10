@@ -147,6 +147,12 @@ bool llama_kv_cache_paged::allocate(int32_t num_tokens, llama_sequence_group & g
     }
 
     llama_block_ids new_ids = block_manager.checkout_gpu_blocks(num_requested_blocks);
+    // Fresh allocations carry the owner tag of the requesting group. The tag
+    // is only an ownership record; the block enters the tag -> block mapping
+    // once it is filled and registered in the prefix index.
+    for (const uint32_t id : new_ids) {
+        block_manager.set_tag(id, group.tag);
+    }
     concat_block_ids(group.block_table, new_ids);
     LLAMA_LOG_DEBUG("%s: successfully allocated %d.\n", __func__, num_requested_blocks);
     return true;
@@ -397,6 +403,36 @@ llama_memory_context_ptr llama_kv_cache_paged::create_batch_context(
 
 uint32_t llama_kv_cache_paged::get_num_gpu_blocks() const {
     return num_gpu_blocks;
+}
+
+uint32_t llama_kv_cache_paged::get_num_cpu_blocks() const {
+    return num_cpu_blocks;
+}
+
+const std::string & llama_kv_cache_paged::block_tag(uint32_t block_id) const {
+    return block_manager.tag(block_id);
+}
+
+void llama_kv_cache_paged::collect_tag_blocks(
+        std::unordered_map<std::string, std::unordered_set<uint32_t>> & owned,
+        std::unordered_set<uint32_t> *                                  reusable_ids) const {
+    for (const auto & [hash, e] : prefix_index.entries()) {
+        (void) hash;
+        const uint32_t id = e.block_id;
+        // Same liveness filter the prefix matcher applies: GPU-resident,
+        // referenced, and not recycled since the entry was written.
+        if (!block_manager.is_gpu(id) || block_manager.block_ref_count(id) == 0 ||
+            block_manager.block_generation(id) != e.generation) {
+            continue;
+        }
+        if (reusable_ids) {
+            reusable_ids->insert(id);
+        }
+        const std::string & tag = block_manager.tag(id);
+        if (!tag.empty()) {
+            owned[tag].insert(id);
+        }
+    }
 }
 
 void llama_kv_cache_paged::concat_block_ids(llama_block_ids &       to_block_table,

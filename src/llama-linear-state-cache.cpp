@@ -187,8 +187,15 @@ bool llama_linear_state_cache::demote_one_checkpoint() {
 // active state
 //
 
-bool llama_linear_state_cache::ensure_active(llama_seq_id seq_id) {
+bool llama_linear_state_cache::ensure_active(llama_seq_id seq_id, const std::string & tag) {
     if (seqs.count(seq_id)) {
+        // The tag is an ownership annotation only; an existing ACTIVE state
+        // block is never re-tagged (it is not reusable anyway). Repair an
+        // empty annotation when the caller supplies one: a failed checkpoint
+        // fork may have dropped it on an earlier attempt.
+        if (!tag.empty() && seqs[seq_id].tag.empty()) {
+            seqs[seq_id].tag = tag;
+        }
         return true;
     }
 
@@ -203,8 +210,24 @@ bool llama_linear_state_cache::ensure_active(llama_seq_id seq_id) {
     st.block_id = block_id;
     st.pos      = -1;
     st.rollback = 0;
+    st.tag      = tag;
     seqs[seq_id] = st;
     return true;
+}
+
+bool llama_linear_state_cache::set_seq_tag(llama_seq_id seq_id, const std::string & tag) {
+    const auto it = seqs.find(seq_id);
+    if (it == seqs.end()) {
+        return false;
+    }
+    it->second.tag = tag;
+    return true;
+}
+
+const std::string & llama_linear_state_cache::seq_tag(llama_seq_id seq_id) const {
+    static const std::string empty;
+    const auto it = seqs.find(seq_id);
+    return it == seqs.end() ? empty : it->second.tag;
 }
 
 bool llama_linear_state_cache::release(llama_seq_id seq_id) {
@@ -244,6 +267,7 @@ bool llama_linear_state_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_
     st.block_id = dst_id;
     st.pos      = src->second.pos;
     st.rollback = 0;
+    st.tag      = src->second.tag;  // fork inherits the owner tag
     seqs[seq_id_dst] = st;
     return true;
 }
@@ -393,6 +417,12 @@ bool llama_linear_state_cache::create_checkpoint(llama_seq_id seq_id, uint64_t c
     const uint32_t dst_local = ckpt_gpu ? ckpt_id : ckpt_id - n_gpu_blocks;
     mem->copy_state_block(it->second.block_id, /*src_gpu=*/true, dst_local, ckpt_gpu);
 
+    // Only GPU checkpoints are reusable and therefore visible in the tag ->
+    // block mapping. CPU checkpoints stay untagged.
+    if (ckpt_gpu) {
+        block_manager.set_tag(ckpt_id, it->second.tag);
+    }
+
     const auto * old = checkpoint_index.find(chain_hash);
     const bool   has_old = old != nullptr;
     const uint32_t old_block = has_old ? old->block_id : 0;
@@ -413,7 +443,8 @@ const llama_linear_prefix_entry * llama_linear_state_cache::find_checkpoint(
     return checkpoint_index.find_deepest(chain_hashes, max_blocks);
 }
 
-bool llama_linear_state_cache::fork_checkpoint(uint64_t chain_hash, llama_seq_id seq_id) {
+bool llama_linear_state_cache::fork_checkpoint(uint64_t chain_hash, llama_seq_id seq_id,
+                                               const std::string & tag) {
     const auto * e = checkpoint_index.find(chain_hash);
     if (!e || !checkpoint_is_live(*e)) {
         return false;
@@ -424,6 +455,11 @@ bool llama_linear_state_cache::fork_checkpoint(uint64_t chain_hash, llama_seq_id
     const uint32_t src_block = e->block_id;
     const uint32_t src_gen   = e->generation;
     const llama_pos pos      = e->pos;
+
+    // The active state block is replaced below. The request tag is taken from
+    // the caller when given: a failed attempt releases the seq_state, so a
+    // retry would otherwise lose it.
+    const std::string owner_tag = !tag.empty() ? tag : seq_tag(seq_id);
 
     // Replace any stale active block for this sequence.
     if (seqs.count(seq_id)) {
@@ -451,6 +487,7 @@ bool llama_linear_state_cache::fork_checkpoint(uint64_t chain_hash, llama_seq_id
     // last processed token position (boundary - 1).
     st.pos      = pos > 0 ? pos - 1 : -1;
     st.rollback = 0;
+    st.tag      = owner_tag;
     seqs[seq_id] = st;
     checkpoint_index.touch(chain_hash);
     return true;
@@ -517,6 +554,32 @@ uint32_t llama_linear_state_cache::n_free_gpu_blocks() const {
 
 uint32_t llama_linear_state_cache::n_free_cpu_blocks() const {
     return (uint32_t) block_manager.n_free_cpu_blocks();
+}
+
+uint32_t llama_linear_state_cache::get_num_gpu_blocks() const {
+    return n_gpu_blocks;
+}
+
+uint32_t llama_linear_state_cache::get_num_cpu_blocks() const {
+    return n_cpu_blocks;
+}
+
+const std::string & llama_linear_state_cache::block_tag(uint32_t block_id) const {
+    return block_manager.tag(block_id);
+}
+
+void llama_linear_state_cache::collect_tag_blocks(
+        std::unordered_map<std::string, std::unordered_set<uint32_t>> & owned) const {
+    for (const auto & [chain_hash, e] : checkpoint_index.entries()) {
+        (void) chain_hash;
+        if (!checkpoint_is_live(e) || !block_manager.is_gpu(e.block_id)) {
+            continue;
+        }
+        const std::string & tag = block_manager.tag(e.block_id);
+        if (!tag.empty()) {
+            owned[tag].insert(e.block_id);
+        }
+    }
 }
 
 bool llama_linear_state_cache::has_free_gpu_blocks(uint32_t n) const {

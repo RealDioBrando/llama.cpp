@@ -27,6 +27,7 @@ llama_paged_scheduler_impl::llama_paged_scheduler_impl(uint32_t               n_
     llama_linear_state_cache * linear = hybrid_memory ? hybrid_memory->get_linear_mem() : nullptr;
     cache_manager = std::make_unique<llama_paged_cache_manager>(kv_manager, linear, block_sz, prefix_cache_enabled,
                                                                 ckpt_interval, ckpt_base);
+    tag_manager = std::make_unique<llama_paged_tag_manager>(*kv_manager, linear);
 }
 
 bool llama_paged_scheduler_impl::check_deadlock(uint32_t n_candidates, uint32_t n_swapped, uint32_t n_waiting) const {
@@ -1081,6 +1082,11 @@ bool llama_paged_scheduler_impl::fork_request(int32_t src_id, int32_t dst_id) {
         LLAMA_LOG_ERROR("%s: failed to fork linear state for dst request %d.\n", __func__, dst_id);
         return false;
     }
+    if (cache_manager->linear()) {
+        // the owner tag is inherited by the child (llama_sequence_group copy),
+        // but seq_cp builds a fresh seq_state that must be annotated again
+        cache_manager->linear()->set_seq_tag(dst_id, child.tag);
+    }
 
     child.status = llama_sequence_group_status::RUNNING;
     auto child_ptr = std::make_unique<llama_sequence_group>(std::move(child));
@@ -1154,4 +1160,82 @@ llama_sequence_group * llama_paged_scheduler_impl::get_group_from_id(int32_t req
 
 const llama_paged_batch_info * llama_paged_scheduler_impl::get_curr_batch_info() const {
     return &curr_info;
+}
+
+//
+// tag accounting
+//
+
+bool llama_paged_scheduler_impl::set_request_tag(int32_t request_id, const std::string & tag) {
+    GGML_ASSERT(cache_manager && "cache_manager is nullptr.");
+
+    auto it = id_to_group.find(request_id);
+    if (it == id_to_group.end() || it->second == nullptr) {
+        LLAMA_LOG_WARN("%s: request %d is not outstanding, tag '%s' ignored.\n", __func__, request_id, tag.c_str());
+        return false;
+    }
+    llama_sequence_group & group = *it->second;
+
+    // Blocks may already carry an owner tag, and a cache reservation may have
+    // pinned a linear state block. Tagging after the first schedule step would
+    // make the accounting depend on timing, so it is rejected.
+    if (group.cache_reserved || !group.block_table.empty()) {
+        LLAMA_LOG_WARN("%s: request %d already holds KV blocks, tag '%s' rejected.\n", __func__, request_id,
+                       tag.c_str());
+        return false;
+    }
+
+    group.tag = tag;
+    if (auto * linear = cache_manager->linear()) {
+        // Only annotates an already-created ACTIVE state; the ACTIVE block is
+        // never tagged (it is non-reusable).
+        linear->set_seq_tag(request_id, tag);
+    }
+    return true;
+}
+
+llama_paged_tag_manager::snapshot llama_paged_scheduler_impl::materialize_tag_blocks() const {
+    if (tag_manager == nullptr) {
+        return {};
+    }
+
+    // The scheduler contributes the only state the tag manager cannot see on
+    // its own: the live requests' (tag, block_table) pairs.
+    std::vector<llama_paged_tag_manager::request_ref> requests;
+    requests.reserve(id_to_group.size());
+    for (const auto & [request_id, group] : id_to_group) {
+        GGML_UNUSED(request_id);
+        if (group == nullptr || group->tag.empty()) {
+            continue;
+        }
+        requests.push_back({ &group->tag, &group->block_table });
+    }
+    return tag_manager->materialize(requests);
+}
+
+void llama_paged_scheduler_impl::all_tag_block_usage(std::map<std::string, llama_paged_tag_usage> & out) const {
+    llama_paged_tag_manager::all_usage(materialize_tag_blocks(), out);
+}
+
+bool llama_paged_scheduler_impl::tag_block_usage(const std::string & tag, llama_paged_tag_usage & out) const {
+    // unknown tags are reported as all-zero, not as an error
+    out = llama_paged_tag_manager::usage(materialize_tag_blocks(), tag);
+    return true;
+}
+
+bool llama_paged_scheduler_impl::tag_blocks(const std::string & tag,
+                                            std::vector<uint32_t> & full_owned,
+                                            std::vector<uint32_t> & full_shared,
+                                            std::vector<uint32_t> & linear_owned) const {
+    llama_paged_tag_manager::block_ids(materialize_tag_blocks(), tag, full_owned, full_shared, linear_owned);
+    return true;
+}
+
+void llama_paged_scheduler_impl::for_each_tag_block(const std::string * tag,
+                                                    const llama_paged_tag_manager::block_cb & cb) const {
+    llama_paged_tag_manager::for_each_block(materialize_tag_blocks(), tag, cb);
+}
+
+void llama_paged_scheduler_impl::kv_cache_block_stats(llama_paged_pool_stats & out) const {
+    out = tag_manager ? tag_manager->block_stats() : llama_paged_pool_stats{};
 }
