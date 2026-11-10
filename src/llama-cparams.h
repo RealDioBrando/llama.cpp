@@ -25,6 +25,14 @@ struct llama_cparams {
     uint32_t n_gpu_blocks;
     uint32_t n_cpu_blocks;
     float    kv_paged_watermark;
+    float    kv_paged_vram_utilization; // device-level VRAM utilization limit, in (0, 1]
+    float    kv_paged_linear_ratio;     // linear state pool share of the total budget, in [0, 1)
+    float    kv_paged_cpu_state_ratio;  // CPU state pool checkpoint multiplier over the GPU pool
+    float    cpu_to_gpu_blocks_ratio;   // CPU PA block pool size relative to the GPU pool
+    uint32_t n_gpu_state_blocks;        // GPU linear state block pool override (0 = auto)
+    uint32_t n_cpu_state_blocks;        // CPU linear state block pool override (0 = auto)
+    uint32_t kv_prefix_ckpt_interval;   // checkpoint lattice interval N in blocks (0 = disabled)
+    uint32_t kv_prefix_ckpt_base;       // checkpoint lattice anchor base, in [0, N)
 
     float rope_freq_base;
     float rope_freq_scale;

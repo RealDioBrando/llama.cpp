@@ -434,6 +434,14 @@ extern "C" {
         uint32_t n_gpu_blocks;       // GPU block pool size
         uint32_t n_cpu_blocks;       // CPU block pool size for swap-out
         float    kv_paged_watermark; // percentage of GPU blocks reserved as safety margin [0, 0.1)
+        float    kv_paged_vram_utilization; // device-level VRAM utilization limit, in (0, 1]
+        float    kv_paged_linear_ratio;     // linear state pool share of the total budget, in [0, 1)
+        float    kv_paged_cpu_state_ratio;  // CPU state pool checkpoint multiplier over the GPU pool
+        float    cpu_to_gpu_blocks_ratio;   // CPU PA block pool size relative to the GPU pool
+        uint32_t n_gpu_state_blocks;        // GPU linear state block pool override (0 = auto)
+        uint32_t n_cpu_state_blocks;        // CPU linear state block pool override (0 = auto)
+        uint32_t kv_prefix_ckpt_interval;   // checkpoint lattice interval N in blocks (0 = disabled)
+        uint32_t kv_prefix_ckpt_base;       // checkpoint lattice anchor base, in [0, N)
         // Order paged requests by request priority instead of FCFS.
         // Decided at llama_paged_scheduler_init() time and fixed afterwards.
         bool     paged_priority;

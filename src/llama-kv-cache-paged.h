@@ -2,6 +2,7 @@
 
 #include "llama-batch.h"
 #include "llama-block-manager.h"
+#include "llama-full-prefix-index.h"
 #include "llama-graph.h"
 #include "llama-memory.h"
 #include "llama-sequence-group.h"
@@ -22,25 +23,33 @@ class llama_kv_cache_paged : public llama_memory_i {
                          uint32_t n_ubatch,
                          uint32_t n_seq_max);
 
+    // filter: keep K/V tensors only for layers where filter(il) is true.
+    // nullptr allocates all layers. Filtered-out entries stay nullptr so layer
+    // indices keep matching the model's global layer numbering.
     void init(ggml_backend_t backend_gpu,
               ggml_backend_t backend_cpu,
               enum ggml_type type,
               uint32_t       n_gpu_blocks,
               uint32_t       n_cpu_blocks,
-              float          watermark);  // percentage
+              float          watermark,  // percentage
+              std::function<bool(uint32_t)> filter = nullptr);
 
     bool allocate(int32_t num_tokens, llama_sequence_group & group);
     void free_blocks(llama_sequence_group & group);
     void free_blocks(llama_sequence_group & group, const llama_block_ids & keep);
     bool release_block(uint32_t block_id);
     uint32_t n_free_gpu_blocks() const;
+    uint32_t n_free_cpu_blocks() const;
     bool swap_in(llama_sequence_group & group);
     bool swap_out(llama_sequence_group & group);
+    bool can_swap_in(llama_sequence_group & group) const;
+    bool can_swap_out(llama_sequence_group & group) const;
 
     // Prefix cache support: share already populated blocks by reference.
     bool share_blocks(llama_sequence_group & group, const llama_block_ids & src_ids);
     bool add_ref_blocks(const llama_block_ids & ids);
     uint32_t block_ref_count(uint32_t block_id) const;
+    uint32_t block_generation(uint32_t block_id) const;
     bool is_block_gpu(uint32_t block_id) const;
 
     // Copy the KV content of one allocated block into another allocated
@@ -48,9 +57,36 @@ class llama_kv_cache_paged : public llama_memory_i {
     // partially-filled tail block.
     void copy_block_content(uint32_t src_block_id, uint32_t dst_block_id);
 
-    // Notified with (chain_hash, new_block_id) whenever a swap moves a
-    // registered block between the GPU and CPU pools.
-    void set_block_move_cb(std::function<void(uint64_t, uint32_t)> cb) { block_move_cb = std::move(cb); }
+    // Token-block prefix index owned by the cache, so block release, reuse
+    // and swapping keep the index consistent with the pools.
+    void set_prefix_enabled(bool enabled);
+    bool prefix_enabled() const;
+
+    // Returns the entry only when it still points at a live, GPU-resident
+    // block with a matching generation.
+    const llama_full_prefix_entry * find_prefix_block(uint64_t    hash,
+                                                      llama_token first_tok,
+                                                      llama_token last_tok) const;
+
+    void register_prefix_block(uint64_t    hash,
+                               uint32_t    block_id,
+                               int32_t     owner_seq,
+                               uint32_t    block_idx,
+                               llama_token first_tok,
+                               llama_token last_tok);
+
+    // Release request blocks, keeping full blocks that are safe to reuse
+    // cache-resident. Updates the prefix index accordingly.
+    void release_sequence(llama_sequence_group & group);
+
+    // Transfer a cache-resident prefix block to the live request that just
+    // took a reference on it: the entry stops being evictable and the cache's
+    // own reference is dropped. No-op unless the entry is cached and still
+    // points at this block.
+    bool take_cached_ref(uint64_t hash, uint32_t block_id);
+
+    // Evict the least-recently-used cache-resident prefix block.
+    bool evict_cached_prefix_block();
 
     void     set_paged_batch_info(const llama_paged_batch_info * info);
     uint32_t get_num_gpu_blocks() const;
@@ -141,11 +177,12 @@ class llama_kv_cache_paged : public llama_memory_i {
     uint32_t       num_gpu_blocks;
     uint32_t       num_cpu_blocks;
     uint32_t       block_bytes;
+    float          watermark = 0.0f;
 
     ggml_backend_t gpu_backend;
     ggml_backend_t cpu_backend;
 
-    std::function<void(uint64_t, uint32_t)> block_move_cb;
+    llama_full_prefix_index prefix_index;
 
     struct seq_range {
         llama_pos min = -1;
@@ -201,6 +238,10 @@ class llama_kv_cache_paged_context : public llama_memory_context_i {
     std::vector<llama_ubatch> ubatches;
     size_t                    i_cur = 0;      // index of ubatch to process
 
+    // per-sequence tokens already consumed by earlier ubatches. Only used as
+    // a fallback when the ubatch carries no original batch indices.
+    std::unordered_map<llama_seq_id, int32_t> seq_token_offsets;
+
     const llama_paged_batch_info * batch_info = nullptr;
 
     int32_t * paged_write_slots   = nullptr;  // [n_tokens]
@@ -212,6 +253,7 @@ class llama_kv_cache_paged_context : public llama_memory_context_i {
     std::vector<int32_t> local_context_lens;
     std::vector<int32_t> local_batch_offsets;
     std::vector<int32_t> local_batch_lens;
+    std::vector<int32_t> local_block_table;   // [n_seqs, max_blocks], gathered by batch slot
 
     int32_t n_tokens   = 0;
     int32_t batch_size = 0;

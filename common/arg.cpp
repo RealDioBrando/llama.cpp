@@ -1801,6 +1801,79 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
     add_opt(common_arg(
+        {"--kv-paged-vram-utilization"}, "N",
+        "device-level VRAM utilization limit for the paged KV + state budget (default: 0.80, range (0.0, 1.0])",
+        [](common_params & params, const std::string & value) {
+            float potential_utilization = std::stof(value);
+            if (potential_utilization <= 0.0f || potential_utilization > 1.0f) {
+                throw std::invalid_argument("--kv-paged-vram-utilization must be in range (0.0, 1.0]");
+            }
+            params.kv_paged_vram_utilization = potential_utilization;
+        }
+    ).set_env("LLAMA_ARG_KV_PAGED_VRAM_UTILIZATION").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"--kv-paged-linear-ratio"}, "N",
+        "share of the paged memory budget used by the linear state pool (default: 0.20, range [0.0, 1.0))",
+        [](common_params & params, const std::string & value) {
+            float potential_ratio = std::stof(value);
+            if (potential_ratio < 0.0f || potential_ratio >= 1.0f) {
+                throw std::invalid_argument("--kv-paged-linear-ratio must be in range [0.0, 1.0)");
+            }
+            params.kv_paged_linear_ratio = potential_ratio;
+        }
+    ).set_env("LLAMA_ARG_KV_PAGED_LINEAR_RATIO").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"--kv-paged-cpu-state-ratio"}, "N",
+        "CPU state pool checkpoint multiplier over the GPU state pool (default: 1.0, must be >= 0.0)",
+        [](common_params & params, const std::string & value) {
+            float potential_ratio = std::stof(value);
+            if (potential_ratio < 0.0f) {
+                throw std::invalid_argument("--kv-paged-cpu-state-ratio must be >= 0.0");
+            }
+            params.kv_paged_cpu_state_ratio = potential_ratio;
+        }
+    ).set_env("LLAMA_ARG_KV_PAGED_CPU_STATE_RATIO").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"--n-gpu-state-blocks"}, "N",
+        "number of GPU linear state blocks (default: 0 = auto)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--n-gpu-state-blocks must be >= 0");
+            }
+            params.n_gpu_state_blocks = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"--n-cpu-state-blocks"}, "N",
+        "number of CPU linear state blocks (default: 0 = auto)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--n-cpu-state-blocks must be >= 0");
+            }
+            params.n_cpu_state_blocks = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"--kv-prefix-ckpt-interval"}, "N",
+        "checkpoint lattice interval in blocks (default: 4, 0 = disabled, must be >= 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--kv-prefix-ckpt-interval must be >= 0");
+            }
+            params.kv_prefix_ckpt_interval = value;
+        }
+    ).set_env("LLAMA_ARG_KV_PREFIX_CKPT_INTERVAL").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
+        {"--kv-prefix-ckpt-base"}, "N",
+        "checkpoint lattice anchor base in blocks (default: 0, must be >= 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--kv-prefix-ckpt-base must be >= 0");
+            }
+            params.kv_prefix_ckpt_base = value;
+        }
+    ).set_env("LLAMA_ARG_KV_PREFIX_CKPT_BASE").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PAGED}));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",

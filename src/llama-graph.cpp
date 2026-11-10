@@ -351,6 +351,18 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
             fprintf(stderr, "%s]\n", n_rs > 64 ? ",..." : "");
         }
     }
+
+    if (s_write) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(s_write->buffer));
+        const uint32_t n_planes = mctx->get_n_planes();
+        const uint32_t n_seqs   = (uint32_t)(s_write->ne[0] / n_planes);
+        int32_t * data = (int32_t *) s_write->data;
+        for (uint32_t i = 0; i < n_seqs; ++i) {
+            for (uint32_t p = 0; p < n_planes; ++p) {
+                data[p * n_seqs + i] = mctx->s_write(i, p);
+            }
+        }
+    }
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -369,6 +381,11 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= s_copy_main->ne[0]  == params.ubatch.n_seqs;
     res &= s_copy_extra->ne[0] == mctx->get_n_rs() - params.ubatch.n_seqs;
+
+    res &= (s_write != nullptr) == mctx->is_paged();
+    if (s_write) {
+        res &= s_write->ne[0] == (int64_t) params.ubatch.n_seqs * mctx->get_n_planes();
+    }
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
@@ -3790,6 +3807,26 @@ ggml_tensor * llm_graph_context::build_rs(
     return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
                     get_state_rows);
+}
+
+void llm_graph_context::build_state_write(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        dst_all,
+        ggml_tensor *        src,
+        int64_t              n_seqs,
+        uint32_t             plane) const {
+    GGML_ASSERT(inp->s_write && "paged state write rows are missing");
+
+    ggml_tensor * idx = ggml_view_1d(ctx0, inp->s_write, n_seqs,
+            (size_t) plane * n_seqs * ggml_element_size(inp->s_write));
+
+    const int64_t row_width = dst_all->ne[0];
+    ggml_tensor * src2 = ggml_is_contiguous(src)
+                             ? ggml_reshape_2d(ctx0, src, row_width, n_seqs)
+                             : ggml_cont_2d(ctx0, src, row_width, n_seqs);
+    ggml_tensor * dst2 = ggml_reshape_2d(ctx0, dst_all, dst_all->ne[0], dst_all->ne[1]);
+
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx0, dst2, src2, idx));
 }
 
 ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
