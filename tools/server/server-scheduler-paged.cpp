@@ -503,7 +503,12 @@ void server_scheduler_paged::update() {
         llama_paged_seq_state st;
         GGML_ASSERT(llama_paged_scheduler_get_seq_state(sched, req_id, &st));
 
-        const bool final_prefill = len > 1 && (int32_t) st.n_past + len == (int32_t) st.n_prompt_total;
+        // A prefill chunk that reaches the end of the prompt is the final
+        // prefill even when it carries a single row: the checkpoint lattice
+        // (doc 5.3.4) can split the prompt so that the last chunk is 1 token.
+        // Decode/verify steps are excluded by st.n_decoded, not by the row
+        // count, otherwise n_cmpl children are never forked.
+        const bool final_prefill = st.n_decoded == 0 && (int32_t) st.n_past + len == (int32_t) st.n_prompt_total;
         const bool sample_now    = len == 1 || final_prefill;
 
         m.n_tokens_max = std::max<uint64_t>(m.n_tokens_max, st.n_past + len);

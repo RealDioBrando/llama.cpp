@@ -276,6 +276,11 @@ public:
     ggml_tensor * s_copy_main;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
 
+    // Paged linear state only: explicit per-sequence write rows, laid out
+    // plane-major as [n_planes, n_seqs]. Null for the classic contiguous
+    // row-at-head layout.
+    ggml_tensor * s_write = nullptr;  // I32 [n_seqs * n_planes]
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
@@ -1431,6 +1436,15 @@ struct llm_graph_context {
                 int32_t   state_size,
                 int32_t   n_seqs,
             const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
+
+    // Scatter one state plane into the explicitly addressed rows of the
+    // paged linear state cache (paged mode only).
+    void build_state_write(
+            llm_graph_input_rs * inp,
+            ggml_tensor *        dst_all,
+            ggml_tensor *        src,
+            int64_t              n_seqs,
+            uint32_t             plane) const;
 
     ggml_tensor * build_rwkv_token_shift_load(
         llm_graph_input_rs * inp,

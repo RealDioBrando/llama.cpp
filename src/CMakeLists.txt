@@ -29,7 +29,10 @@ set(LLAMA_CORE_SOURCES
     llama-kv-cache-dsv4.cpp
     llama-kv-cache-paged.cpp
     llama-block-manager.cpp
-    llama-paged-prefix-cache.cpp
+    llama-full-prefix-index.cpp
+    llama-linear-prefix-index.cpp
+    llama-linear-state-cache.cpp
+    llama-paged-cache-manager.cpp
     llama-paged-scheduler.cpp
     llama-paged-scheduler-impl.cpp
     llama-memory-hybrid-paged.cpp
