@@ -4092,6 +4092,10 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 if (op->src[1]->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_F16) {
                     return false;
                 }
+                // 310P PFA prefill is wrong for full attention without an explicit mask.
+                if (op->src[0]->ne[1] > 1 && op->src[3] == nullptr) {
+                    return false;
+                }
                 // Multi-sequence prefill (B > 1, q_len > 1) is handled by the
                 // per-batch-element PFA loop in ggml_cann_flash_attn_ext_310p.
                 // It must NOT be routed to the CPU backend: the scheduler's
