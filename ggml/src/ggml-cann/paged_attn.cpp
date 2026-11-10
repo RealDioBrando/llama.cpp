@@ -72,7 +72,6 @@ struct atb_paged_state {
     int64_t          sa_head_dim = -1;
     float            sa_scale    = 0.0f;
     void *           prefill_mask = nullptr;
-    void *           prefill_mask_host = nullptr;
     int64_t          prefill_mask_len = -1;
     aclrtContext     saved_ctx  = nullptr;
     std::mutex       mtx;
@@ -92,7 +91,6 @@ struct atb_paged_state {
         if (ws_pa)  aclrtFree(ws_pa);
         if (ws_sf)  aclrtFree(ws_sf);
         if (prefill_mask) aclrtFree(prefill_mask);
-        if (prefill_mask_host) aclrtFreeHost(prefill_mask_host);
     }
 };
 
@@ -196,9 +194,7 @@ void * get_prefill_causal_mask(int64_t max_len, aclrtStream stream) {
     if (g_atb.prefill_mask) {
         aclrtSynchronizeStream(stream);
         ACL_CHECK(aclrtFree(g_atb.prefill_mask));
-        ACL_CHECK(aclrtFreeHost(g_atb.prefill_mask_host));
         g_atb.prefill_mask     = nullptr;
-        g_atb.prefill_mask_host = nullptr;
         g_atb.prefill_mask_len = -1;
     }
 
@@ -207,20 +203,19 @@ void * get_prefill_causal_mask(int64_t max_len, aclrtStream stream) {
     void *       mask_dev   = nullptr;
     ACL_CHECK(aclrtMalloc(&mask_dev, mask_bytes, ACL_MEM_MALLOC_HUGE_FIRST));
 
-    ACL_CHECK(aclrtMallocHost(&g_atb.prefill_mask_host, mask_bytes));
-    auto * mask_host = (uint16_t *) g_atb.prefill_mask_host;
+    std::vector<uint16_t> mask_host(mask_elems);
     const float    neg_big = -10000.0f;
     const ggml_fp16_t neg_fp16 = ggml_fp32_to_fp16(neg_big);
     uint16_t neg_bits;
     memcpy(&neg_bits, &neg_fp16, sizeof(neg_bits));
-    std::fill(mask_host, mask_host + mask_elems, neg_bits);
+    mask_host.assign(mask_elems, neg_bits);
     for (int64_t row = 0; row < max_len; ++row) {
         for (int64_t col = 0; col <= row; ++col) {
             mask_host[(size_t) row * max_len + col] = 0;
         }
     }
 
-    ACL_CHECK(aclrtMemcpyAsync(mask_dev, mask_bytes, mask_host, mask_bytes,
+    ACL_CHECK(aclrtMemcpyAsync(mask_dev, mask_bytes, mask_host.data(), mask_bytes,
                                ACL_MEMCPY_HOST_TO_DEVICE, stream));
     g_atb.prefill_mask     = mask_dev;
     g_atb.prefill_mask_len = max_len;

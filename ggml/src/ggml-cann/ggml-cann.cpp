@@ -3911,10 +3911,10 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                      op->ne[1] * op->ne[3] > op->ne[2] * 8)) {
                     return false;
                 }
-                // Partial rope (n_dims < ne[0]) takes the
-                // RotaryPositionEmbedding path in ggml_cann_rope; only
-                // contiguous inputs are supported there.
-                if (!ggml_is_contiguous(op->src[0])) {
+                // Partial rope (n_dims < ne[0]) materializes non-contiguous
+                // F32 input in ggml_cann_rope. Keep the full-width composite
+                // path restricted to contiguous input.
+                if (rope_dims == op->src[0]->ne[0] && !ggml_is_contiguous(op->src[0])) {
                     return false;
                 }
 #endif
@@ -4087,13 +4087,13 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 if (maxBias != 0.0f) {
                     return false;
                 }
-                // A null mask means full attention; the 310P path fills an
-                // all-keep attenMask for prefill and passes no pseShift for decode.
-                if (op->src[1]->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_F16) {
+                // Mask flows through device memory (pseShift for decode,
+                // attenMask for prefill), so the captured graph is
+                // replay-safe: no host-side KV length channel.
+                if (op->src[3] == nullptr) {
                     return false;
                 }
-                // 310P PFA prefill is wrong for full attention without an explicit mask.
-                if (op->src[0]->ne[1] > 1 && op->src[3] == nullptr) {
+                if (op->src[1]->type != GGML_TYPE_F16 || op->src[2]->type != GGML_TYPE_F16) {
                     return false;
                 }
                 // Multi-sequence prefill (B > 1, q_len > 1) is handled by the

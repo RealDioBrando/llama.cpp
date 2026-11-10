@@ -100,10 +100,6 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
             cb(Kcur, "Kcur", il);
             cb(Vcur, "Vcur", il);
 
-            // CANN 310P partial RoPE requires contiguous input.
-            Qcur = ggml_cont(ctx0, Qcur);
-            Kcur = ggml_cont(ctx0, Kcur);
-
             // apply M-RoPE
             Qcur = ggml_rope_multi(
                 ctx0, Qcur, positions, nullptr,

@@ -118,7 +118,7 @@ bool ggml_cann_is_weight_layout_candidate(const ggml_tensor * tensor) {
                can_transform_slice(tensor);
     }
 
-    return is_dense_weight_name(tensor) && can_transform_slice(tensor);
+    return tensor->type == GGML_TYPE_F16 && is_dense_weight_name(tensor) && can_transform_slice(tensor);
 }
 
 size_t ggml_cann_weight_layout_alloc_size(const ggml_tensor * tensor) {
