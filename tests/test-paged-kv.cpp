@@ -1,7 +1,8 @@
 #include "ggml-backend.h"
 #include "llama-block-manager.h"
 #include "llama-kv-cache-paged.h"
-#include "llama-paged-prefix-cache.h"
+#include "llama-full-prefix-index.h"
+#include "llama-linear-prefix-index.h"
 #include "llama-paged-scheduler-impl.h"
 
 #include <cassert>
@@ -164,6 +165,11 @@ TEST(test_block_manager_gpu_cpu_disjoint) {
 // Testing llama_kv_cache_paged book-keeping
 
 // kv_cache_paged with arbitrary shape (we only care about the bookkeeping)
+static ggml_backend_t make_kv_backend() {
+    static ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    return backend;
+}
+
 static llama_kv_cache_paged make_kv() {
     return llama_kv_cache_paged(
         /*head_dim=*/64,
@@ -461,6 +467,49 @@ TEST(test_scheduler_multi_request_decode) {
 
 // Testing prefix cache
 
+TEST(test_block_manager_generation) {
+    llama_block_manager bm;
+    bm.init(/*n_gpu=*/4, /*n_cpu=*/2, 0.0f);
+
+    auto ids = bm.checkout_gpu_blocks(1);
+    EXPECT_EQ(ids.size(), 1u);
+    const uint32_t id = ids[0];
+    const uint32_t g0 = bm.block_generation(id);
+
+    // Allocated blocks keep their generation; releasing bumps it so stale
+    // prefix entries can detect the reuse.
+    EXPECT_EQ(bm.block_generation(id), g0);
+    bm.release_gpu_blocks({ id });
+    EXPECT_EQ(bm.block_generation(id), g0 + 1);
+
+    auto ids2 = bm.checkout_gpu_blocks(1);
+    EXPECT_EQ(ids2.size(), 1u);
+    EXPECT_EQ(ids2[0], id);
+    EXPECT_EQ(bm.block_generation(id), g0 + 1);
+    bm.release_gpu_blocks(ids2);
+}
+
+TEST(test_prefix_block_stale_generation) {
+    auto kv = make_kv();
+    kv.init(make_kv_backend(), make_kv_backend(), GGML_TYPE_F16, /*n_gpu=*/4, /*n_cpu=*/2, 0.0f);
+
+    llama_sequence_group group;
+    group.request_id = 0;
+    group.n_prompt   = 32;
+    EXPECT_TRUE(kv.allocate(0, group));
+    EXPECT_EQ(group.block_table.size(), 2u);
+
+    const uint32_t id = group.block_table[0];
+    kv.register_prefix_block(/*hash=*/1234, id, /*owner=*/0, /*idx=*/0, /*first=*/1, /*last=*/2);
+    EXPECT_TRUE(kv.find_prefix_block(1234, 1, 2) != nullptr);
+
+    // Once the block goes back to the pool the entry must not validate.
+    kv.release_block(id);
+    EXPECT_TRUE(kv.find_prefix_block(1234, 1, 2) == nullptr);
+
+    kv.free_blocks(group);
+}
+
 TEST(test_block_manager_add_ref) {
     llama_block_manager bm;
     bm.init(/*n_gpu=*/4, /*n_cpu=*/2, 0.0f);
@@ -486,48 +535,61 @@ TEST(test_block_manager_add_ref) {
 }
 
 TEST(test_prefix_cache_register_find) {
-    llama_paged_prefix_cache pc;
-    pc.register_block(100, /*block_id=*/7, /*owner=*/0, /*idx=*/0, /*first=*/1, /*last=*/2);
+    llama_full_prefix_index pc;
+    pc.register_block(100, /*block_id=*/7, /*generation=*/3, /*owner=*/0, /*idx=*/0, /*first=*/1, /*last=*/2);
 
-    const auto * e = pc.find_block(100, 1, 2);
+    const auto * e = pc.find(100, 1, 2);
     EXPECT_TRUE(e != nullptr);
     EXPECT_EQ(e->block_id, 7u);
-    EXPECT_TRUE(pc.find_block(100, 9, 9) == nullptr);
+    EXPECT_EQ(e->generation, 3u);
+    EXPECT_TRUE(pc.find(100, 9, 9) == nullptr);
 
-    pc.update_block_id(100, 8);
-    EXPECT_EQ(pc.find_block(100, 1, 2)->block_id, 8u);
+    EXPECT_TRUE(pc.update_block_id(100, 8, /*new_generation=*/4));
+    EXPECT_EQ(pc.find(100, 1, 2)->block_id, 8u);
+    EXPECT_EQ(pc.find(100, 1, 2)->generation, 4u);
 }
 
 TEST(test_prefix_cache_cached_lifecycle) {
-    llama_paged_prefix_cache pc;
-    pc.register_block(1, 10, 0, 0, 1, 1);
-    pc.register_block(2, 11, 0, 1, 1, 1);
+    llama_full_prefix_index pc;
+    pc.register_block(1, 10, 0, 0, 0, 1, 1);
+    pc.register_block(2, 11, 0, 0, 1, 1, 1);
     pc.set_cached_state(1, true);
     pc.set_cached_state(2, true);
     pc.set_cached_state(2, false);
 
     uint64_t h    = 0;
     uint32_t id   = 0;
-    EXPECT_TRUE(pc.pop_lru_cached(h, id));
+    uint32_t gen  = 0;
+    EXPECT_TRUE(pc.pop_lru_cached(h, id, gen));
     EXPECT_EQ(h, 1ull);
     EXPECT_EQ(id, 10u);
-    EXPECT_FALSE(pc.pop_lru_cached(h, id));
+    EXPECT_FALSE(pc.pop_lru_cached(h, id, gen));
 }
 
 TEST(test_prefix_cache_ckpt_slots) {
-    llama_paged_prefix_cache pc;
-    pc.set_ckpt_slots(/*base=*/6, /*n=*/2);
-    EXPECT_TRUE(pc.seq_reserved(6));
-    EXPECT_TRUE(pc.seq_reserved(7));
-    EXPECT_FALSE(pc.seq_reserved(5));
-    EXPECT_FALSE(pc.seq_reserved(8));
+    llama_linear_prefix_index pc;
+    pc.insert(/*hash=*/42, /*block=*/6, /*gen=*/0, /*pos=*/64);
+    pc.insert(/*hash=*/43, /*block=*/7, /*gen=*/0, /*pos=*/128);
 
-    EXPECT_EQ(pc.acquire_ckpt_slot(42, 64), 6);
-    EXPECT_EQ(pc.acquire_ckpt_slot(43, 128), 7);
-    EXPECT_EQ(pc.acquire_ckpt_slot(42, 64), 6);
-    EXPECT_EQ(pc.acquire_ckpt_slot(44, 192), 6);
-    EXPECT_TRUE(pc.find_ckpt(43) != nullptr);
-    EXPECT_TRUE(pc.find_ckpt(44) != nullptr);
+    EXPECT_TRUE(pc.find(42) != nullptr);
+    EXPECT_EQ(pc.find(43)->pos, 128);
+
+    const std::vector<uint64_t> chain = { 42, 43 };
+    const auto * deepest = pc.find_deepest(chain, 2);
+    EXPECT_TRUE(deepest != nullptr);
+    EXPECT_EQ(deepest->chain_hash, 43ull);
+
+    EXPECT_TRUE(pc.find_deepest(chain, 1) != nullptr);
+    EXPECT_EQ(pc.find_deepest(chain, 1)->chain_hash, 42ull);
+
+    uint64_t h = 0;
+    uint32_t id = 0;
+    uint32_t gen = 0;
+    EXPECT_TRUE(pc.pop_lru(h, id, gen));
+    EXPECT_EQ(h, 42ull);
+    EXPECT_TRUE(pc.pop_lru(h, id, gen));
+    EXPECT_EQ(h, 43ull);
+    EXPECT_FALSE(pc.pop_lru(h, id, gen));
 }
 
 TEST(test_scheduler_prefix_cache_hit) {
@@ -561,7 +623,9 @@ TEST(test_scheduler_prefix_cache_hit) {
     EXPECT_EQ(g1->n_prompt, 16u);
     EXPECT_EQ(g1->block_table[0], blk0);
     EXPECT_EQ(g1->block_table[1], blk1);
-    EXPECT_EQ(fixture.kv->block_ref_count(blk0), 2u);
+    // The cache's extra reference is transferred to the reusing request, so
+    // the block is owned exactly once while the request is running.
+    EXPECT_EQ(fixture.kv->block_ref_count(blk0), 1u);
 
     const llama_block_ids table1 = g1->block_table;
     std::vector<llama_token> sampled1(1, 8);
@@ -650,6 +714,8 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_scheduler_multi_request_decode);
 
     fprintf(stderr, "test-paged-kv: prefix cache\n");
+    RUN(test_block_manager_generation);
+    RUN(test_prefix_block_stale_generation);
     RUN(test_block_manager_add_ref);
     RUN(test_prefix_cache_register_find);
     RUN(test_prefix_cache_cached_lifecycle);

@@ -3,15 +3,27 @@
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-kv-cache-paged.h"
+#include "llama-linear-state-cache.h"
 #include "llama-memory.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
 struct llama_cparams;
 struct llama_memory_params;
 struct llama_model;
+
+// Unified VRAM budget for the two physical paged pools (PA K/V and linear
+// recurrent state). See docs/kvcache-manager/linear-attention-cache.md §10.
+struct llama_paged_memory_budget {
+    uint32_t n_gpu_blocks       = 0;
+    uint32_t n_cpu_blocks       = 0;
+    uint32_t n_gpu_state_blocks = 0;
+    uint32_t n_cpu_state_blocks = 0;
+};
 
 class llama_memory_hybrid_paged : public llama_memory_i {
 public:
@@ -32,7 +44,9 @@ public:
                         uint32_t   n_ubatch,
                         uint32_t   n_seq_max,
                         uint32_t   n_rs_seq,
-                            bool   offload);
+                            bool   offload,
+                        uint32_t   n_gpu_state_blocks,
+                        uint32_t   n_cpu_state_blocks);
 
     ~llama_memory_hybrid_paged() = default;
 
@@ -65,11 +79,15 @@ public:
         return mem_attn.get();
     }
 
+    llama_linear_state_cache * get_linear_mem() const {
+        return mem_linear.get();
+    }
+
     uint32_t get_n_seq_max() const;
 
 private:
-    const std::unique_ptr<llama_kv_cache_paged> mem_attn;
-    const std::unique_ptr<llama_memory_recurrent> mem_recr;
+    const std::unique_ptr<llama_kv_cache_paged>     mem_attn;
+    std::unique_ptr<llama_linear_state_cache>       mem_linear;
 };
 
 class llama_memory_hybrid_paged_context : public llama_memory_context_i {
@@ -109,3 +127,11 @@ llama_memory_i * llama_paged_memory_try_create(
         const llama_model & model,
         const llama_memory_params & params,
         const llama_cparams & cparams);
+
+llama_paged_memory_budget llama_paged_compute_budget(
+        const llama_model & model,
+        const llama_cparams & cparams,
+        ggml_type type_k,
+        ggml_type type_v,
+        ggml_type type_r,
+        ggml_type type_s);
