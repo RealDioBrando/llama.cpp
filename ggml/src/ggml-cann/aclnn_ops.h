@@ -933,9 +933,9 @@ void ggml_cann_gated_linear_attn(ggml_backend_cann_context & ctx, ggml_tensor * 
  *   g, beta: [1, H, T, B] -> [T*B, N]
  *   state: [S_v, S_v, H, B] -> [slots=B, N, DV, DK] (dk fastest in both)
  * dst holds the packed output [S_v*H, T*B + K*S_v*B]: attention output first,
- * then the updated state snapshot (K == 1).
+ * then min(T, K) state snapshots, newest first, with the remaining slots unused.
  *
- * Decode (T == 1) runs all sequences in a single kernel call. Prefill (T > 1)
+ * For K == 1, decode (T == 1) runs all sequences in a single kernel call. Prefill (T > 1)
  * goes through the chunk kernel as a single call for the whole batch when it
  * is eligible (GGML_CANN_GDN_PREFILL_CHUNK=0 forces the fallback), the fallback loops 8-token blocks per sequence
  * through the recurrent kernel and threads the state through the sequence
@@ -943,6 +943,9 @@ void ggml_cann_gated_linear_attn(ggml_backend_cann_context & ctx, ggml_tensor * 
  * fp16 (g stays fp32), every call works on a view of the staging buffers.
  * q/k/v may be rows-contiguous strided views (op contract), the input cast
  * gathers them into the dense staging layout.
+ * For K > 1, recurrent calls write indexed snapshots. Short sequences share one
+ * batch call; longer sequences use blocks of up to 8 tokens. An opt-in chunk
+ * prefix is limited to the shapes accepted by gdn_route::snapshot_prefix.
  *
  * The aclnn op is resolved at runtime from the custom op package,
  * see ggml_cann_gdn_available.
@@ -958,6 +961,7 @@ void ggml_cann_gated_delta_net(ggml_backend_cann_context & ctx, ggml_tensor * ds
  * Only an explicit absolute custom package in ASCEND_CUSTOM_OPP_PATH is used.
  */
 bool ggml_cann_gdn_available();
+bool ggml_cann_gdn_snapshots_supported(const ggml_tensor * dst);
 
 /**
  * @brief Check whether the GQA head reordering in the GDN glue is enabled.

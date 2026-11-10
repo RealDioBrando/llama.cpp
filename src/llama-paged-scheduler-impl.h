@@ -2,11 +2,12 @@
 
 #include "llama-kv-cache-paged.h"
 #include "llama-memory-hybrid-paged.h"
-#include "llama-paged-prefix-cache.h"
+#include "llama-paged-cache-manager.h"
 #include "llama-paged-queue.h"
 
 #include <clocale>
 #include <cstdlib>
+#include <memory>
 #include <vector>
 
 enum class llama_scheduler_status {
@@ -23,7 +24,9 @@ class llama_paged_scheduler_impl {
             int32_t  n_pos_per_embd,
             llama_kv_cache_paged * kv_manager,
             llama_memory_hybrid_paged * hybrid_memory = nullptr,
-            bool priority_enabled = false);
+            bool priority_enabled = false,
+            uint32_t ckpt_interval = 4,
+            uint32_t ckpt_base     = 0);
 
     llama_scheduler_status step(llama_batch & batch);
     bool                   queue_request(llama_sequence_group group);
@@ -58,6 +61,12 @@ class llama_paged_scheduler_impl {
 
     int32_t get_curr_decode_tokens() const;
 
+    // Number of prefill tokens to schedule for this group this step. Hybrid
+    // requests stop at the next checkpoint lattice boundary so that the state
+    // at that boundary can be checkpointed and reused by another request
+    // (doc 5.3.4).
+    int32_t prefill_chunk_tokens(const llama_sequence_group & group) const;
+
     // Evict one group from `running` and return it (may be nullptr if every
     // group is FINISHED). Priority mode picks the lowest priority, FCFS the
     // most recent arrival. Groups already added to this step's candidates are
@@ -73,14 +82,6 @@ class llama_paged_scheduler_impl {
 
     void clear_batch(llama_batch & batch);
     void populate_batch_from(const llama_sequence_group_raw_list & candidates, llama_batch & batch);
-
-    // Prefix cache
-    void try_apply_prefix_cache(llama_sequence_group & group);
-    void register_completed_blocks(llama_sequence_group & group);
-    void maybe_create_checkpoint(llama_sequence_group & group);
-    bool evict_cached_blocks();
-    static uint64_t hash_block(uint64_t prev, const std::vector<llama_token> & tokens, uint32_t block_idx,
-                               uint32_t block_size);
 
     // Scheduling mode is fixed at construction time (see enable_priority).
     const bool priority_enabled_;
@@ -102,13 +103,12 @@ class llama_paged_scheduler_impl {
     const uint32_t         block_size;
     const int32_t          n_batch;
     const int32_t          n_pos_per_embd;  // 1, or 4 for mrope models (9.4)
-    llama_kv_cache_paged * kv_cache_manager = nullptr;
-    llama_memory_hybrid_paged * hybrid_memory_manager = nullptr;
     llama_paged_batch_info curr_info = {};
 
-    llama_paged_prefix_cache prefix_cache;
-    bool                     prefix_cache_enabled = true;
-    uint32_t                 n_ckpt_requested     = 4;
+    // Owns no cache; binds the full-attention cache and the optional linear
+    // state cache and centralizes matching, reservation and eviction.
+    std::unique_ptr<llama_paged_cache_manager> cache_manager;
+    bool prefix_cache_enabled = true;
 
     // mrope models take a sectioned position array ([t][y][x][z]); owned by
     // populate_batch_from for the lifetime of the built batch

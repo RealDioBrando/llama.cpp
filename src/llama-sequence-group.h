@@ -31,6 +31,21 @@ struct llama_seq_segment {
     std::vector<llama_pos> pos;          // media mrope: n_tokens * 4, row-major [row][4]
 };
 
+// Immutable prefix-cache match produced when a request is queued. Waiting
+// requests only hold this candidate: no KV block references and no linear
+// state block are reserved until the request is admitted.
+struct llama_prefix_candidate {
+    bool      valid       = false;
+    uint32_t  n_blocks    = 0;   // number of reusable full KV blocks
+    llama_pos reuse_pos   = 0;   // n_blocks * block_size
+    bool      has_checkpoint = false;
+    uint64_t  checkpoint_hash = 0;
+
+    std::vector<uint32_t> block_ids;    // [n_blocks]
+    std::vector<uint32_t> generations;  // [n_blocks] KV block generations
+    std::vector<uint64_t> hashes;       // [n_blocks] chain hashes
+};
+
 struct llama_sequence_group {
     int32_t                     request_id = -1;
     llama_sequence_group_status status     = llama_sequence_group_status::PENDING;
@@ -57,6 +72,9 @@ struct llama_sequence_group {
     // speculative decoding: draft tokens tentatively added to the next step.
     // consumed (cleared) by populate_batch_from
     std::vector<llama_token> pending_draft;
+    // number of draft rows consumed by the current batch; update() uses it to
+    // skip prefix registration/checkpoints for verify steps
+    uint32_t                 draft_rows_in_batch = 0;
 
     // multimodal (9.4): ordered segmentation covering all rows; empty for
     // legacy text-only requests. media segments are appended with their
@@ -81,6 +99,12 @@ struct llama_sequence_group {
         const llama_seq_segment * s = segment_at(row);
         return s && s->is_media && s->embd == nullptr;
     }
+
+    llama_prefix_candidate   prefix_candidate;
+
+    // True while this group holds KV block references and an active linear
+    // state block. Set at admission, cleared on release.
+    bool cache_reserved = false;
 };
 
 using llama_sequence_group_raw_list = std::vector<llama_sequence_group *>;

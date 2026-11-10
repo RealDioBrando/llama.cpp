@@ -7,6 +7,13 @@
 void llama_block_manager::init(uint32_t n_gpu, uint32_t n_cpu, float watermark) {
     LLAMA_LOG_INFO("%s: Block manager initialized: n_free_gpu_blocks=%d, n_free_cpu_blocks=%d\n", __func__, n_gpu,
                    n_cpu);
+
+    // Make init idempotent: callers may reuse an instance to reset the pools.
+    gpu_registry.clear();
+    cpu_registry.clear();
+    free_gpu_ids.clear();
+    free_cpu_ids.clear();
+
     total_num_gpu_blocks = n_gpu;
     total_num_cpu_blocks = n_cpu;
 
@@ -86,9 +93,14 @@ llama_block_manager::physical_block_ids llama_block_manager::checkout_cpu_blocks
 
 void llama_block_manager::release_gpu_blocks(const physical_block_ids & freed_blocks_ids) {
     for (const uint32_t & id : freed_blocks_ids) {
+        if (id >= total_num_gpu_blocks || gpu_registry[id].ref_count == 0) {
+            LLAMA_LOG_ERROR("%s: release of free/invalid GPU block %u\n", __func__, id);
+            continue;
+        }
         gpu_registry[id].ref_count -= 1;
         if (gpu_registry[id].ref_count <= 0) {
             gpu_registry[id].ref_count = 0;
+            gpu_registry[id].generation += 1;
             free_gpu_ids.push_back(id);
         }
     }
@@ -96,9 +108,15 @@ void llama_block_manager::release_gpu_blocks(const physical_block_ids & freed_bl
 
 void llama_block_manager::release_cpu_blocks(const physical_block_ids & freed_blocks_ids) {
     for (const uint32_t & id : freed_blocks_ids) {
+        if (id < total_num_gpu_blocks || id - total_num_gpu_blocks >= total_num_cpu_blocks ||
+            cpu_registry[id - total_num_gpu_blocks].ref_count == 0) {
+            LLAMA_LOG_ERROR("%s: release of free/invalid CPU block %u\n", __func__, id);
+            continue;
+        }
         cpu_registry[id - total_num_gpu_blocks].ref_count -= 1;
         if (cpu_registry[id - total_num_gpu_blocks].ref_count <= 0) {
             cpu_registry[id - total_num_gpu_blocks].ref_count = 0;
+            cpu_registry[id - total_num_gpu_blocks].generation += 1;
             free_cpu_ids.push_back(id);
         }
     }
@@ -133,4 +151,15 @@ uint32_t llama_block_manager::block_ref_count(uint32_t id) const {
         return 0;
     }
     return cpu_registry[cpu_id].ref_count;
+}
+
+uint32_t llama_block_manager::block_generation(uint32_t id) const {
+    if (id < total_num_gpu_blocks) {
+        return gpu_registry[id].generation;
+    }
+    const uint32_t cpu_id = id - total_num_gpu_blocks;
+    if (cpu_id >= total_num_cpu_blocks) {
+        return 0;
+    }
+    return cpu_registry[cpu_id].generation;
 }

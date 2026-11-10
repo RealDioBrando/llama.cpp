@@ -1289,6 +1289,10 @@ struct common_init_result::impl {
 
 static void common_fit_paged_kv_blocks(common_params& params, const llama_model * model) {
     GGML_ASSERT(model && "model must be loaded before fitting paged KV blocks.");
+    if (llama_model_is_hybrid(model)) {
+        LOG_INF("%s: hybrid model, paged memory budget is derived by the hybrid memory factory\n", __func__);
+        return;
+    }
     ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
     if (!dev) {
         LOG_WRN("%s: no GPU device found, cannot fit paged KV blocks.\n", __func__);
@@ -1796,6 +1800,16 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    // Reserve one rollback step per possible ngram-simple draft token.
+    const char * snapshot_enable = std::getenv("LLAMA_GDN_SNAPSHOT_ENABLE");
+    if ((snapshot_enable && std::strcmp(snapshot_enable, "1") == 0) &&
+        std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE) != params.speculative.types.end() &&
+        std::all_of(params.speculative.types.begin(), params.speculative.types.end(), [](common_speculative_type t) {
+            return t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE;
+        })) {
+        cparams.n_rs_seq = params.speculative.ngram_simple.size_m;
+    }
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;
@@ -1827,6 +1841,14 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_gpu_blocks      = params.n_gpu_blocks;
     cparams.n_cpu_blocks      = params.n_cpu_blocks;
     cparams.kv_paged_watermark = params.kv_paged_watermark;
+    cparams.kv_paged_vram_utilization = params.kv_paged_vram_utilization;
+    cparams.kv_paged_linear_ratio     = params.kv_paged_linear_ratio;
+    cparams.kv_paged_cpu_state_ratio  = params.kv_paged_cpu_state_ratio;
+    cparams.cpu_to_gpu_blocks_ratio   = params.cpu_to_gpu_blocks_ratio;
+    cparams.n_gpu_state_blocks        = params.n_gpu_state_blocks;
+    cparams.n_cpu_state_blocks        = params.n_cpu_state_blocks;
+    cparams.kv_prefix_ckpt_interval   = params.kv_prefix_ckpt_interval;
+    cparams.kv_prefix_ckpt_base       = params.kv_prefix_ckpt_base;
     cparams.paged_priority      = params.enable_priority;
 
     cparams.type_k   = params.cache_type_k;

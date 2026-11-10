@@ -26,6 +26,7 @@
 #include "../ggml-impl.h"
 #include "../include/ggml-cann.h"
 #include "../include/ggml.h"
+#include "gdn_route.h"
 
 #include <acl/acl.h>
 #include <unistd.h>
@@ -40,6 +41,7 @@
 #include <functional>
 #include <iostream>
 #include <list>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -468,6 +470,8 @@ struct ggml_cann_graph {
 #endif
 
     std::vector<ggml_graph_node_properties> ggml_graph_properties;
+    // RoPE generation, parameter epoch, and producer recorded during capture.
+    std::vector<std::array<size_t, 3>> rope_refs;
 
     /**
      * @brief Create a new CANN graph from a ggml computation graph.
@@ -654,15 +658,93 @@ struct ggml_cann_graph_lru_cache {
 #endif  // USE_ACL_GRAPH
 
 struct ggml_cann_rope_cache {
+    static bool lifetime_fix() {
+        static const bool enabled = []() {
+            const char * e = getenv("GGML_CANN_ROPE_LIFETIME_FIX");
+            return e && strcmp(e, "1") == 0;
+        }();
+        return enabled;
+    }
+
+    struct generation {
+        void * sin;
+        void * cos;
+        size_t bytes;
+        bool live;
+    };
+    std::vector<generation> generations;
+    size_t active_generation = 0;
+    size_t pair_capacity = 0;
+    size_t live_bytes = 0;
+    size_t param_epoch = 0;
+
+    bool generation_live(size_t id) const {
+        return id > 0 && id <= generations.size() && generations[id - 1].live;
+    }
+
+    void note_param_change() {
+        ++param_epoch;
+    }
+
+    void retire_pair(bool release) {
+        if (!active_generation) return;
+        auto & old = generations[active_generation - 1];
+        GGML_ASSERT(old.live);
+        if (release) {
+            ACL_CHECK(aclrtFree(old.sin));
+            ACL_CHECK(aclrtFree(old.cos));
+            old.live = false;
+            live_bytes -= 2 * old.bytes;
+        }
+    }
+
+    void ensure_pair(int64_t dims, int64_t tokens, bool capturing) {
+        GGML_ASSERT(dims > 0 && tokens > 0);
+        const size_t limit = std::numeric_limits<size_t>::max();
+        GGML_ASSERT((uint64_t) dims <= limit / sizeof(float) / 2);
+        const size_t row_bytes = (size_t) dims * sizeof(float) * 2;
+        GGML_ASSERT((uint64_t) tokens <= limit / row_bytes);
+        const size_t required = row_bytes * (size_t) tokens;
+        const bool fix = lifetime_fix();
+        const bool grow = fix ? required > pair_capacity : tokens > position_length;
+        if (!grow) return;
+        GGML_ASSERT(!capturing);
+        size_t capacity = required;
+        if (fix) {
+            capacity = pair_capacity ? pair_capacity : 256;
+            while (capacity < required) {
+                if (capacity > limit / 2) { capacity = required; break; }
+                capacity *= 2;
+            }
+        } else {
+            retire_pair(true);
+        }
+        GGML_ASSERT(capacity <= (limit - live_bytes) / 2);
+        void * new_sin = nullptr;
+        void * new_cos = nullptr;
+        ACL_CHECK(aclrtMalloc(&new_sin, capacity, ACL_MEM_MALLOC_HUGE_FIRST));
+        ACL_CHECK(aclrtMalloc(&new_cos, capacity, ACL_MEM_MALLOC_HUGE_FIRST));
+        if (fix) retire_pair(false);
+        generations.push_back({new_sin, new_cos, capacity, true});
+        active_generation = generations.size();
+        sin_cache = new_sin;
+        cos_cache = new_cos;
+        pair_capacity = capacity;
+        live_bytes += 2 * capacity;
+        position_length = tokens;
+    }
+
     ~ggml_cann_rope_cache() {
         if (theta_scale_cache) {
             ACL_CHECK(aclrtFree(theta_scale_cache));
         }
-        if (sin_cache) {
-            ACL_CHECK(aclrtFree(sin_cache));
-        }
-        if (cos_cache) {
-            ACL_CHECK(aclrtFree(cos_cache));
+        // The context synchronizes streams and destroys graphs before this.
+        for (size_t i = 0; i < generations.size(); ++i) {
+            auto & g = generations[i];
+            if (g.live) {
+                ACL_CHECK(aclrtFree(g.sin));
+                ACL_CHECK(aclrtFree(g.cos));
+            }
         }
         if (position_select_index) {
             ACL_CHECK(aclrtFree(position_select_index));
@@ -797,6 +879,7 @@ struct ggml_cann_gdn_cache {
     std::vector<std::array<void *, 3>> generations_; /**< superseded index-buffer generations (kept alive for old graphs). */
     std::map<std::pair<int64_t, int64_t>, void *> prefill_map_; /**< (batch, t) -> immutable [t]*batch device buffer. */
     std::map<std::pair<int64_t, int64_t>, std::pair<void *, void *>> gqa_perm_map_; /**< (nk, nv) -> immutable {in, out} head-index tables. */
+    std::map<std::array<int64_t, 3>, void *> snapshot_map_;
     size_t prefill_entries_ = 0;
     size_t prefill_device_bytes_ = 0;
 
@@ -894,6 +977,26 @@ struct ggml_cann_gdn_cache {
         ensure_prefill_lens(batch, t);
     }
 
+    void * ensure_snapshot_indices(int64_t batch, int64_t t, int64_t k) {
+        const std::array<int64_t, 3> key = {batch, t, k};
+        const auto it = snapshot_map_.find(key);
+        if (it != snapshot_map_.end()) {
+            return it->second;
+        }
+        std::vector<int32_t> host(batch * t);
+        for (int64_t b = 0; b < batch; ++b) {
+            for (int64_t j = 0; j < t; ++j) {
+                host[b * t + j] = (int32_t) gdn_route::snapshot_index(b, j, batch, t, k);
+            }
+        }
+        void * dev = nullptr;
+        const size_t bytes = host.size() * sizeof(int32_t);
+        ACL_CHECK(aclrtMalloc(&dev, bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+        ACL_CHECK(aclrtMemcpy(dev, bytes, host.data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE));
+        snapshot_map_.emplace(key, dev);
+        return dev;
+    }
+
     /**
      * @brief Return the device index tables that reorder the v-head axis
      *        between the llama.cpp modulo mapping and the kernel's block
@@ -971,6 +1074,10 @@ struct ggml_cann_gdn_cache {
             }
         }
         prefill_map_.clear();
+        for (const auto & kv : snapshot_map_) {
+            ACL_CHECK(aclrtFree(kv.second));
+        }
+        snapshot_map_.clear();
         prefill_entries_ = 0;
         for (const auto & kv : gqa_perm_map_) {
             if (kv.second.first != nullptr) {

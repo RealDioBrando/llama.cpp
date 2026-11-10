@@ -1,6 +1,7 @@
 #include "llama-kv-cache-paged.h"
 
 #include <algorithm>
+#include <utility>
 
 #include "llama-impl.h"
 
@@ -31,7 +32,8 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
                                 enum ggml_type type,
                                 uint32_t       n_gpu_blocks,
                                 uint32_t       n_cpu_blocks,
-                                float          watermark) {
+                                float          watermark,
+                                std::function<bool(uint32_t)> filter) {
     GGML_ASSERT(backend_cpu && "backend_cpu is nullptr");
     GGML_ASSERT(backend_gpu && "backend_gpu is nullptr");
     const ggml_backend_dev_t dev = ggml_backend_get_device(backend_gpu);
@@ -53,7 +55,10 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     kv_type        = type;
     gpu_backend    = backend_gpu;
     cpu_backend    = backend_cpu;
-    block_bytes    = block_size * n_heads_kv * head_dim * ggml_type_size(kv_type);
+    // Per-block bytes must match the 4D tensor layout [head_dim, block_size,
+    // n_heads_kv, n_blocks]; ggml_row_size also handles quantized row padding.
+    block_bytes = (uint32_t) (ggml_row_size(kv_type, head_dim) * block_size * n_heads_kv);
+    this->watermark = watermark;
 
     // Set up GPU context and tensors. One K pool and one V pool per layer.
     struct ggml_init_params gpu_params;
@@ -64,6 +69,11 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     struct ggml_context * ctx_gpu = ggml_init(gpu_params);
 
     for (uint32_t il = 0; il < n_layers; ++il) {
+        if (filter && !filter(il)) {
+            k_gpu_layers.push_back(nullptr);
+            v_gpu_layers.push_back(nullptr);
+            continue;
+        }
         ggml_tensor * k_layer_gpu =
             ggml_new_tensor_4d(ctx_gpu, type, head_dim, block_size, n_heads_kv, n_gpu_blocks);
         ggml_tensor * v_layer_gpu =
@@ -81,6 +91,9 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     GGML_ASSERT(buf_gpu && "Failed to allocate GPU KV cache buffer");
     ggml_backend_buffer_clear(buf_gpu, 0);  // zero out the cache
     for (uint32_t il = 0; il < n_layers; ++il) {
+        if (!k_gpu_layers[il]) {
+            continue;
+        }
         GGML_ASSERT(k_gpu_layers[il]->buffer && v_gpu_layers[il]->buffer && "GPU layer tensor has null buffer");
     }
 
@@ -91,6 +104,11 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     cpu_params.no_alloc           = true;
     struct ggml_context * ctx_cpu = ggml_init(cpu_params);
     for (uint32_t il = 0; il < n_layers; ++il) {
+        if (filter && !filter(il)) {
+            k_cpu_layers.push_back(nullptr);
+            v_cpu_layers.push_back(nullptr);
+            continue;
+        }
         ggml_tensor * k_layer_cpu =
             ggml_new_tensor_4d(ctx_cpu, type, head_dim, block_size, n_heads_kv, n_cpu_blocks);
         ggml_tensor * v_layer_cpu =
@@ -104,6 +122,9 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
     GGML_ASSERT(buf_cpu && "Failed to allocate CPU KV cache buffer");
     ggml_backend_buffer_clear(buf_cpu, 0);  // zero out the cache
     for (uint32_t il = 0; il < n_layers; ++il) {
+        if (!k_cpu_layers[il]) {
+            continue;
+        }
         GGML_ASSERT(k_cpu_layers[il]->buffer && v_cpu_layers[il]->buffer && "CPU layer tensor has null buffer");
     }
 
@@ -192,6 +213,9 @@ void llama_kv_cache_paged::copy_block_content(uint32_t src_block_id, uint32_t ds
 
         std::vector<uint8_t> staging(block_bytes);
         for (uint32_t il = 0; il < n_layers; ++il) {
+            if (!k[il]) {
+                continue;
+            }
             const size_t src_offset = (size_t) src_local * block_bytes;
             const size_t dst_offset = (size_t) dst_local * block_bytes;
             ggml_backend_tensor_get(k[il], staging.data(), src_offset, block_bytes);
@@ -207,6 +231,10 @@ void llama_kv_cache_paged::copy_block_content(uint32_t src_block_id, uint32_t ds
 
 uint32_t llama_kv_cache_paged::n_free_gpu_blocks() const {
     return (uint32_t) block_manager.n_free_gpu_blocks();
+}
+
+uint32_t llama_kv_cache_paged::n_free_cpu_blocks() const {
+    return (uint32_t) block_manager.n_free_cpu_blocks();
 }
 
 void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,
@@ -230,6 +258,9 @@ void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,
     std::vector<uint8_t> staging(block_bytes);
 
     for (uint32_t il = 0; il < n_layers; ++il) {
+        if (!src_k[il]) {
+            continue;
+        }
         for (uint32_t i = 0; i < num_blocks; ++i) {
             const uint32_t src_global = src_ids[i];
             const uint32_t dst_global = new_ids[i];
@@ -252,6 +283,27 @@ void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,
     }
 }
 
+bool llama_kv_cache_paged::can_swap_in(llama_sequence_group & group) const {
+    const uint32_t num_blocks = group.block_table.size();
+    if (num_blocks == 0) {
+        return true;
+    }
+    // n_prompt is only refreshed at admission, so a mid-prefill group must
+    // derive the remaining prompt from n_past instead of the stale field.
+    const int32_t  n_remaining   = std::max<int32_t>(0, (int32_t) group.n_prompt_total - (int32_t) group.n_past);
+    const uint32_t next_tokens   = group.n_decoded > 0
+                                       ? 1u + (uint32_t) group.pending_draft.size()
+                                       : (uint32_t) n_remaining + 1u;
+    const uint32_t needed_blocks = (group.n_past + next_tokens + block_size - 1) / block_size;
+    const uint32_t n_new_ids     = std::max(num_blocks, needed_blocks);
+    return block_manager.has_free_gpu_blocks(n_new_ids);
+}
+
+bool llama_kv_cache_paged::can_swap_out(llama_sequence_group & group) const {
+    const uint32_t num_blocks = group.block_table.size();
+    return num_blocks == 0 || block_manager.has_free_cpu_blocks(num_blocks);
+}
+
 bool llama_kv_cache_paged::swap_in(llama_sequence_group & group) {
     const uint32_t num_blocks = group.block_table.size();
     if (num_blocks == 0) {
@@ -265,7 +317,12 @@ bool llama_kv_cache_paged::swap_in(llama_sequence_group & group) {
     // block, calculate_global_slot_index() reads block_table[n_past/block_size]
     // out of bounds. Prefill groups that were swapped out before their prompt
     // was fully reserved get the remainder reserved here as well.
-    const uint32_t next_tokens = group.n_decoded > 0 ? 1u : group.n_prompt + 1u;
+    // n_prompt is only refreshed at admission, so a mid-prefill group must
+    // derive the remaining prompt from n_past instead of the stale field.
+    const int32_t  n_remaining = std::max<int32_t>(0, (int32_t) group.n_prompt_total - (int32_t) group.n_past);
+    const uint32_t next_tokens = group.n_decoded > 0
+                                     ? 1u + (uint32_t) group.pending_draft.size()
+                                     : (uint32_t) n_remaining + 1u;
     const uint32_t needed_blocks = (group.n_past + next_tokens + block_size - 1) / block_size;
     const uint32_t n_new_ids     = std::max(num_blocks, needed_blocks);
 
@@ -279,13 +336,21 @@ bool llama_kv_cache_paged::swap_in(llama_sequence_group & group) {
     llama_block_ids copy_dst(new_ids.begin(), new_ids.begin() + num_blocks);
     do_block_copy(group.block_table, copy_dst, /*to_gpu=*/true);
 
+    // Re-point the prefix index before the old blocks return to the pool.
+    // Only entries that still refer to this request's copy are moved; a
+    // same-chain entry owned by another request must not be hijacked.
+    for (size_t i = 0; i < group.block_hashes.size() && i < num_blocks; ++i) {
+        const auto * e = prefix_index.find_hash(group.block_hashes[i]);
+        if (e && e->cached) {
+            // The entry is owned by the cache; keep it on the cache's copy.
+            continue;
+        }
+        prefix_index.update_block_id_if(group.block_hashes[i], group.block_table[i], new_ids[i],
+                                        block_manager.block_generation(new_ids[i]));
+    }
+
     free_blocks(group);
     group.block_table = std::move(new_ids);
-    for (size_t i = 0; i < group.block_hashes.size() && i < group.block_table.size(); ++i) {
-        if (block_move_cb) {
-            block_move_cb(group.block_hashes[i], group.block_table[i]);
-        }
-    }
     return true;
 }
 
@@ -302,13 +367,18 @@ bool llama_kv_cache_paged::swap_out(llama_sequence_group & group) {
     llama_block_ids new_ids = block_manager.checkout_cpu_blocks(num_blocks);
     do_block_copy(group.block_table, new_ids, /*to_gpu=*/false);
 
+    for (size_t i = 0; i < group.block_hashes.size() && i < num_blocks; ++i) {
+        const auto * e = prefix_index.find_hash(group.block_hashes[i]);
+        if (e && e->cached) {
+            // The entry is owned by the cache; keep it on the cache's copy.
+            continue;
+        }
+        prefix_index.update_block_id_if(group.block_hashes[i], group.block_table[i], new_ids[i],
+                                        block_manager.block_generation(new_ids[i]));
+    }
+
     free_blocks(group);
     group.block_table = new_ids;
-    for (size_t i = 0; i < group.block_hashes.size() && i < group.block_table.size(); ++i) {
-        if (block_move_cb) {
-            block_move_cb(group.block_hashes[i], group.block_table[i]);
-        }
-    }
     return true;
 }
 
@@ -347,12 +417,166 @@ bool llama_kv_cache_paged::share_blocks(llama_sequence_group & group, const llam
 }
 
 bool llama_kv_cache_paged::add_ref_blocks(const llama_block_ids & ids) {
+    llama_block_ids added;
+    added.reserve(ids.size());
     for (const uint32_t id : ids) {
         if (!block_manager.add_ref_block(id)) {
+            if (!added.empty()) {
+                for (const uint32_t done : added) {
+                    if (block_manager.is_gpu(done)) {
+                        block_manager.release_gpu_blocks({ done });
+                    } else {
+                        block_manager.release_cpu_blocks({ done });
+                    }
+                }
+            }
             return false;
         }
+        added.push_back(id);
     }
     return true;
+}
+
+void llama_kv_cache_paged::set_prefix_enabled(bool enabled) {
+    prefix_index.set_enabled(enabled);
+}
+
+bool llama_kv_cache_paged::prefix_enabled() const {
+    return prefix_index.enabled();
+}
+
+const llama_full_prefix_entry * llama_kv_cache_paged::find_prefix_block(uint64_t    hash,
+                                                                        llama_token first_tok,
+                                                                        llama_token last_tok) const {
+    const auto * e = prefix_index.find(hash, first_tok, last_tok);
+    if (!e) {
+        return nullptr;
+    }
+    if (block_manager.block_ref_count(e->block_id) == 0) {
+        return nullptr;
+    }
+    if (!block_manager.is_gpu(e->block_id)) {
+        return nullptr;
+    }
+    if (block_manager.block_generation(e->block_id) != e->generation) {
+        return nullptr;
+    }
+    return e;
+}
+
+void llama_kv_cache_paged::register_prefix_block(uint64_t    hash,
+                                                 uint32_t    block_id,
+                                                 int32_t     owner_seq,
+                                                 uint32_t    block_idx,
+                                                 llama_token first_tok,
+                                                 llama_token last_tok) {
+    // Re-registering the same chain must not orphan a cache-resident block
+    // that was kept alive by the previous entry.
+    const auto * old = prefix_index.find(hash, first_tok, last_tok);
+    const uint32_t old_id = old ? old->block_id : 0;
+    const bool old_cached = old && old->cached;
+
+    prefix_index.register_block(hash, block_id, block_manager.block_generation(block_id), owner_seq, block_idx,
+                                first_tok, last_tok);
+
+    if (old && old_id != block_id && old_cached &&
+        block_manager.block_ref_count(old_id) == 1 && block_manager.is_gpu(old_id)) {
+        release_block(old_id);
+    }
+}
+
+void llama_kv_cache_paged::release_sequence(llama_sequence_group & group) {
+    struct planned_hash {
+        uint64_t hash;
+        uint32_t block_id;
+        size_t   index;
+        bool     keep;
+    };
+
+    std::vector<planned_hash> plan;
+    llama_block_ids           keep;
+
+    for (size_t i = 0; i < group.block_hashes.size() && i < group.block_table.size(); ++i) {
+        const uint64_t h  = group.block_hashes[i];
+        const uint32_t id = group.block_table[i];
+
+        bool keep_block = block_manager.block_ref_count(id) == 1 && block_manager.is_gpu(id);
+        if (keep_block) {
+            // If another request already registered this chain for a different
+            // physical block, this copy is a redundant duplicate: release it
+            // rather than keeping an unindexed block checked out forever.
+            const auto * e = prefix_index.find_hash(h);
+            if (e && e->block_id != id) {
+                keep_block = false;
+            }
+        }
+        plan.push_back({ h, id, i, keep_block });
+        if (keep_block) {
+            keep.push_back(id);
+        }
+    }
+
+    free_blocks(group, keep);
+
+    for (const planned_hash & p : plan) {
+        if (p.keep) {
+            const auto * e = prefix_index.find_hash(p.hash);
+            if (!e) {
+                // A sharer may have dropped the entry; re-register so the
+                // still-referenced block stays visible and reclaimable.
+                const size_t i = p.index;
+                if ((i + 1) * block_size <= group.logical_seq.size()) {
+                    prefix_index.register_block(p.hash, p.block_id, block_manager.block_generation(p.block_id),
+                                                group.request_id, (uint32_t) i,
+                                                group.logical_seq[i * block_size],
+                                                group.logical_seq[(i + 1) * block_size - 1]);
+                }
+                e = prefix_index.find_hash(p.hash);
+            }
+            if (e && e->block_id == p.block_id) {
+                prefix_index.set_cached_state(p.hash, true);
+            }
+        } else if (block_manager.block_ref_count(p.block_id) == 0) {
+            // Only drop the entry when the block actually returned to the
+            // pool. A block shared with another live request must stay
+            // indexed so it remains reachable when the last sharer finishes.
+            prefix_index.remove_if_block(p.hash, p.block_id);
+        }
+    }
+}
+
+bool llama_kv_cache_paged::take_cached_ref(uint64_t hash, uint32_t block_id) {
+    const auto * e = prefix_index.find_hash(hash);
+    if (!e || e->block_id != block_id || !e->cached) {
+        return false;
+    }
+    // The caller has already added its own reference, so the block cannot
+    // disappear when the cache's reference is released here.
+    if (block_manager.block_ref_count(block_id) <= 1) {
+        return false;
+    }
+    prefix_index.set_cached_state(hash, false);
+    release_block(block_id);
+    return true;
+}
+
+bool llama_kv_cache_paged::evict_cached_prefix_block() {
+    uint64_t hash       = 0;
+    uint32_t block_id   = 0;
+    uint32_t generation = 0;
+    if (!prefix_index.pop_lru_cached(hash, block_id, generation)) {
+        return false;
+    }
+    if (block_manager.block_ref_count(block_id) > 0 &&
+        block_manager.block_generation(block_id) == generation) {
+        release_block(block_id);
+    }
+    LLAMA_LOG_DEBUG("%s: evicted cache-resident prefix block %u\n", __func__, block_id);
+    return true;
+}
+
+uint32_t llama_kv_cache_paged::block_generation(uint32_t block_id) const {
+    return block_manager.block_generation(block_id);
 }
 
 uint32_t llama_kv_cache_paged::block_ref_count(uint32_t block_id) const {
@@ -433,15 +657,31 @@ llama_memory_context_ptr llama_kv_cache_paged::init_update(llama_context * /*lct
 }
 
 struct ggml_tensor * llama_kv_cache_paged::get_k_tensor(int layer_idx) const {
+    GGML_ASSERT(layer_idx >= 0 && (size_t) layer_idx < k_gpu_layers.size());
     return k_gpu_layers[layer_idx];
 }
 
 struct ggml_tensor * llama_kv_cache_paged::get_v_tensor(int layer_idx) const {
+    GGML_ASSERT(layer_idx >= 0 && (size_t) layer_idx < v_gpu_layers.size());
     return v_gpu_layers[layer_idx];
 }
 
-void llama_kv_cache_paged::clear(bool /*data*/) {
+void llama_kv_cache_paged::clear(bool data) {
     sequence_positions.clear();
+    prefix_index.clear();
+
+    block_manager = llama_block_manager();
+    block_manager.init(num_gpu_blocks, num_cpu_blocks, watermark);
+
+    if (data) {
+        for (const auto * pool : { &k_gpu_layers, &v_gpu_layers, &k_cpu_layers, &v_cpu_layers }) {
+            for (auto * t : *pool) {
+                if (t) {
+                    ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+                }
+            }
+        }
+    }
 }
 
 bool llama_kv_cache_paged::seq_rm(llama_seq_id seq_id, llama_pos /*p0*/, llama_pos /*p1*/) {
@@ -515,22 +755,58 @@ void llama_kv_cache_paged_context::derive_current_batch_data() {
     const llama_ubatch & cur = ubatches[i_cur];
     const int32_t n_seq_tokens = (int32_t) cur.n_seq_tokens;
 
+    // Original batch index of every ubatch token. The ubatch is a split of the
+    // scheduler's flat batch and may contain only a subset of its sequences
+    // (an earlier sequence can be exhausted while a later one still has rows),
+    // so the ubatch position is not the batch slot.
+    const int32_t * batch_idxs = nullptr;
+    if (cur.data && (int32_t) cur.data->batch_idxs.size() == (int32_t) cur.n_tokens) {
+        batch_idxs = cur.data->batch_idxs.data();
+    }
+
     local_write_slots.resize(cur.n_tokens);
     local_context_lens.resize(cur.n_seqs);
     local_batch_offsets.resize(cur.n_seqs);
     local_batch_lens.resize(cur.n_seqs);
+    // The graph sees one block-table row per ubatch sequence, so gather those
+    // rows by batch slot as well.
+    local_block_table.resize((size_t) cur.n_seqs * (size_t) max_blocks);
 
     int32_t local_offset = 0;
     for (int32_t s = 0; s < (int32_t) cur.n_seqs; ++s) {
-        const int32_t src_offset = batch_info->batch_offsets[s] + (int32_t) i_cur * n_seq_tokens;
-        GGML_ASSERT(src_offset + n_seq_tokens <= batch_info->n_tokens && "paged metadata does not match ubatch");
+        const llama_seq_id seq_id = cur.seq_id[s * n_seq_tokens][0];
+
+        // flat batch index of this sequence's first token in this ubatch
+        const int32_t seq_base = batch_idxs
+                                     ? batch_idxs[s * n_seq_tokens]
+                                     : batch_info->batch_offsets[s] + seq_token_offsets[seq_id];
+
+        // batch slot whose token range contains seq_base
+        int32_t slot = -1;
+        for (int32_t c = 0; c < batch_info->n_seq; ++c) {
+            if (seq_base >= batch_info->batch_offsets[c] &&
+                seq_base < batch_info->batch_offsets[c] + batch_info->batch_lens[c]) {
+                slot = c;
+                break;
+            }
+        }
+        GGML_ASSERT(slot >= 0 && "paged metadata does not cover the ubatch sequence");
 
         local_batch_offsets[s] = local_offset;
         local_batch_lens[s]    = n_seq_tokens;
         local_context_lens[s]  = cur.pos[(s + 1) * n_seq_tokens - 1] + 1;
 
+        const int32_t * src_blocks = batch_info->block_table + (size_t) slot * (size_t) max_blocks;
+        std::copy(src_blocks, src_blocks + max_blocks,
+                  local_block_table.begin() + (size_t) s * (size_t) max_blocks);
+
         for (int32_t t = 0; t < n_seq_tokens; ++t) {
-            local_write_slots[local_offset + t] = batch_info->write_slots[src_offset + t];
+            const int32_t bi = batch_idxs ? batch_idxs[s * n_seq_tokens + t] : seq_base + t;
+            local_write_slots[local_offset + t] = batch_info->write_slots[bi];
+        }
+
+        if (!batch_idxs) {
+            seq_token_offsets[seq_id] += n_seq_tokens;
         }
 
         local_offset += n_seq_tokens;
@@ -540,7 +816,7 @@ void llama_kv_cache_paged_context::derive_current_batch_data() {
     batch_size = cur.n_seqs;
 
     paged_write_slots   = local_write_slots.data();
-    paged_block_table   = batch_info->block_table;
+    paged_block_table   = local_block_table.data();
     paged_context_lens  = local_context_lens.data();
     paged_batch_offsets = local_batch_offsets.data();
     paged_batch_lens    = local_batch_lens.data();

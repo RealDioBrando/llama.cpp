@@ -51,6 +51,15 @@ llm_graph_input_rs * llama_hybrid_paged_build_rs_inp(
     inp->s_copy_extra = ggml_view_1d(
             gctx.ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);
 
+    // Paged linear state: state rows are not contiguous at `head`, so the
+    // graph receives an explicit write row per (sequence, rollback plane).
+    if (recr_mctx->is_paged()) {
+        const int64_t n_planes = recr_mctx->get_n_planes();
+        inp->s_write = ggml_new_tensor_1d(gctx.ctx0, GGML_TYPE_I32, n_seqs * n_planes);
+        ggml_set_name(inp->s_write, "state_write_rows");
+        ggml_set_input(inp->s_write);
+    }
+
     inp->head = recr_mctx->get_head();
     inp->rs_z = recr_mctx->get_rs_z();
 

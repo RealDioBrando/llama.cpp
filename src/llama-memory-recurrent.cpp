@@ -59,7 +59,8 @@ llama_memory_recurrent::llama_memory_recurrent(
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-    const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
+    const layer_filter_cb & filter,
+    const llama_recurrent_state_pool * state_pool) : hparams(model.hparams), n_seq_max(n_seq_max) {
     const int32_t n_layer = hparams.n_layer();
 
     head = 0;
@@ -70,6 +71,83 @@ llama_memory_recurrent::llama_memory_recurrent(
     rs_idx.assign(n_seq_max, 0);
 
     cells.clear();
+
+    if (state_pool) {
+        // Paged linear-attention state: separate GPU and CPU block pools.
+        GGML_ASSERT(state_pool->backend_gpu && state_pool->backend_cpu);
+        GGML_ASSERT(state_pool->n_gpu_blocks > 0 && state_pool->n_cpu_blocks > 0);
+
+        paged                 = true;
+        n_gpu_state_blocks_   = state_pool->n_gpu_blocks;
+        n_cpu_state_blocks_   = state_pool->n_cpu_blocks;
+        size                  = n_gpu_state_blocks_;  // plane stride used by the graph
+
+        const uint32_t n_planes = 1 + n_rs_seq;
+
+        auto make_pool = [&](ggml_backend_t backend, uint32_t n_blocks,
+                             std::vector<ggml_tensor *> & r_out,
+                             std::vector<ggml_tensor *> & s_out,
+                             std::vector<ggml_tensor *> & p_out) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                throw std::runtime_error("failed to create ggml context for paged rs cache");
+            }
+
+            r_out.resize(n_layer, nullptr);
+            s_out.resize(n_layer, nullptr);
+            p_out.resize(n_layer, nullptr);
+
+            const uint32_t n_rows = n_blocks * n_planes;
+
+            for (int i = 0; i < n_layer; i++) {
+                if (filter && !filter(i)) {
+                    continue;
+                }
+
+                ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
+                ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
+                ggml_format_name(r, "cache_r_l%d", i);
+                ggml_format_name(s, "cache_s_l%d", i);
+                r_out[i] = r;
+                s_out[i] = s;
+
+                if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
+                    ggml_tensor * p = ggml_new_tensor_2d(ctx, type_r, hparams.ple_conv_state(), n_rows);
+                    ggml_format_name(p, "cache_ple_r_l%d", i);
+                    p_out[i] = p;
+                }
+            }
+
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            if (!buf) {
+                ggml_free(ctx);
+                throw std::runtime_error("failed to allocate buffer for paged rs cache");
+            }
+            ggml_backend_buffer_clear(buf, 0);
+
+            LLAMA_LOG_INFO("%s: %10s paged RS buffer size = %8.2f MiB (%u blocks x %u planes)\n", __func__,
+                    ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0, n_blocks, n_planes);
+
+            ctxs_bufs.emplace_back(ggml_context_ptr(ctx), ggml_backend_buffer_ptr(buf));
+        };
+
+        make_pool(state_pool->backend_gpu, n_gpu_state_blocks_, r_l_gpu, s_l_gpu, p_l_gpu);
+        make_pool(state_pool->backend_cpu, n_cpu_state_blocks_, r_l_cpu, s_l_cpu, p_l_cpu);
+
+        // Keep the classic per-layer vectors empty; graph-facing getters
+        // resolve the device through the batch row map (always the GPU pool).
+        r_l.assign(n_layer, nullptr);
+        s_l.assign(n_layer, nullptr);
+        p_l.assign(n_layer, nullptr);
+
+        return;
+    }
+
     cells.resize(mem_size);
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
@@ -180,8 +258,120 @@ llama_memory_recurrent::llama_memory_recurrent(
     }
 }
 
+ggml_tensor * llama_memory_recurrent::get_state_r_tensor(int32_t il, bool gpu) const {
+    GGML_ASSERT(paged && il >= 0 && il < (int32_t) r_l_gpu.size());
+    return gpu ? r_l_gpu[il] : r_l_cpu[il];
+}
+
+ggml_tensor * llama_memory_recurrent::get_state_s_tensor(int32_t il, bool gpu) const {
+    GGML_ASSERT(paged && il >= 0 && il < (int32_t) s_l_gpu.size());
+    return gpu ? s_l_gpu[il] : s_l_cpu[il];
+}
+
+ggml_tensor * llama_memory_recurrent::get_state_p_tensor(int32_t il, bool gpu) const {
+    GGML_ASSERT(paged && il >= 0 && il < (int32_t) p_l_gpu.size());
+    return gpu ? p_l_gpu[il] : p_l_cpu[il];
+}
+
+void llama_memory_recurrent::copy_state_block(uint32_t src_id, bool src_gpu, uint32_t dst_id, bool dst_gpu) {
+    GGML_ASSERT(paged);
+    const uint32_t n_planes = n_state_planes();
+    const uint32_t n_src    = src_gpu ? n_gpu_state_blocks_ : n_cpu_state_blocks_;
+    const uint32_t n_dst    = dst_gpu ? n_gpu_state_blocks_ : n_cpu_state_blocks_;
+    GGML_ASSERT(src_id < n_src && dst_id < n_dst);
+
+    const auto & r_src = src_gpu ? r_l_gpu : r_l_cpu;
+    const auto & r_dst = dst_gpu ? r_l_gpu : r_l_cpu;
+    const auto & s_src = src_gpu ? s_l_gpu : s_l_cpu;
+    const auto & s_dst = dst_gpu ? s_l_gpu : s_l_cpu;
+    const auto & p_src = src_gpu ? p_l_gpu : p_l_cpu;
+    const auto & p_dst = dst_gpu ? p_l_gpu : p_l_cpu;
+
+    // Layer 0 may be a full-attention layer, so take the row size from the
+    // first layer that actually owns a recurrent tensor.
+    const auto first_tensor = [](const std::vector<ggml_tensor *> & v) -> const ggml_tensor * {
+        for (const auto * t : v) {
+            if (t) { return t; }
+        }
+        return nullptr;
+    };
+    const ggml_tensor * r_any = first_tensor(r_l_gpu);
+    const ggml_tensor * s_any = first_tensor(s_l_gpu);
+    const ggml_tensor * p_any = first_tensor(p_l_gpu);
+    const size_t rb_r = r_any ? ggml_row_size(r_any->type, hparams.n_embd_r()) : 0;
+    const size_t rb_s = s_any ? ggml_row_size(s_any->type, hparams.n_embd_s()) : 0;
+    const size_t rb_p = p_any ? ggml_row_size(p_any->type, hparams.ple_conv_state()) : 0;
+
+    std::vector<uint8_t> staging(std::max(rb_r, std::max(rb_s, rb_p)));
+
+    const auto copy_one = [&](const std::vector<ggml_tensor *> & src_t, const std::vector<ggml_tensor *> & dst_t,
+                              size_t row_bytes, int32_t il, uint32_t plane) {
+        if (row_bytes == 0 || il >= (int32_t) src_t.size() || !src_t[il]) {
+            return;
+        }
+        GGML_ASSERT(dst_t[il]);
+        const size_t src_off = (size_t)(plane * n_src + src_id) * row_bytes;
+        const size_t dst_off = (size_t)(plane * n_dst + dst_id) * row_bytes;
+        ggml_backend_tensor_get(src_t[il], staging.data(), src_off, row_bytes);
+        ggml_backend_tensor_set(dst_t[il], staging.data(), dst_off, row_bytes);
+    };
+
+    for (uint32_t plane = 0; plane < n_planes; ++plane) {
+        for (int32_t il = 0; il < (int32_t) r_l_gpu.size(); ++il) {
+            copy_one(r_src, r_dst, rb_r, il, plane);
+            copy_one(s_src, s_dst, rb_s, il, plane);
+            if (il < (int32_t) p_l_gpu.size()) {
+                copy_one(p_src, p_dst, rb_p, il, plane);
+            }
+        }
+    }
+}
+
+void llama_memory_recurrent::zero_state_block(uint32_t id, bool gpu) {
+    GGML_ASSERT(paged);
+    const uint32_t n_planes = n_state_planes();
+    const uint32_t n_blocks = gpu ? n_gpu_state_blocks_ : n_cpu_state_blocks_;
+    GGML_ASSERT(id < n_blocks);
+
+    const auto & r_t = gpu ? r_l_gpu : r_l_cpu;
+    const auto & s_t = gpu ? s_l_gpu : s_l_cpu;
+    const auto & p_t = gpu ? p_l_gpu : p_l_cpu;
+
+    // Layer 0 may be a full-attention layer, so take the row size from the
+    // first layer that actually owns a recurrent tensor.
+    const auto first_tensor = [](const std::vector<ggml_tensor *> & v) -> const ggml_tensor * {
+        for (const auto * t : v) {
+            if (t) { return t; }
+        }
+        return nullptr;
+    };
+    const ggml_tensor * r_any = first_tensor(r_l_gpu);
+    const ggml_tensor * s_any = first_tensor(s_l_gpu);
+    const ggml_tensor * p_any = first_tensor(p_l_gpu);
+    const size_t rb_r = r_any ? ggml_row_size(r_any->type, hparams.n_embd_r()) : 0;
+    const size_t rb_s = s_any ? ggml_row_size(s_any->type, hparams.n_embd_s()) : 0;
+    const size_t rb_p = p_any ? ggml_row_size(p_any->type, hparams.ple_conv_state()) : 0;
+
+    const auto zero_one = [&](const std::vector<ggml_tensor *> & t, size_t row_bytes, int32_t il, uint32_t plane) {
+        if (row_bytes == 0 || il >= (int32_t) t.size() || !t[il]) {
+            return;
+        }
+        ggml_backend_tensor_memset(t[il], 0, (size_t)(plane * n_blocks + id) * row_bytes, row_bytes);
+    };
+
+    for (uint32_t plane = 0; plane < n_planes; ++plane) {
+        for (int32_t il = 0; il < (int32_t) r_l_gpu.size(); ++il) {
+            zero_one(r_t, rb_r, il, plane);
+            zero_one(s_t, rb_s, il, plane);
+            if (il < (int32_t) p_l_gpu.size()) {
+                zero_one(p_t, rb_p, il, plane);
+            }
+        }
+    }
+}
+
 void llama_memory_recurrent::clear(bool data) {
-    for (int32_t i = 0; i < (int32_t) size; ++i) {
+    for (int32_t i = 0; i < (int32_t) cells.size(); ++i) {
         cells[i].pos = -1;
         cells[i].seq_id.clear();
         cells[i].src = -1;
@@ -201,6 +391,11 @@ void llama_memory_recurrent::clear(bool data) {
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (paged) {
+        // seq_id -> state block mapping lives in llama_linear_state_cache
+        return true;
+    }
+
     uint32_t new_head = size;
 
     if (p0 < 0) {
@@ -289,6 +484,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 }
 
 void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    if (paged) {
+        return;
+    }
+
     if (seq_id_src == seq_id_dst) {
         return;
     }
@@ -326,6 +525,10 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
 }
 
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
+    if (paged) {
+        return;
+    }
+
     uint32_t new_head = size;
 
     for (uint32_t i = 0; i < size; ++i) {
@@ -358,6 +561,10 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    if (paged) {
+        return;
+    }
+
     if (shift == 0) {
         return;
     }
@@ -388,6 +595,10 @@ void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
 }
 
 void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    if (paged) {
+        return;
+    }
+
     if (d == 1) {
         return;
     }
@@ -418,6 +629,10 @@ void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
 }
 
 llama_pos llama_memory_recurrent::seq_pos_min(llama_seq_id seq_id) const {
+    if (paged) {
+        return -1;
+    }
+
     llama_pos result = std::numeric_limits<llama_pos>::max();
 
     for (uint32_t i = 0; i < size; ++i) {
@@ -434,6 +649,10 @@ llama_pos llama_memory_recurrent::seq_pos_min(llama_seq_id seq_id) const {
 }
 
 llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
+    if (paged) {
+        return std::numeric_limits<llama_pos>::max();
+    }
+
     llama_pos result = -1;
 
     for (uint32_t i = 0; i < size; ++i) {
@@ -521,6 +740,13 @@ llama_memory_context_ptr llama_memory_recurrent::init_update(llama_context * lct
 }
 
 bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches) {
+    if (paged) {
+        // paged state blocks are allocated by llama_linear_state_cache, which
+        // also builds the per-ubatch row map
+        LLAMA_LOG_ERROR("%s: prepare() is not used in paged mode\n", __func__);
+        return false;
+    }
+
     // simply remember the full state because it is very small for this type of cache
     // TODO: optimize
     auto org_cells = cells;
@@ -750,6 +976,24 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     n    = max - min + 1;
     used = std::count_if(cells.begin(), cells.end(),
         [](const mem_cell & cell){ return !cell.is_empty(); });
+
+    if (getenv("GGML_DEBUG_RS")) {
+        fprintf(stderr, "[FSDBG] n_seqs=%u n_seq_tokens=%u min=%d max=%d head=%u n=%u rs_z=%d\n",
+                ubatch.n_seqs, ubatch.n_seq_tokens, min, max, head, n, rs_z);
+        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+            const llama_seq_id sid = ubatch.seq_id[s*ubatch.n_seq_tokens][0];
+            const int32_t tail = cells[sid].tail;
+            fprintf(stderr, "[FSDBG]   s=%u seq=%d tail=%d src0=%d pos=%d cells={",
+                    s, sid, tail, tail >= 0 ? cells[tail].src0 : -1,
+                    tail >= 0 ? (int) cells[tail].pos : -1);
+            if (tail >= 0) {
+                for (int q : cells[tail].seq_id) {
+                    fprintf(stderr, "%d,", q);
+                }
+            }
+            fprintf(stderr, "}\n");
+        }
+    }
 
     // sanity check
     return n >= n_seqs;
@@ -1279,6 +1523,17 @@ llama_memory_recurrent_context::llama_memory_recurrent_context(
         llama_memory_recurrent * mem,
         std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), mem(mem), ubatches(std::move(ubatches)) {}
 
+llama_memory_recurrent_context::llama_memory_recurrent_context(
+        llama_memory_recurrent * mem,
+        std::vector<llama_ubatch> ubatches,
+        std::vector<llama_recurrent_batch_rows> batch_rows) :
+    status(LLAMA_MEMORY_STATUS_SUCCESS),
+    mem(mem),
+    ubatches(std::move(ubatches)),
+    batch_rows(std::move(batch_rows)) {
+    GGML_ASSERT(this->ubatches.size() == this->batch_rows.size());
+}
+
 llama_memory_recurrent_context::~llama_memory_recurrent_context() = default;
 
 bool llama_memory_recurrent_context::next() {
@@ -1302,6 +1557,12 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
+    // Paged mode: the linear state cache already allocated and mapped the
+    // state blocks; there is nothing to place here.
+    if (mem->is_paged()) {
+        return true;
+    }
+
     mem->find_slot(ubatches[i_next]);
 
     return true;
@@ -1318,14 +1579,29 @@ const llama_ubatch & llama_memory_recurrent_context::get_ubatch() const {
 }
 
 uint32_t llama_memory_recurrent_context::get_n_rs() const {
+    if (mem->is_paged()) {
+        if (is_full) {
+            return mem->n_seq_max_hint();
+        }
+        GGML_ASSERT(i_next < batch_rows.size());
+        return batch_rows[i_next].n_seqs;
+    }
     return is_full ? mem->size : mem->n;
 }
 
 uint32_t llama_memory_recurrent_context::get_head() const {
+    if (mem->is_paged()) {
+        return 0;
+    }
     return is_full ? 0 : mem->head;
 }
 
 int32_t llama_memory_recurrent_context::get_rs_z() const {
+    if (mem->is_paged()) {
+        // paged blocks are explicitly zeroed when a fresh active block is
+        // allocated, so no in-graph zeroing source is needed
+        return -1;
+    }
     return is_full ? 0 : mem->rs_z;
 }
 
@@ -1334,18 +1610,25 @@ uint32_t llama_memory_recurrent_context::get_size() const {
 }
 
 ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
-    return mem->r_l[il];
+    return mem->is_paged() ? mem->get_state_r_tensor(il, true) : mem->r_l[il];
 }
 
 ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
-    return mem->s_l[il];
+    return mem->is_paged() ? mem->get_state_s_tensor(il, true) : mem->s_l[il];
 }
 
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
-    return mem->p_l[il];
+    return mem->is_paged() ? mem->get_state_p_tensor(il, true) : mem->p_l[il];
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
+    if (mem->is_paged()) {
+        GGML_ASSERT(i_next < batch_rows.size());
+        const auto & rows = batch_rows[i_next];
+        GGML_ASSERT(i >= 0 && i < (int32_t) rows.read_rows.size());
+        return rows.read_rows[i];
+    }
+
     const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;
 
@@ -1363,4 +1646,13 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
         }
     }
     return (int32_t)(idx * mem->size) + src0;
+}
+
+int32_t llama_memory_recurrent_context::s_write(int i, uint32_t plane) const {
+    GGML_ASSERT(mem->is_paged());
+    GGML_ASSERT(i_next < batch_rows.size());
+    const auto & rows = batch_rows[i_next];
+    GGML_ASSERT(i >= 0 && i < (int32_t) rows.n_seqs);
+    GGML_ASSERT(plane < rows.n_planes);
+    return rows.write_rows[i * rows.n_planes + plane];
 }

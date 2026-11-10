@@ -12,8 +12,11 @@ struct llama_paged_scheduler {
     llama_paged_scheduler(uint32_t n_ctx, uint32_t block_sz, uint32_t n_batch, int32_t n_pos_per_embd,
                           llama_kv_cache_paged * kv_manager,
                           llama_memory_hybrid_paged * hybrid_memory,
-                          bool priority_enabled) :
-        impl(n_ctx, block_sz, n_batch, n_pos_per_embd, kv_manager, hybrid_memory, priority_enabled) {}
+                          bool priority_enabled,
+                          uint32_t ckpt_interval,
+                          uint32_t ckpt_base) :
+        impl(n_ctx, block_sz, n_batch, n_pos_per_embd, kv_manager, hybrid_memory, priority_enabled,
+             ckpt_interval, ckpt_base) {}
 };
 
 LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama_context * ctx) {
@@ -45,9 +48,12 @@ LLAMA_API struct llama_paged_scheduler * llama_paged_scheduler_init(struct llama
     }
     const int32_t n_pos_per_embd = llama_model_n_pos_per_embd(llama_get_model(ctx));
 
+    const llama_cparams & cp = ctx->get_cparams();
+
     try {
         return new llama_paged_scheduler(n_ctx, block_sz, n_batch, n_pos_per_embd, paged_kv, hybrid_memory,
-                                         ctx->paged_priority());
+                                         ctx->paged_priority(), cp.kv_prefix_ckpt_interval,
+                                         cp.kv_prefix_ckpt_base);
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("%s: Error when creating llama_paged_scheduler: %s\n", __func__, e.what());
         return nullptr;

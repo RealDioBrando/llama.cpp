@@ -6,9 +6,10 @@
 
 class llama_block_manager {
     struct physical_block {
-        uint32_t id        = 0;
-        uint32_t ref_count = 0;
-        bool     is_gpu    = false;
+        uint32_t id         = 0;
+        uint32_t ref_count  = 0;
+        uint32_t generation = 0;
+        bool     is_gpu     = false;
     };
 
     using physical_block_bool = std::vector<physical_block>;
@@ -44,6 +45,12 @@ class llama_block_manager {
 
     // 0 means the block is free (or unknown).
     uint32_t block_ref_count(uint32_t id) const;
+
+    // Bumped every time the block transitions from allocated to free. A
+    // prefix entry that stores (block id, generation) can therefore detect
+    // that the physical block was released and possibly reused since the
+    // entry was created.
+    uint32_t block_generation(uint32_t id) const;
 
     void release_gpu_blocks(const physical_block_ids & freed_blocks);
     void release_cpu_blocks(const physical_block_ids & freed_blocks);
