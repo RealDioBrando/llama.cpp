@@ -1,13 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: bash run_llama_server.sh [text_10c|vl_small|vl_large]
+# Usage: bash run_llama_server.sh [text_10c|vl_small|vl_large] [--model PATH] [--mmproj PATH]
 # Default: text_10c
-SCENARIO=${1:-text_10c}
+SCENARIO=text_10c
+CLI_MODEL=""
+CLI_MMPROJ=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model)
+      [[ $# -ge 2 ]] || { echo "--model requires a path" >&2; exit 1; }
+      CLI_MODEL="$2"
+      shift 2
+      ;;
+    --mmproj)
+      [[ $# -ge 2 ]] || { echo "--mmproj requires a path" >&2; exit 1; }
+      CLI_MMPROJ="$2"
+      shift 2
+      ;;
+    *)
+      SCENARIO="$1"
+      shift
+      ;;
+  esac
+done
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=${PERF_REGRESSION_ROOT:-$(dirname "${SCRIPT_DIR}")}
-REPO_ROOT=${LLAMA_SOURCE:-$(cd "${SCRIPT_DIR}/../.." && pwd)}
+REPO_ROOT=${LLAMA_SOURCE:-$(cd "${SCRIPT_DIR}/../../../../.." && pwd)}
 BUILD_DIR=${LLAMA_BUILD_DIR:-${REPO_ROOT}/build-cann-aclgraph}
 
 # Source CANN and ATB environments so the server can find libascendcl and ATB.
@@ -20,6 +40,9 @@ if [[ -z "${CANN_SET_ENV}" && -n "${ASCEND_TOOLKIT_HOME:-}" ]]; then
 fi
 if [[ -z "${CANN_SET_ENV}" && -f "${ASCEND_HOME}/ascend-toolkit/set_env.sh" ]]; then
   CANN_SET_ENV="${ASCEND_HOME}/ascend-toolkit/set_env.sh"
+fi
+if [[ -z "${CANN_SET_ENV}" && -f "${ASCEND_HOME}/cann-9.1.0/set_env.sh" ]]; then
+  CANN_SET_ENV="${ASCEND_HOME}/cann-9.1.0/set_env.sh"
 fi
 if [[ -z "${ATB_SET_ENV}" && -f "${ASCEND_HOME}/nnal/atb/set_env.sh" ]]; then
   ATB_SET_ENV="${ASCEND_HOME}/nnal/atb/set_env.sh"
@@ -48,7 +71,7 @@ fi
 # Per-scenario defaults (overridable by env vars)
 case "${SCENARIO}" in
   text_10c)
-    DEFAULT_MODEL=${LLAMA_TEXT_MODEL:-${LLAMA_MODEL:-}}
+    DEFAULT_MODEL=/home/common/model/qwen3/Qwen3-1.7B-F16.gguf
     DEFAULT_MMPROJ=""
     DEFAULT_PORT=18112
     DEFAULT_CTX=8192
@@ -56,8 +79,8 @@ case "${SCENARIO}" in
     DEFAULT_ACT_TYPE=f16
     ;;
   vl_small|vl_large)
-    DEFAULT_MODEL=${LLAMA_VL_MODEL:-${LLAMA_MODEL:-}}
-    DEFAULT_MMPROJ=${LLAMA_VL_MMPROJ:-${LLAMA_MMPROJ:-}}
+    DEFAULT_MODEL=/home/common/model/qwen3/Qwen3-VL-4B-Instruct/Qwen3VL-4B-Instruct-F16.gguf
+    DEFAULT_MMPROJ=/home/common/model/qwen3/Qwen3-VL-4B-Instruct/Qwen3VL-4B-Instruct-mmproj-f16.gguf
     DEFAULT_PORT=18113
     DEFAULT_CTX=32768
     DEFAULT_PARALLEL=4
@@ -70,23 +93,19 @@ case "${SCENARIO}" in
     ;;
 esac
 
-MODEL=${LLAMA_MODEL:-${DEFAULT_MODEL}}
-if [[ -z "${MODEL}" ]]; then
-  echo "llama model path is not set; use LLAMA_MODEL, LLAMA_TEXT_MODEL or LLAMA_VL_MODEL" >&2
-  exit 1
-fi
+MODEL=${CLI_MODEL:-${DEFAULT_MODEL}}
 PORT=${PERF_SERVER_PORT:-${DEFAULT_PORT}}
 CTX=${PERF_LLAMA_CTX:-${DEFAULT_CTX}}
 PARALLEL=${PERF_LLAMA_PARALLEL:-${DEFAULT_PARALLEL}}
 THREADS=${PERF_LLAMA_THREADS:-8}
 THREADS_BATCH=${PERF_LLAMA_THREADS_BATCH:-8}
-MMPROJ=${LLAMA_MMPROJ:-${DEFAULT_MMPROJ}}
+MMPROJ=${CLI_MMPROJ:-${DEFAULT_MMPROJ}}
 MMPROJ_ARGS=(--mmproj-auto)
 if [[ -n "${MMPROJ}" ]]; then
   MMPROJ_ARGS=(--mmproj "${MMPROJ}")
 fi
 
-export ASCEND_RT_VISIBLE_DEVICES=${PERF_NPU_ID:-7}
+export ASCEND_RT_VISIBLE_DEVICES=${PERF_NPU_ID:-5}
 export GGML_CANN_ACL_GRAPH=${PERF_LLAMA_ACL_GRAPH:-1}
 export GGML_CANN_PREFILL_USE_GRAPH=${PERF_LLAMA_PREFILL_GRAPH:-0}
 export GGML_CANN_FA_V5=1
@@ -131,5 +150,9 @@ fi
   >"${LOG}" 2>&1 &
 PID=$!
 echo "${PID}" > "${ROOT}/run/llama-server-${PORT}.pid"
-trap 'kill "${PID}" 2>/dev/null || true' EXIT INT TERM
+cleanup() {
+  kill "${PID}" 2>/dev/null || true
+  wait "${PID}" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
 wait "${PID}"

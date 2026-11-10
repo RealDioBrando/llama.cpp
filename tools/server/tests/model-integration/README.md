@@ -31,7 +31,9 @@ The scripts derive the repository root from their own location:
 llama.cpp/tools/server/tests/model-integration
 ```
 
-Run from the CANN container. The default NPU is device 7, but every model path is supplied through environment variables.
+Run from the CANN container. The default NPU is device 5. Model paths have
+`/home/common` defaults and can be overridden with CLI options or the previous
+environment variables.
 
 ## Build and prepare
 
@@ -40,9 +42,6 @@ chmod +x scripts/*.sh
 python scripts/prepare_assets.py
 python scripts/prepare_accuracy_assets.py
 python scripts/validate_env.py
-LLAMA_TEXT_MODEL=/path/to/Qwen3-1.7B-F16.gguf \
-LLAMA_VL_MODEL=/path/to/Qwen3VL-4B-Instruct-F16.gguf \
-  python scripts/validate_env.py
 scripts/build_llama.sh
 ```
 
@@ -53,27 +52,34 @@ scripts/build_llama.sh
 llama.cpp:
 
 ```bash
-LLAMA_TEXT_MODEL=/path/to/Qwen3-1.7B-F16.gguf \
 PERF_LLAMA_CTX=65536 \
 PERF_LLAMA_PARALLEL=10 \
-scripts/run_llama_server.sh
+scripts/run_llama_server.sh text_10c --model /path/to/Qwen3-1.7B-F16.gguf
 ```
 
 vLLM baseline:
 
 ```bash
-VLLM_TEXT_MODEL=/path/to/Qwen3-1.7B \
-scripts/run_vllm_server.sh
+scripts/run_vllm_server.sh text_10c --model /path/to/Qwen3-1.7B
 ```
 
-For Qwen3 VL, set:
+For Qwen3 VL, pass:
 
 ```bash
-export LLAMA_VL_MODEL=/path/to/Qwen3VL-4B-Instruct-F16.gguf
-export VLLM_VL_MODEL=/path/to/Qwen3-VL-4B-Instruct
+scripts/run_llama_server.sh vl_small \
+  --model /path/to/Qwen3VL-4B-Instruct-F16.gguf \
+  --mmproj /path/to/Qwen3VL-4B-Instruct-mmproj-f16.gguf
+scripts/run_vllm_server.sh vl_small --model /path/to/Qwen3-VL-4B-Instruct
 ```
 
-The server uses `--mmproj-auto` because the GGUF contains the projector. If the projector is a separate GGUF, set `LLAMA_VL_MMPROJ=/path/to/Qwen3VL-4B-Instruct-mmproj-f16.gguf`.
+The server uses the separate mmproj by default. `run_all.py` accepts
+`--llama-text-model`, `--llama-vl-model`, `--llama-vl-mmproj`,
+`--qwen3-1-7b-path`, `--qwen3-vl-4b-path`, `--vllm-text-model`, and
+`--vllm-vl-model`.
+
+The fixed-token dataset uses `/home/common/model/qwen3/Qwen3-8B` as its
+default tokenizer directory and accepts `QWEN3_1_7B_PATH` as a fallback
+override.
 
 ## Run cases
 
@@ -123,7 +129,12 @@ For the 10-concurrency text case, the current CANN ACL graph path can abort with
 `PERF_LLAMA_ACL_GRAPH=0` for that case until the graph event lifecycle is fixed.
 This remains a compile-time ACL-graph build, but the text case runs eager.
 
-If starting AISBench manually, prepend the config directory to `PYTHONPATH`:
+`run_all.py` defaults AISBench to `/usr/bin/python3`, source at
+`/home/z00575061/AISBench-benchmark`, site-packages at
+`/home/qzh/.venvs/aisbench/lib/python3.10/site-packages`, and CANN
+`/usr/local/Ascend/cann-9.1.0/set_env.sh`. Override them with
+`AIS_BENCH_BIN`, `AIS_BENCH_HOME`, or `CANN_SET_ENV`. If starting AISBench
+manually, prepend the config directory to `PYTHONPATH`:
 
 ```bash
 PYTHONPATH=$PWD/configs ais_bench ...

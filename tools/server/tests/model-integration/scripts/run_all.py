@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from dataclasses import dataclass
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,6 +73,32 @@ VLLM_COMPILATION_CONFIG = (
     '"cudagraph_capture_sizes":[1,2,3,4,5,6,7,8,9,10]}'
 )
 
+DEFAULT_QWEN3_ROOT = Path("/home/common/model/qwen3")
+DEFAULT_LLAMA_TEXT_MODEL = DEFAULT_QWEN3_ROOT / "Qwen3-1.7B-F16.gguf"
+DEFAULT_LLAMA_VL_MODEL = DEFAULT_QWEN3_ROOT / "Qwen3-VL-4B-Instruct/Qwen3VL-4B-Instruct-F16.gguf"
+DEFAULT_LLAMA_VL_MMPROJ = (
+    DEFAULT_QWEN3_ROOT / "Qwen3-VL-4B-Instruct/Qwen3VL-4B-Instruct-mmproj-f16.gguf"
+)
+DEFAULT_QWEN3_TEXT_HF_DIR = DEFAULT_QWEN3_ROOT / "Qwen3-8B"
+DEFAULT_QWEN3_VL_HF_DIR = DEFAULT_QWEN3_ROOT / "Qwen3-VL-4B-Instruct"
+DEFAULT_VLLM_TEXT_MODEL = DEFAULT_QWEN3_ROOT / "Qwen3-8B"
+DEFAULT_VLLM_VL_MODEL = DEFAULT_QWEN3_ROOT / "Qwen3-VL-4B-Instruct"
+DEFAULT_AIS_BENCH_BIN = Path("/usr/bin/python3")
+DEFAULT_AIS_BENCH_HOME = Path("/home/qzh/.venvs/aisbench/lib/python3.10/site-packages")
+DEFAULT_AIS_BENCH_SOURCE = Path("/home/z00575061/AISBench-benchmark")
+DEFAULT_CANN_SET_ENV = Path("/usr/local/Ascend/cann-9.1.0/set_env.sh")
+
+
+@dataclass(frozen=True)
+class ModelPaths:
+    llama_text_model: Path
+    llama_vl_model: Path
+    llama_vl_mmproj: Path
+    qwen3_text_hf_dir: Path
+    qwen3_vl_hf_dir: Path
+    vllm_text_model: Path
+    vllm_vl_model: Path
+
 
 def wait_server(port: int, timeout: int = 120) -> bool:
     import time
@@ -87,7 +114,7 @@ def wait_server(port: int, timeout: int = 120) -> bool:
     return False
 
 
-def start_server(scenario: str):
+def start_server(scenario: str, paths: ModelPaths):
     import signal
     port = int(os.environ.get("PERF_SERVER_PORT") or SCENARIOS[scenario]["server_port"])
     if os.environ.get("LLAMA_REUSE_SERVER") == "1" and wait_server(port, 2):
@@ -95,8 +122,15 @@ def start_server(scenario: str):
     env = os.environ.copy()
     env["PERF_REGRESSION_ROOT"] = str(ROOT)
     env["PERF_SERVER_PORT"] = str(port)
+    command = ["bash", str(SCRIPTS / "run_llama_server.sh"), scenario]
+    if scenario == "text_10c":
+        command.extend(["--model", str(paths.llama_text_model)])
+    else:
+        command.extend(["--model", str(paths.llama_vl_model)])
+        if paths.llama_vl_mmproj:
+            command.extend(["--mmproj", str(paths.llama_vl_mmproj)])
     proc = subprocess.Popen(
-        ["bash", str(SCRIPTS / "run_llama_server.sh"), scenario],
+        command,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         env=env,
@@ -127,19 +161,15 @@ def _docker_exec(cmd: str, background: bool = False) -> subprocess.Popen | None:
     return subprocess.Popen(full, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def generated_model_config(engine: str, scenario: str) -> str | Path:
+def generated_model_config(engine: str, scenario: str, paths: ModelPaths) -> str | Path:
     model_name = SCENARIOS[scenario]["models"][engine]
     server_port = os.environ.get("PERF_SERVER_PORT") or SCENARIOS[scenario]["server_port"]
     source = ROOT / "configs" / "models" / f"{model_name}.py"
-    if scenario == "text_10c":
-        tokenizer_path = os.environ.get("QWEN3_1_7B_PATH") or os.environ.get("TOKENIZER_PATH")
-    else:
-        tokenizer_path = os.environ.get("QWEN3_VL_4B_PATH") or os.environ.get("TOKENIZER_PATH")
-    if not tokenizer_path:
-        return model_name
+    tokenizer_path = paths.qwen3_text_hf_dir if scenario == "text_10c" else paths.qwen3_vl_hf_dir
 
     text = source.read_text(encoding="utf-8")
-    text = re.sub(r"path\s*=\s*\"\.\"", f'path="{tokenizer_path}"', text, count=1)
+    tokenizer_path_text = str(tokenizer_path).replace('"', '\\"')
+    text = re.sub(r"path\s*=\s*\"\.\"", f'path="{tokenizer_path_text}"', text, count=1)
     text = re.sub(r"host_ip\s*=\s*\"localhost\"", 'host_ip="127.0.0.1"', text, count=1)
     text = re.sub(r"host_port\s*=\s*\d+", f"host_port={server_port}", text, count=1)
     output_name = f"generated_{engine}_{scenario}"
@@ -148,12 +178,9 @@ def generated_model_config(engine: str, scenario: str) -> str | Path:
     return output_name
 
 
-def start_vllm_server(scenario: str) -> bool:
+def start_vllm_server(scenario: str, paths: ModelPaths) -> bool:
     cfg = VLLM_SERVERS[scenario]
-    model_key = "VLLM_TEXT_MODEL" if scenario == "text_10c" else "VLLM_VL_MODEL"
-    model_path = os.environ.get(model_key) or os.environ.get("VLLM_MODEL")
-    if not model_path:
-        raise RuntimeError(f"{model_key} or VLLM_MODEL is not set")
+    model_path = paths.vllm_text_model if scenario == "text_10c" else paths.vllm_vl_model
     npu_id = os.environ.get("VLLM_NPU_ID", "5")
     _docker_exec("pkill -9 -f vllm 2>/dev/null; sleep 3")
     import time
@@ -182,6 +209,7 @@ def run_benchmark(
     engine: str,
     scenario: str,
     config_dir: Path,
+    paths: ModelPaths,
     dataset: str | None = None,
     work_dir_name: str | None = None,
     mode: str = "perf",
@@ -192,6 +220,8 @@ def run_benchmark(
     work_dir = ROOT / "results" / engine / (work_dir_name or scenario)
     work_dir.mkdir(parents=True, exist_ok=True)
     ais_bench_bin = os.environ.get("AIS_BENCH_BIN") or shutil.which("ais_bench")
+    if not ais_bench_bin and DEFAULT_AIS_BENCH_BIN.is_file():
+        ais_bench_bin = str(DEFAULT_AIS_BENCH_BIN)
     if not ais_bench_bin:
         raise RuntimeError("ais_bench was not found; set AIS_BENCH_BIN or put it on PATH")
     command = [ais_bench_bin]
@@ -201,7 +231,7 @@ def run_benchmark(
     command.extend(
         [
             "--models",
-            str(generated_model_config(engine, scenario)),
+            str(generated_model_config(engine, scenario, paths)),
             "--datasets",
             dataset,
             "--config-dir",
@@ -220,11 +250,17 @@ def run_benchmark(
     ais_bench_root = Path(ais_bench_bin).resolve().parents[1]
     python_paths.extend(str(p) for p in sorted(ais_bench_root.glob("lib/python*/site-packages")))
     ais_bench_home = os.environ.get("AIS_BENCH_HOME")
+    if not ais_bench_home and DEFAULT_AIS_BENCH_HOME.is_dir():
+        ais_bench_home = str(DEFAULT_AIS_BENCH_HOME)
+    if DEFAULT_AIS_BENCH_SOURCE.is_dir():
+        python_paths.insert(0, str(DEFAULT_AIS_BENCH_SOURCE))
     if ais_bench_home:
         python_paths.insert(0, ais_bench_home)
     env["PYTHONPATH"] = os.pathsep.join(python_paths + [env.get("PYTHONPATH", "")])
     env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
     cann_env = os.environ.get("CANN_SET_ENV")
+    if not cann_env and DEFAULT_CANN_SET_ENV.is_file():
+        cann_env = str(DEFAULT_CANN_SET_ENV)
     if not cann_env and os.environ.get("ASCEND_TOOLKIT_HOME"):
         cann_env = str(Path(os.environ["ASCEND_TOOLKIT_HOME"]) / "set_env.sh")
     if cann_env and os.path.exists(cann_env):
@@ -245,6 +281,7 @@ def run_accuracy_benchmark(
     engine: str,
     scenario: str,
     config_dir: Path,
+    paths: ModelPaths,
     num_prompts: int,
     full_dataset: bool,
 ) -> None:
@@ -266,6 +303,7 @@ def run_accuracy_benchmark(
         engine,
         scenario,
         config_dir,
+        paths,
         dataset=dataset,
         work_dir_name=f"{scenario}_accuracy",
         mode="all",
@@ -392,10 +430,68 @@ def main() -> int:
     parser.add_argument("--accuracy-mode", choices=["both", "off", "only"], default="both")
     parser.add_argument("--accuracy-num-prompts", type=int, default=30)
     parser.add_argument("--accuracy-full", action="store_true")
+    parser.add_argument(
+        "--llama-text-model",
+        default=os.environ.get("LLAMA_TEXT_MODEL") or DEFAULT_LLAMA_TEXT_MODEL,
+    )
+    parser.add_argument(
+        "--llama-vl-model",
+        default=os.environ.get("LLAMA_VL_MODEL") or DEFAULT_LLAMA_VL_MODEL,
+    )
+    parser.add_argument(
+        "--llama-vl-mmproj",
+        default=os.environ.get("LLAMA_VL_MMPROJ") or DEFAULT_LLAMA_VL_MMPROJ,
+    )
+    parser.add_argument(
+        "--qwen3-1-7b-path",
+        default=os.environ.get("QWEN3_1_7B_PATH") or DEFAULT_QWEN3_TEXT_HF_DIR,
+    )
+    parser.add_argument(
+        "--qwen3-vl-4b-path",
+        default=os.environ.get("QWEN3_VL_4B_PATH") or DEFAULT_QWEN3_VL_HF_DIR,
+    )
+    parser.add_argument(
+        "--vllm-text-model",
+        default=os.environ.get("VLLM_TEXT_MODEL") or DEFAULT_VLLM_TEXT_MODEL,
+    )
+    parser.add_argument(
+        "--vllm-vl-model",
+        default=os.environ.get("VLLM_VL_MODEL") or DEFAULT_VLLM_VL_MODEL,
+    )
     args = parser.parse_args()
 
     scenarios = list(SCENARIOS) if args.scenario == 'all' else [args.scenario]
     engines = ['llama', 'vllm'] if args.engine == 'both' else [args.engine]
+
+    paths = ModelPaths(
+        llama_text_model=Path(args.llama_text_model).expanduser(),
+        llama_vl_model=Path(args.llama_vl_model).expanduser(),
+        llama_vl_mmproj=Path(args.llama_vl_mmproj).expanduser() if args.llama_vl_mmproj else Path(),
+        qwen3_text_hf_dir=Path(args.qwen3_1_7b_path).expanduser(),
+        qwen3_vl_hf_dir=Path(args.qwen3_vl_4b_path).expanduser(),
+        vllm_text_model=Path(args.vllm_text_model).expanduser(),
+        vllm_vl_model=Path(args.vllm_vl_model).expanduser(),
+    )
+
+    missing = []
+    if "llama" in engines:
+        if "text_10c" in scenarios and not paths.llama_text_model.is_file():
+            missing.append(str(paths.llama_text_model))
+        if any(s != "text_10c" for s in scenarios):
+            if not paths.llama_vl_model.is_file():
+                missing.append(str(paths.llama_vl_model))
+            if paths.llama_vl_mmproj and not paths.llama_vl_mmproj.is_file():
+                missing.append(str(paths.llama_vl_mmproj))
+    if "vllm" in engines:
+        if "text_10c" in scenarios and not paths.vllm_text_model.is_dir():
+            missing.append(str(paths.vllm_text_model))
+        if any(s != "text_10c" for s in scenarios) and not paths.vllm_vl_model.is_dir():
+            missing.append(str(paths.vllm_vl_model))
+    if missing:
+        print("ERROR: model paths not found:")
+        for path in missing:
+            print(f"  {path}")
+        return 2
 
     if not args.collect_only:
         for engine in engines:
@@ -411,35 +507,37 @@ def main() -> int:
                         need_restart = True
                         vllm_started.discard(port)
                     if need_restart:
-                        if not start_vllm_server(scenario):
+                        if not start_vllm_server(scenario, paths):
                             print(f'ERROR: failed to start vllm server for {scenario}')
                             continue
                         vllm_started.add(port)
                     if args.accuracy_mode != 'only':
-                        run_benchmark(engine, scenario, ROOT / 'configs')
+                        run_benchmark(engine, scenario, ROOT / 'configs', paths)
                     if args.accuracy_mode != 'off':
                         run_accuracy_benchmark(
                             engine,
                             scenario,
                             ROOT / 'configs',
+                            paths,
                             args.accuracy_num_prompts,
                             args.accuracy_full,
                         )
                 stop_vllm_server()
             else:
                 for scenario in scenarios:
-                    proc = start_server(scenario)
+                    proc = start_server(scenario, paths)
                     if proc is None and os.environ.get("LLAMA_REUSE_SERVER") != "1":
                         print(f'ERROR: failed to start llama server for {scenario}')
                         continue
                     try:
                         if args.accuracy_mode != 'only':
-                            run_benchmark(engine, scenario, ROOT / 'configs')
+                            run_benchmark(engine, scenario, ROOT / 'configs', paths)
                         if args.accuracy_mode != 'off':
                             run_accuracy_benchmark(
                                 engine,
                                 scenario,
                                 ROOT / 'configs',
+                                paths,
                                 args.accuracy_num_prompts,
                                 args.accuracy_full,
                             )

@@ -2410,10 +2410,7 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
                                         bcast_weight_nb[3], bcast_weight_nb[4], bcast_weight_nb[5] };
     acl_tensor_ptr acl_weight_tensor;
 
-    // Only check env once.
-    static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
-    bool used_tied_copy = false;
-    bool weight_is_nz = false;
+    aclFormat weight_format = ACL_FORMAT_ND;
 #ifdef ASCEND_310P
     // The tied lm head (token_embd.weight) keeps its ND data for GET_ROWS;
     // mul_mat reads a separate FRACTAL_NZ copy prepared once at weight-load
@@ -2425,17 +2422,16 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
             acl_weight_tensor = ggml_cann_create_tensor(it->second->buffer, ACL_FLOAT16, sizeof(uint16_t),
                                                         transpose_ne, transpose_nb, n_dims,
                                                         ACL_FORMAT_FRACTAL_NZ);
-            used_tied_copy = true;
-            weight_is_nz = true;
+            weight_format = ACL_FORMAT_FRACTAL_NZ;
         }
     }
 #endif
 
-    if (!used_tied_copy && weight_to_nz && weight->type != GGML_TYPE_BF16 &&
-        ggml_cann_is_weight_layout_candidate(weight)) {
+    if (weight_format == ACL_FORMAT_ND && ggml_cann_is_weight_layout_candidate(weight)) {
         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_FRACTAL_NZ);
-        weight_is_nz = true;
-    } else if (!used_tied_copy) {
+        weight_format = ACL_FORMAT_FRACTAL_NZ;
+    }
+    if (weight_format == ACL_FORMAT_ND) {
         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_ND);
     }
     acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst, bcast_dst_ne, bcast_dst_nb, n_dims);
@@ -2443,7 +2439,8 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
     switch (n_dims) {
         case 2:
 #ifdef ASCEND_310P
-            if (input->type == GGML_TYPE_F16 && input->ne[1] > 1 && weight_is_nz) {
+            if (input->type == GGML_TYPE_F16 && input->ne[1] > 1 &&
+                weight_format == ACL_FORMAT_FRACTAL_NZ) {
                 // aclnnMatmul is the F16/NZ prefill fast path. CANN tiling
                 // rejects some M and mat2 shape combinations (M=2048 with
                 // K=2560/N=4096 is one), while ND mat2 or other NZ shapes

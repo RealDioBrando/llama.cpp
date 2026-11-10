@@ -1,22 +1,36 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: bash run_vllm_server.sh [text_10c|vl_small|vl_large]
+# Usage: bash run_vllm_server.sh [text_10c|vl_small|vl_large] [--model PATH]
 # Default: text_10c
-SCENARIO=${1:-text_10c}
+SCENARIO=text_10c
+CLI_MODEL=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model)
+      [[ $# -ge 2 ]] || { echo "--model requires a path" >&2; exit 1; }
+      CLI_MODEL="$2"
+      shift 2
+      ;;
+    *)
+      SCENARIO="$1"
+      shift
+      ;;
+  esac
+done
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ROOT=${PERF_REGRESSION_ROOT:-$(dirname "${SCRIPT_DIR}")}
 
 case "${SCENARIO}" in
   text_10c)
-    DEFAULT_MODEL=${VLLM_TEXT_MODEL:-${VLLM_MODEL:-}}
+    DEFAULT_MODEL=/home/common/model/qwen3/Qwen3-8B
     DEFAULT_PORT=18110
     DEFAULT_MAX_LEN=12288
     DEFAULT_MAX_SEQS=16
     ;;
   vl_small|vl_large)
-    DEFAULT_MODEL=${VLLM_VL_MODEL:-${VLLM_MODEL:-}}
+    DEFAULT_MODEL=/home/common/model/qwen3/Qwen3-VL-4B-Instruct
     DEFAULT_PORT=18120
     DEFAULT_MAX_LEN=8192
     DEFAULT_MAX_SEQS=4
@@ -28,16 +42,12 @@ case "${SCENARIO}" in
     ;;
 esac
 
-MODEL=${VLLM_MODEL:-${DEFAULT_MODEL}}
-if [[ -z "${MODEL}" ]]; then
-  echo "vLLM model path is not set; use VLLM_MODEL, VLLM_TEXT_MODEL or VLLM_VL_MODEL" >&2
-  exit 1
-fi
+MODEL=${CLI_MODEL:-${DEFAULT_MODEL}}
 PORT=${PERF_SERVER_PORT:-${DEFAULT_PORT}}
 MAX_LEN=${PERF_VLLM_MAX_LEN:-${DEFAULT_MAX_LEN}}
 MAX_SEQS=${PERF_VLLM_MAX_SEQS:-${DEFAULT_MAX_SEQS}}
 
-export ASCEND_RT_VISIBLE_DEVICES=${PERF_NPU_ID:-7}
+export ASCEND_RT_VISIBLE_DEVICES=${PERF_NPU_ID:-5}
 
 mkdir -p "${ROOT}/logs" "${ROOT}/run"
 LOG=${ROOT}/logs/vllm-server-${PORT}.log
