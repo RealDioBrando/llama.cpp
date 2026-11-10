@@ -444,6 +444,8 @@ private:
 
             // the paged scheduler runs its own warmup after the context is created
             params_base.warmup = false;
+        } else if (params_base.enable_priority) {
+            SRV_WRN("%s", "--enable-priority only applies to the paged scheduler, ignoring it (add --kv-paged)\n");
         }
 
         if (callback_state) {
@@ -3688,6 +3690,10 @@ bool server_context::load_model(common_params & params) {
 
 void server_context::start_loop() {
     auto & params = impl->params_base;
+    // request priority only exists on the paged path: order the server queues
+    // by task priority so that a burst of requests is admitted by priority too
+    // (the paged scheduler itself orders its own waiting/swapped queues)
+    impl->queue_tasks.set_priority_order(params.kv_paged && params.enable_priority);
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
 }
 

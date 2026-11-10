@@ -168,6 +168,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-cram, --cache-ram N` | set the maximum cache size in MiB (default: 8192, -1 - no limit, 0 - disable)[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)<br/>(env: LLAMA_ARG_CACHE_RAM) |
 | `-kvu, --kv-unified, -no-kvu, --no-kv-unified` | use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)<br/>(env: LLAMA_ARG_KV_UNIFIED) |
 | `-kvp, --kv-paged, -no-kvp, --no-kv-paged` | use paged KV buffer with a continuous-batching scheduler, shared across all sequences (default: disabled), see [Paged KV cache](#paged-kv-cache)<br/>(env: LLAMA_ARG_KV_PAGED) |
+| `--enable-priority, --no-enable-priority` | order paged requests by the per-request `priority` field (lower value first) instead of FCFS (default: disabled), see [Paged KV cache](#paged-kv-cache)<br/>(env: LLAMA_ARG_ENABLE_PRIORITY) |
 | `-ncpub, --n-cpu-blocks N` | number of physical CPU blocks for paged KV cache (default: 1) |
 | `-ngpub, --n-gpu-blocks N` | number of physical GPU blocks for paged KV cache (default: auto-fitted from free device memory) |
 | `-kvbls, --kv-block-size N` | number of tokens per paged KV block, must be a power of 2 (default: 16) |
@@ -367,6 +368,14 @@ Phase-1 restrictions:
 The number of slots (`-np`) caps how many requests run (or wait) inside the scheduler;
 additional requests are queued by the server as usual. KV blocks are auto-fitted from free
 device memory unless `-ngpub` is given explicitly.
+
+With `--enable-priority` the scheduler serves requests by their `priority` field instead of
+FCFS: add `"priority": <int>` to the request body of `/completion`, `/v1/completions` or
+`/v1/chat/completions` (default `0`, lower values are served first, range
+`[-1000000, 1000000]`). The priority orders the server queues, the scheduler's own
+waiting/swapped queues and the choice of preemption victims. Without `--kv-paged` the flag
+has no effect; a running request is never preempted just because a higher-priority request
+is waiting for a free slot.
 
 ### Multimodal support
 
