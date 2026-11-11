@@ -4232,11 +4232,11 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     case GGML_TYPE_F16:
                     case GGML_TYPE_F32:
                         // Same residency contract as the K-quant paths below:
-                        // the weight must already live in a CANN (or
-                        // CANN-only meta) buffer holding the device layout.
-                        // A weight in a host buffer holds raw bytes, e.g.
+                        // a weight in a host buffer holds raw bytes, e.g.
                         // with -ngl 0, and must stay on its own backend.
-                        if (op->src[0]->buffer == nullptr ||
+                        // Tensors without a buffer are not yet placed (scan
+                        // time activations), so residency is undetermined.
+                        if (op->src[0]->buffer != nullptr &&
                                 !ggml_backend_buft_is_cann(op->src[0]->buffer->buft)) {
                             return false;
                         }
@@ -4248,7 +4248,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                         // already live in a CANN buffer holding the device layout.
 #ifdef ASCEND_310P
                         if (ggml_cann_kq_matmul_path(op->src[0]) != GGML_CANN_KQ_NONE) {
-                            if (op->src[0]->buffer == nullptr ||
+                            if (op->src[0]->buffer != nullptr &&
                                 !ggml_backend_buft_is_cann(op->src[0]->buffer->buft)) {
                                 return false;
                             }
@@ -4289,7 +4289,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                             // (upstream cpy_tensor_async also refuses to copy
                             // matmul weights). So with e.g. -ngl 0 we must report
                             // "not supported" and let the op stay on its backend.
-                            if (op->src[0]->buffer == nullptr ||
+                            if (op->src[0]->buffer != nullptr &&
                                 !ggml_backend_buft_is_cann(op->src[0]->buffer->buft)) {
                                 return false;
                             }
@@ -4307,7 +4307,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 case GGML_TYPE_F32:
                     // experts need the load-time fractal layout: same
                     // residency contract as GGML_OP_MUL_MAT above
-                    if (op->src[0]->buffer == nullptr ||
+                    if (op->src[0]->buffer != nullptr &&
                             !ggml_backend_buft_is_cann(op->src[0]->buffer->buft)) {
                         return false;
                     }
@@ -4343,7 +4343,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                         if (moe_cpu) {
                             return false;
                         }
-                        if (op->src[0]->buffer == nullptr ||
+                        if (op->src[0]->buffer != nullptr &&
                                 !ggml_backend_buft_is_cann(op->src[0]->buffer->buft)) {
                             return false;
                         }
