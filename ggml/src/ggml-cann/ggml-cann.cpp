@@ -4186,7 +4186,7 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
  * @return bool Returns true if the operation is supported by the backend,
  *              otherwise false.
  */
-static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+static bool ggml_backend_cann_supports_op_impl(ggml_backend_dev_t dev, const ggml_tensor * op) {
     switch (op->op) {
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
@@ -4301,6 +4301,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                         return false;
                 }
             }
+
         case GGML_OP_MUL_MAT_ID:
             switch (op->src[0]->type) {
                 case GGML_TYPE_F16:
@@ -4730,6 +4731,20 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
     }
 
     GGML_UNUSED(dev);
+}
+
+static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    static const bool supports_debug = parse_bool(get_env_as_lowercase("GGML_CANN_SUPPORTS_DEBUG").value_or(""));
+    const bool supported = ggml_backend_cann_supports_op_impl(dev, op);
+    if (supports_debug) {
+        const char * src0_buft = "none";
+        if (op->src[0] != nullptr && op->src[0]->buffer != nullptr) {
+            src0_buft = ggml_backend_buft_name(ggml_backend_buffer_get_type(op->src[0]->buffer));
+        }
+        GGML_LOG_INFO("cann supports_op: %s result=%d src0_buft=%s\n",
+                       ggml_op_desc(op), (int) supported, src0_buft);
+    }
+    return supported;
 }
 
 /**
