@@ -18,7 +18,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 eval "$(python3 "${SCRIPT_DIR}/test_config.py" --config "${CONFIG_FILE}" --engine build --shell)"
-LLAMA_SOURCE=${LLAMA_SOURCE:-${CFG_LLAMA_SOURCE:-$(cd "${SCRIPT_DIR}/../.." && pwd)}}
+LLAMA_SOURCE=${LLAMA_SOURCE:-${CFG_LLAMA_SOURCE:-$(cd "${SCRIPT_DIR}/../../../../.." && pwd)}}
 BUILD_DIR=${LLAMA_BUILD_DIR:-${CFG_LLAMA_BUILD_DIR:-${LLAMA_SOURCE}/build-cann-aclgraph}}
 
 cmake -S "${LLAMA_SOURCE}" -B "${BUILD_DIR}" \
