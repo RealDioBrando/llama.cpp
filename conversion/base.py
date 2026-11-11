@@ -962,7 +962,7 @@ class ModelBase:
 
         from .modelslim import create_adapter, has_modelslim_checkpoint
         modelslim_checkpoint = (
-            self.model_type == ModelType.TEXT and has_modelslim_checkpoint(self.dir_model)
+            self.model_type in (ModelType.TEXT, ModelType.MMPROJ) and has_modelslim_checkpoint(self.dir_model)
         )
         if self.ftype == gguf.LlamaFileType.MOSTLY_W8A8 and not modelslim_checkpoint:
             raise ValueError("--outtype w8a8 requires a ModelSlim W8A8_DYNAMIC checkpoint")
