@@ -53,6 +53,28 @@ in the engine defaults.
 
 ## Perf dataset overrides
 
+The perf dataset paths live in `config.json` under `datasets`. Point an
+existing entry at custom data directly:
+
+```json
+"datasets": {
+  "vl_image_small": {
+    "type": "local_image_perf",
+    "path": "/home/common/dataset/llama.cpp/my_images.jsonl"
+  },
+  "gsm8k_4k_2k_10": {
+    "type": "gsm8k_fixed_token",
+    "path": "/home/common/dataset/llama.cpp/my_questions.jsonl",
+    "subset_size": 10,
+    "input_tokens": 4096
+  }
+}
+```
+
+Paths may be absolute, relative to this directory, or `aisbench://` built-in
+dataset URIs. To bind a new dataset entry to a scenario, set
+`scenarios.<name>.datasets.perf` to the entry key.
+
 `run_all.py` can point the perf workload at custom data without editing
 `config.json`:
 

@@ -18,6 +18,8 @@ if RUN_OVERRIDE_PATH.is_file():
 _path = Path(gsm8k_cfg["path"]).expanduser()
 if _path.is_absolute():
     gsm8k_cfg["path"] = str(_path.resolve())
+elif not _path.as_posix().startswith("aisbench://"):
+    gsm8k_cfg["path"] = str((CONFIG_PATH.parent / _path).resolve())
 else:
     _aisbench_source = Path(_config["runtime"]["ais_bench"]["source"]).expanduser()
     gsm8k_cfg["path"] = str(
