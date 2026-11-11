@@ -21,6 +21,29 @@ eval "$(python3 "${SCRIPT_DIR}/test_config.py" --config "${CONFIG_FILE}" --engin
 LLAMA_SOURCE=${LLAMA_SOURCE:-${CFG_LLAMA_SOURCE:-$(cd "${SCRIPT_DIR}/../../../../.." && pwd)}}
 BUILD_DIR=${LLAMA_BUILD_DIR:-${CFG_LLAMA_BUILD_DIR:-${LLAMA_SOURCE}/build-cann-aclgraph}}
 
+CANN_SET_ENV=${CANN_SET_ENV:-${CFG_CANN_SET_ENV}}
+ATB_SET_ENV=${ATB_SET_ENV:-${CFG_ATB_SET_ENV}}
+if [[ -z "${CANN_SET_ENV}" && -n "${ASCEND_TOOLKIT_HOME:-}" ]]; then
+  CANN_SET_ENV="${ASCEND_TOOLKIT_HOME}/set_env.sh"
+fi
+if [[ -z "${CANN_SET_ENV}" && -f "${CFG_ASCEND_HOME}/cann-9.1.0/set_env.sh" ]]; then
+  CANN_SET_ENV="${CFG_ASCEND_HOME}/cann-9.1.0/set_env.sh"
+fi
+if [[ -z "${CANN_SET_ENV}" && -f "${CFG_ASCEND_HOME}/cann/set_env.sh" ]]; then
+  CANN_SET_ENV="${CFG_ASCEND_HOME}/cann/set_env.sh"
+fi
+if [[ -z "${ATB_SET_ENV}" && -f "${CFG_ASCEND_HOME}/nnal/atb/set_env.sh" ]]; then
+  ATB_SET_ENV="${CFG_ASCEND_HOME}/nnal/atb/set_env.sh"
+fi
+if [[ -n "${CANN_SET_ENV}" && -f "${CANN_SET_ENV}" ]]; then
+  # shellcheck disable=SC1090
+  source "${CANN_SET_ENV}"
+fi
+if [[ -n "${ATB_SET_ENV}" && -f "${ATB_SET_ENV}" ]]; then
+  # shellcheck disable=SC1090
+  source "${ATB_SET_ENV}"
+fi
+
 cmake -S "${LLAMA_SOURCE}" -B "${BUILD_DIR}" \
   -DGGML_CANN="${CFG_BUILD_GGML_CANN}" \
   -DCANN_SOC_VERSION="${CFG_BUILD_SOC_VERSION}" \
