@@ -385,6 +385,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
+    static const std::regex pattern_paged_kv_cache  ("cache_paged_(k|v)_l\\d*");
     static const std::regex pattern_idx_cache       ("cache_idx_(k|v)_l\\d*");
     static const std::regex pattern_dsv4_state      ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
@@ -528,6 +529,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         if (std::regex_match(tensor_name, pattern_kv_cache) || std::regex_match(tensor_name, pattern_attn_sinks)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
         }
+        // paged KV pool: [head_dim, block_size, n_heads_kv, n_blocks], split on
+        // the KV head axis so each device holds its head slice of every block
+        if (std::regex_match(tensor_name, pattern_paged_kv_cache)) {
+            const size_t layer_index_start = tensor_name.find("_l", 6);
+            GGML_ASSERT(layer_index_start != std::string::npos);
+            const uint32_t il = std::stoull(tensor_name.substr(layer_index_start + 2));
+            if (hparams.is_recr(il)) {
+                // recurrent (GDN) layers have no attention weights and never
+                // touch the paged pools
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "attn_output.weight");
+        }
         if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
         }
@@ -543,6 +557,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
         if (std::regex_match(tensor_name, pattern_ssm_alpha) || std::regex_match(tensor_name, pattern_ssm_beta) ||
                 std::regex_match(tensor_name, pattern_ssm_beta_alpha)) {
+            // head-aligned split (ne[1] holds the per-head outputs in the
+            // transposed weight layout): the GDN op requires beta/alpha to be
+            // split on the same head axis as q/k/v. Slices that are not a
+            // multiple of the W8A8 fractal tile stay off the quantized matmul
+            // path via the ne[1] % 16 check in is_gdn_proj_weight.
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache)) {
@@ -760,6 +779,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_kv_cache)) {
                 GGML_ASSERT(segments.size() == 1);
                 return {granularity_kv};
+            }
+            if (std::regex_match(tensor_name, pattern_paged_kv_cache)) {
+                GGML_ASSERT(segments.size() == 1);
+                // the pool is split in KV heads, not in elements; this keeps
+                // the boundaries aligned with the attn_(k|v) weight slices
+                GGML_ASSERT(granularity_q % n_embd_q == 0);
+                return {granularity_q / n_embd_q};
             }
             if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias)) {
                 GGML_ASSERT(segments.size() == 2);
@@ -2727,12 +2753,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         auto * paged_cache = new llama_kv_cache_paged(head_dim, n_head, block_size, n_layers, n_ubatch, n_seq_max);
                         GGML_ASSERT(paged_cache && "unable to create paged KV cache.");
 
-                        // use the device of the model layers so -mg pins the paged KV pools too
+                        // use the device of the model layers so -mg pins the paged KV pools too;
+                        // with --split-mode tensor this is the meta device wrapping all TP ranks
                         ggml_backend_dev_t gpu_dev = dev_layer(0);
                         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
                         GGML_ASSERT(cpu_dev && "no CPU device found for paged KV cache.");
 
-                        ggml_backend_t backend_gpu = gpu_dev && ggml_backend_dev_type(gpu_dev) == GGML_BACKEND_DEVICE_TYPE_GPU
+                        const auto gpu_dev_type = gpu_dev ? ggml_backend_dev_type(gpu_dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+                        ggml_backend_t backend_gpu = gpu_dev_type == GGML_BACKEND_DEVICE_TYPE_GPU ||
+                                                             gpu_dev_type == GGML_BACKEND_DEVICE_TYPE_META
                                                          ? ggml_backend_dev_init(gpu_dev, nullptr)
                                                          : ggml_backend_dev_init(cpu_dev, nullptr);
                         ggml_backend_t backend_cpu = ggml_backend_dev_init(cpu_dev, nullptr);

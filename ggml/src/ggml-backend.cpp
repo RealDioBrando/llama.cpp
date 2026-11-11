@@ -1668,9 +1668,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_name(sched->backends[sp->backend_id]),
                 (int) sp->graph.n_nodes, sp->i_start, sp->i_end, sp->n_inputs);
         // Print all op names for small splits, first few for large ones.
-        int n_print = sp->graph.n_nodes < 6 ? (int) sp->graph.n_nodes : 3;
+        int n_print = (int) sp->graph.n_nodes;
             for (int j = 0; j < n_print && j < sp->graph.n_nodes; j++) {
-                fprintf(stderr, "%s%s", j ? "," : "", ggml_op_name(sp->graph.nodes[j]->op));
+                fprintf(stderr, "%s%s(%s)", j ? "," : "", ggml_op_name(sp->graph.nodes[j]->op),
+                    sp->graph.nodes[j]->name[0] ? sp->graph.nodes[j]->name : "?");
             }
             if (n_print < sp->graph.n_nodes) fprintf(stderr, ",...");
             fprintf(stderr, "\n");
