@@ -687,6 +687,33 @@ TEST(test_scheduler_prefix_cache_eviction) {
     EXPECT_EQ(batch.n_tokens, 33);
 }
 
+TEST(test_scheduler_draft_uses_step_budget) {
+    auto fixture = make_fixture(/*n_ctx=*/128, /*block_size=*/16, /*n_batch=*/16,
+                                /*n_gpu_blocks=*/16, /*n_cpu_blocks=*/2);
+    fixture.sched->set_prefix_cache_enabled(false);
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(0, 32)));
+
+    llama_batch batch = {};
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    fixture.sched->update(&batch, nullptr, 0);
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    const llama_token          sampled = 42;
+    const llama_paged_feedback fb      = { 0, &sampled, 1, 0 };
+    fixture.sched->update(&batch, &fb, 1);
+
+    const llama_token draft[] = { 43, 44, 45 };
+    EXPECT_FALSE(fixture.sched->attach_draft(1, draft, 3));
+    EXPECT_FALSE(fixture.sched->attach_draft(0, nullptr, 3));
+    EXPECT_FALSE(fixture.sched->attach_draft(0, draft, 0));
+    EXPECT_TRUE(fixture.sched->attach_draft(0, draft, 3));
+    EXPECT_FALSE(fixture.sched->attach_draft(0, draft, 3));
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_TRUE(batch.n_tokens == 4);
+    EXPECT_TRUE(batch.pos[0] == 32);
+    EXPECT_TRUE(batch.token[0] == sampled);
+    EXPECT_TRUE(batch.token[3] == draft[2]);
+}
+
 int main(int /*argc*/, char ** /*argv*/) {
     fprintf(stderr, "test-paged-kv: block_manager\n");
     RUN(test_block_manager_leak_simple);
@@ -723,6 +750,7 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_scheduler_prefix_cache_hit);
     RUN(test_scheduler_prefix_cache_zero_suffix);
     RUN(test_scheduler_prefix_cache_eviction);
+    RUN(test_scheduler_draft_uses_step_budget);
 
     fprintf(stderr, "test-paged-kv: ALL PASSED\n");
     return 0;

@@ -1104,7 +1104,8 @@ bool llama_paged_scheduler_impl::attach_draft(int32_t request_id, const llama_to
     }
     // the verify step must fit the token budget; when it does not the caller
     // simply decodes without a draft this round
-    if ((int32_t) group->n_past + 1 + n_draft > n_batch) {
+    const uint32_t n_rows = 1u + (uint32_t) n_draft;
+    if (n_rows > n_batch) {
         LLAMA_LOG_WARN("%s: request %d draft of %d tokens exceeds n_batch, skipping\n", __func__, request_id, n_draft);
         return false;
     }
