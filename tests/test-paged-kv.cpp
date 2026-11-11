@@ -954,11 +954,16 @@ static void check_paged_metadata_split(const std::vector<int32_t> & lengths,
     }
 }
 
+TEST(test_paged_metadata_pinned_mrope_rows) {
+    check_paged_metadata_split({ 6 }, 4, 4);
+}
+
 TEST(test_paged_metadata_first_ubatch) {
     check_paged_metadata_split({ 10 }, 4, 1, true);
 }
 
 int main(int /*argc*/, char ** /*argv*/) {
+    RUN(test_paged_metadata_pinned_mrope_rows);
     RUN(test_paged_metadata_first_ubatch);
     fprintf(stderr, "test-paged-kv: block_manager\n");
     RUN(test_block_manager_leak_simple);

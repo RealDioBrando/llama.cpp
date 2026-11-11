@@ -795,7 +795,13 @@ void llama_kv_cache_paged_context::derive_current_batch_data() {
 
         local_batch_offsets[s] = local_offset;
         local_batch_lens[s]    = n_seq_tokens;
-        local_context_lens[s]  = cur.pos[(s + 1) * n_seq_tokens - 1] + 1;
+        const int32_t seq_last =
+            batch_idxs ? batch_idxs[s * n_seq_tokens + n_seq_tokens - 1] : seq_base + n_seq_tokens - 1;
+        GGML_ASSERT(seq_last >= batch_info->batch_offsets[slot] &&
+                    seq_last < batch_info->batch_offsets[slot] + batch_info->batch_lens[slot]);
+        // Context length counts KV rows, not the temporal coordinate of an image.
+        local_context_lens[s] = batch_info->context_lens[slot] - batch_info->batch_lens[slot] + seq_last -
+                                batch_info->batch_offsets[slot] + 1;
 
         const int32_t * src_blocks = batch_info->block_table + (size_t) slot * (size_t) max_blocks;
         std::copy(src_blocks, src_blocks + max_blocks,
