@@ -10,83 +10,41 @@ import sys
 from pathlib import Path
 from dataclasses import dataclass
 
+from test_config import config_value, load_config, resolved_path
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
+CONFIG_PATH = ""
+CONFIG = {}
+SCENARIOS = {}
+ACCURACY_DATASETS = {}
+ACCURACY_DATASETS_FULL = {}
+VLLM_SERVERS = {}
 
-SCENARIOS = {
-    "text_10c": {
-        "model": "qwen3_1_7b",
-        "models": {"llama": "llama_qwen3_1_7b", "vllm": "vllm_qwen3_1_7b"},
-        "dataset": "text_4k_2k_10",
-        "targets": {"TTFT": 500.0, "TPOT": 14.0},
-        "server_port": 18112,
-    },
-    "vl_small": {
-        "model": "qwen3_vl_4b",
-        "models": {"llama": "llama_qwen3_vl_4b", "vllm": "vllm_qwen3_vl_4b"},
-        "dataset": "vl_image_small",
-        "targets": {"E2EL": 30.0},
-        "server_port": 18114,
-    },
-    "vl_large": {
-        "model": "qwen3_vl_4b",
-        "models": {"llama": "llama_qwen3_vl_4b", "vllm": "vllm_qwen3_vl_4b"},
-        "dataset": "vl_image_large",
-        "targets": {"E2EL": 1000.0},
-        "server_port": 18114,
-    },
-}
 
-ACCURACY_DATASETS = {
-    "text_10c": "gsm8k_accuracy_30",
-    "vl_small": "textvqa_accuracy_30",
-    "vl_large": "textvqa_accuracy_30",
-}
+def apply_config(config: dict, path: str) -> None:
+    global CONFIG_PATH, CONFIG, SCENARIOS, ACCURACY_DATASETS, ACCURACY_DATASETS_FULL, VLLM_SERVERS
+    CONFIG_PATH = str(Path(path).expanduser().resolve())
+    CONFIG = config
+    SCENARIOS = {}
+    for scenario_name, scenario_spec in CONFIG["scenarios"].items():
+        spec = dict(scenario_spec)
+        spec["models"] = scenario_spec["model_configs"]
+        spec["dataset"] = scenario_spec["datasets"]["perf"]
+        spec["server_port"] = CONFIG["servers"]["llama"]["scenarios"][scenario_name]["port"]
+        SCENARIOS[scenario_name] = spec
 
-ACCURACY_DATASETS_FULL = {
-    "text_10c": "gsm8k_accuracy_full",
-    "vl_small": "textvqa_accuracy_full",
-    "vl_large": "textvqa_accuracy_full",
-}
-
-VLLM_SERVERS = {
-    "text_10c": {
-        "port": 18110,
-        "gpu_mem_util": 0.5,
-        "max_model_len": 8192,
-    },
-    "vl_small": {
-        "port": 18120,
-        "gpu_mem_util": 0.9,
-        "max_model_len": 8192,
-    },
-    "vl_large": {
-        "port": 18120,
-        "gpu_mem_util": 0.9,
-        "max_model_len": 24000,
-    },
-}
-
-VLLM_COMPILATION_CONFIG = (
-    '{"cudagraph_mode":"FULL_DECODE_ONLY",'
-    '"cudagraph_capture_sizes":[1,2,3,4,5,6,7,8,9,10]}'
-)
-
-DEFAULT_QWEN3_ROOT = Path("/home/common/model/qwen3")
-DEFAULT_LLAMA_TEXT_MODEL = DEFAULT_QWEN3_ROOT / "Qwen3-1.7B-F16.gguf"
-DEFAULT_LLAMA_VL_MODEL = DEFAULT_QWEN3_ROOT / "Qwen3-VL-4B-Instruct/Qwen3VL-4B-Instruct-F16.gguf"
-DEFAULT_LLAMA_VL_MMPROJ = (
-    DEFAULT_QWEN3_ROOT / "Qwen3-VL-4B-Instruct/Qwen3VL-4B-Instruct-mmproj-f16.gguf"
-)
-DEFAULT_QWEN3_TEXT_HF_DIR = DEFAULT_QWEN3_ROOT / "Qwen3-8B"
-DEFAULT_QWEN3_VL_HF_DIR = DEFAULT_QWEN3_ROOT / "Qwen3-VL-4B-Instruct"
-DEFAULT_VLLM_TEXT_MODEL = DEFAULT_QWEN3_ROOT / "Qwen3-8B"
-DEFAULT_VLLM_VL_MODEL = DEFAULT_QWEN3_ROOT / "Qwen3-VL-4B-Instruct"
-DEFAULT_AIS_BENCH_BIN = Path("/usr/bin/python3")
-DEFAULT_AIS_BENCH_HOME = Path("/home/qzh/.venvs/aisbench/lib/python3.10/site-packages")
-DEFAULT_AIS_BENCH_SOURCE = Path("/home/z00575061/AISBench-benchmark")
-DEFAULT_CANN_SET_ENV = Path("/usr/local/Ascend/cann-9.1.0/set_env.sh")
+    ACCURACY_DATASETS = {
+        name: spec["datasets"]["accuracy_30"] for name, spec in SCENARIOS.items()
+    }
+    ACCURACY_DATASETS_FULL = {
+        name: spec["datasets"]["accuracy_full"] for name, spec in SCENARIOS.items()
+    }
+    VLLM_SERVERS = {
+        name: {**CONFIG["servers"]["vllm"]["defaults"], **spec}
+        for name, spec in CONFIG["servers"]["vllm"]["scenarios"].items()
+    }
 
 
 @dataclass(frozen=True)
@@ -122,7 +80,13 @@ def start_server(scenario: str, paths: ModelPaths):
     env = os.environ.copy()
     env["PERF_REGRESSION_ROOT"] = str(ROOT)
     env["PERF_SERVER_PORT"] = str(port)
-    command = ["bash", str(SCRIPTS / "run_llama_server.sh"), scenario]
+    command = [
+        "bash",
+        str(SCRIPTS / "run_llama_server.sh"),
+        scenario,
+        "--config",
+        CONFIG_PATH,
+    ]
     if scenario == "text_10c":
         command.extend(["--model", str(paths.llama_text_model)])
     else:
@@ -151,7 +115,7 @@ def stop_server(proc) -> None:
 
 
 def _docker_exec(cmd: str, background: bool = False) -> subprocess.Popen | None:
-    container = os.environ.get("VLLM_CONTAINER")
+    container = os.environ.get("VLLM_CONTAINER") or config_value(CONFIG, "runtime.vllm_container")
     if not container:
         raise RuntimeError("VLLM_CONTAINER is not set")
     full = ["docker", "exec"]
@@ -164,6 +128,7 @@ def _docker_exec(cmd: str, background: bool = False) -> subprocess.Popen | None:
 def generated_model_config(engine: str, scenario: str, paths: ModelPaths) -> str | Path:
     model_name = SCENARIOS[scenario]["models"][engine]
     server_port = os.environ.get("PERF_SERVER_PORT") or SCENARIOS[scenario]["server_port"]
+    workload = SCENARIOS[scenario].get("workload", {})
     source = ROOT / "configs" / "models" / f"{model_name}.py"
     tokenizer_path = paths.qwen3_text_hf_dir if scenario == "text_10c" else paths.qwen3_vl_hf_dir
 
@@ -172,6 +137,10 @@ def generated_model_config(engine: str, scenario: str, paths: ModelPaths) -> str
     text = re.sub(r"path\s*=\s*\"\.\"", f'path="{tokenizer_path_text}"', text, count=1)
     text = re.sub(r"host_ip\s*=\s*\"localhost\"", 'host_ip="127.0.0.1"', text, count=1)
     text = re.sub(r"host_port\s*=\s*\d+", f"host_port={server_port}", text, count=1)
+    if "max_output_tokens" in workload:
+        text = re.sub(r"max_out_len\s*=\s*\d+", f"max_out_len={workload['max_output_tokens']}", text, count=1)
+    if "batch_size" in workload:
+        text = re.sub(r"batch_size\s*=\s*\d+", f"batch_size={workload['batch_size']}", text, count=1)
     output_name = f"generated_{engine}_{scenario}"
     output = ROOT / "configs" / "models" / f"{output_name}.py"
     output.write_text(text, encoding="utf-8")
@@ -181,20 +150,31 @@ def generated_model_config(engine: str, scenario: str, paths: ModelPaths) -> str
 def start_vllm_server(scenario: str, paths: ModelPaths) -> bool:
     cfg = VLLM_SERVERS[scenario]
     model_path = paths.vllm_text_model if scenario == "text_10c" else paths.vllm_vl_model
-    npu_id = os.environ.get("VLLM_NPU_ID", "5")
+    npu_id = os.environ.get("VLLM_NPU_ID") or config_value(CONFIG, "runtime.vllm_npu_id", "5")
+    cann_env = os.environ.get("CANN_SET_ENV") or config_value(CONFIG, "runtime.cann.set_env")
+    compilation_config = json.dumps(cfg.get("compilation_config", {}), separators=(",", ":"))
+    prefix_caching = "--enable-prefix-caching" if cfg.get("enable_prefix_caching", False) else ""
     _docker_exec("pkill -9 -f vllm 2>/dev/null; sleep 3")
     import time
     time.sleep(5)
     cmd = (
-        f'source "${{ASCEND_TOOLKIT_HOME}}/set_env.sh" && '
+        f'source "{cann_env}" && '
         f"ASCEND_RT_VISIBLE_DEVICES={npu_id} vllm serve "
         f"{model_path} --port {cfg['port']} "
-        f"--enable-prefix-caching --dtype float16 "
-        f"--gpu-memory-utilization {cfg['gpu_mem_util']} "
+        f"{prefix_caching} --dtype {cfg.get('dtype', 'float16')} "
+        f"--gpu-memory-utilization {cfg['gpu_memory_utilization']} "
         f"--max-model-len {cfg['max_model_len']} "
-        f"--compilation-config '{VLLM_COMPILATION_CONFIG}' "
+        f"--max-num-seqs {cfg['max_num_seqs']} "
+        f"--compilation-config '{compilation_config}' "
         f"> /tmp/vllm_{scenario}.log 2>&1"
     )
+    limit_mm = cfg.get("limit_mm_per_prompt")
+    if limit_mm:
+        cmd = cmd.replace(
+            f"--port {cfg['port']} ",
+            f"--port {cfg['port']} --limit-mm-per-prompt '{json.dumps(limit_mm, separators=(',', ':'))}' ",
+            1,
+        )
     _docker_exec(cmd, background=True)
     return wait_server(cfg["port"], timeout=180)
 
@@ -219,14 +199,19 @@ def run_benchmark(
     dataset = dataset or spec["dataset"]
     work_dir = ROOT / "results" / engine / (work_dir_name or scenario)
     work_dir.mkdir(parents=True, exist_ok=True)
+    ais_cfg = CONFIG["runtime"]["ais_bench"]
     ais_bench_bin = os.environ.get("AIS_BENCH_BIN") or shutil.which("ais_bench")
-    if not ais_bench_bin and DEFAULT_AIS_BENCH_BIN.is_file():
-        ais_bench_bin = str(DEFAULT_AIS_BENCH_BIN)
+    if not ais_bench_bin:
+        default_bin = resolved_path(ais_cfg.get("python", ""))
+        if default_bin.is_file():
+            ais_bench_bin = str(default_bin)
     if not ais_bench_bin:
         raise RuntimeError("ais_bench was not found; set AIS_BENCH_BIN or put it on PATH")
     command = [ais_bench_bin]
     if Path(ais_bench_bin).name.startswith("python"):
-        ais_bench_module = os.environ.get("AIS_BENCH_MODULE", "ais_bench.benchmark.cli.main")
+        ais_bench_module = os.environ.get("AIS_BENCH_MODULE") or ais_cfg.get(
+            "module", "ais_bench.benchmark.cli.main"
+        )
         command.extend(["-m", ais_bench_module])
     command.extend(
         [
@@ -243,24 +228,31 @@ def run_benchmark(
         ]
     )
     env = os.environ.copy()
+    if scenario == "text_10c":
+        env["QWEN3_1_7B_PATH"] = str(paths.qwen3_text_hf_dir)
+    else:
+        env["QWEN3_VL_4B_PATH"] = str(paths.qwen3_vl_hf_dir)
     python_paths = [str(ROOT / "configs")]
-    ais_bench_stubs = os.environ.get("AISBENCH_STUBS")
+    ais_bench_stubs = os.environ.get("AISBENCH_STUBS") or ais_cfg.get("stubs")
     if ais_bench_stubs:
         python_paths.insert(0, ais_bench_stubs)
     ais_bench_root = Path(ais_bench_bin).resolve().parents[1]
     python_paths.extend(str(p) for p in sorted(ais_bench_root.glob("lib/python*/site-packages")))
     ais_bench_home = os.environ.get("AIS_BENCH_HOME")
-    if not ais_bench_home and DEFAULT_AIS_BENCH_HOME.is_dir():
-        ais_bench_home = str(DEFAULT_AIS_BENCH_HOME)
-    if DEFAULT_AIS_BENCH_SOURCE.is_dir():
-        python_paths.insert(0, str(DEFAULT_AIS_BENCH_SOURCE))
+    default_ais_bench_home = resolved_path(ais_cfg.get("site_packages", ""))
+    if not ais_bench_home and default_ais_bench_home.is_dir():
+        ais_bench_home = str(default_ais_bench_home)
+    default_ais_bench_source = resolved_path(ais_cfg.get("source", ""))
+    if default_ais_bench_source.is_dir():
+        python_paths.insert(0, str(default_ais_bench_source))
     if ais_bench_home:
         python_paths.insert(0, ais_bench_home)
     env["PYTHONPATH"] = os.pathsep.join(python_paths + [env.get("PYTHONPATH", "")])
     env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
     cann_env = os.environ.get("CANN_SET_ENV")
-    if not cann_env and DEFAULT_CANN_SET_ENV.is_file():
-        cann_env = str(DEFAULT_CANN_SET_ENV)
+    config_cann_env = resolved_path(config_value(CONFIG, "runtime.cann.set_env", ""))
+    if not cann_env and config_cann_env.is_file():
+        cann_env = str(config_cann_env)
     if not cann_env and os.environ.get("ASCEND_TOOLKIT_HOME"):
         cann_env = str(Path(os.environ["ASCEND_TOOLKIT_HOME"]) / "set_env.sh")
     if cann_env and os.path.exists(cann_env):
@@ -294,6 +286,7 @@ def run_accuracy_benchmark(
         subset_path = ROOT / "assets" / "textvqa" / "textvqa_json" / f"textvqa_val_{stem}.jsonl"
         if not subset_path.exists():
             command = [sys.executable, str(SCRIPTS / "prepare_accuracy_assets.py")]
+            command.extend(["--config", CONFIG_PATH])
             if full_dataset or num_prompts <= 0:
                 command.append("--full")
             subprocess.run(command, check=True, cwd=ROOT)
@@ -422,9 +415,15 @@ def write_summary(results: dict) -> None:
 
 
 def main() -> int:
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", default=str(ROOT / "config.json"))
+    pre_args, _ = pre_parser.parse_known_args()
+    apply_config(load_config(pre_args.config), pre_args.config)
+
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=CONFIG_PATH, help="path to config.json")
     parser.add_argument("--engine", choices=["llama", "vllm", "both"], default="llama")
-    parser.add_argument("--scenario", choices=["all", "text_10c", "vl_small", "vl_large"], default="all")
+    parser.add_argument("--scenario", choices=["all", *SCENARIOS.keys()], default="all")
     parser.add_argument("--collect-only", action="store_true")
     parser.add_argument("--save-baseline", action="store_true")
     parser.add_argument(
@@ -443,31 +442,38 @@ def main() -> int:
     parser.add_argument("--accuracy-full", action="store_true")
     parser.add_argument(
         "--llama-text-model",
-        default=os.environ.get("LLAMA_TEXT_MODEL") or DEFAULT_LLAMA_TEXT_MODEL,
+        default=os.environ.get("LLAMA_TEXT_MODEL")
+        or config_value(CONFIG, "models.qwen3_1_7b.llama"),
     )
     parser.add_argument(
         "--llama-vl-model",
-        default=os.environ.get("LLAMA_VL_MODEL") or DEFAULT_LLAMA_VL_MODEL,
+        default=os.environ.get("LLAMA_VL_MODEL")
+        or config_value(CONFIG, "models.qwen3_vl_4b.llama"),
     )
     parser.add_argument(
         "--llama-vl-mmproj",
-        default=os.environ.get("LLAMA_VL_MMPROJ") or DEFAULT_LLAMA_VL_MMPROJ,
+        default=os.environ.get("LLAMA_VL_MMPROJ")
+        or config_value(CONFIG, "models.qwen3_vl_4b.mmproj"),
     )
     parser.add_argument(
         "--qwen3-1-7b-path",
-        default=os.environ.get("QWEN3_1_7B_PATH") or DEFAULT_QWEN3_TEXT_HF_DIR,
+        default=os.environ.get("QWEN3_1_7B_PATH")
+        or config_value(CONFIG, "models.qwen3_1_7b.tokenizer"),
     )
     parser.add_argument(
         "--qwen3-vl-4b-path",
-        default=os.environ.get("QWEN3_VL_4B_PATH") or DEFAULT_QWEN3_VL_HF_DIR,
+        default=os.environ.get("QWEN3_VL_4B_PATH")
+        or config_value(CONFIG, "models.qwen3_vl_4b.tokenizer"),
     )
     parser.add_argument(
         "--vllm-text-model",
-        default=os.environ.get("VLLM_TEXT_MODEL") or DEFAULT_VLLM_TEXT_MODEL,
+        default=os.environ.get("VLLM_TEXT_MODEL")
+        or config_value(CONFIG, "models.qwen3_1_7b.vllm"),
     )
     parser.add_argument(
         "--vllm-vl-model",
-        default=os.environ.get("VLLM_VL_MODEL") or DEFAULT_VLLM_VL_MODEL,
+        default=os.environ.get("VLLM_VL_MODEL")
+        or config_value(CONFIG, "models.qwen3_vl_4b.vllm"),
     )
     args = parser.parse_args()
 

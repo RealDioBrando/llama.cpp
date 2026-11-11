@@ -6,19 +6,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "configs"))
+from config_modules.runtime_config import load_config
+
 
 checks = []
-ASSET_DIR = Path(__file__).resolve().parents[1] / "assets"
-REPO_ROOT = Path(__file__).resolve().parents[5]
-DEFAULT_QWEN3_ROOT = Path("/home/common/model/qwen3")
-DEFAULT_LLAMA_TEXT_MODEL = DEFAULT_QWEN3_ROOT / "Qwen3-1.7B-F16.gguf"
-DEFAULT_LLAMA_VL_MODEL = (
-    DEFAULT_QWEN3_ROOT / "Qwen3-VL-4B-Instruct/Qwen3VL-4B-Instruct-F16.gguf"
-)
-DEFAULT_LLAMA_VL_MMPROJ = (
-    DEFAULT_QWEN3_ROOT / "Qwen3-VL-4B-Instruct/Qwen3VL-4B-Instruct-mmproj-f16.gguf"
-)
-DEFAULT_AIS_BENCH_BIN = Path("/usr/bin/python3")
+ASSET_DIR = ROOT / "assets"
+REPO_ROOT = ROOT.parents[3]
 
 
 def check(name: str, ok: bool, detail: str = ""):
@@ -27,19 +22,31 @@ def check(name: str, ok: bool, detail: str = ""):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=str(ROOT / "config.json"))
     parser.add_argument(
         "--llama-text-model",
-        default=os.environ.get("LLAMA_TEXT_MODEL") or DEFAULT_LLAMA_TEXT_MODEL,
+        default=None,
     )
     parser.add_argument(
         "--llama-vl-model",
-        default=os.environ.get("LLAMA_VL_MODEL") or DEFAULT_LLAMA_VL_MODEL,
+        default=None,
     )
     parser.add_argument(
         "--llama-vl-mmproj",
-        default=os.environ.get("LLAMA_VL_MMPROJ") or DEFAULT_LLAMA_VL_MMPROJ,
+        default=None,
     )
     args = parser.parse_args()
+    config = load_config(args.config)
+    text_model_default = Path(config["models"]["qwen3_1_7b"]["llama"])
+    vl_model_default = Path(config["models"]["qwen3_vl_4b"]["llama"])
+    vl_mmproj_default = Path(config["models"]["qwen3_vl_4b"]["mmproj"])
+    default_ais_bench_bin = Path(config["runtime"]["ais_bench"]["python"])
+    if args.llama_text_model is None:
+        args.llama_text_model = text_model_default
+    if args.llama_vl_model is None:
+        args.llama_vl_model = vl_model_default
+    if args.llama_vl_mmproj is None:
+        args.llama_vl_mmproj = vl_mmproj_default
     text_model = Path(args.llama_text_model).expanduser()
     vl_model = Path(args.llama_vl_model).expanduser()
     vl_mmproj = Path(args.llama_vl_mmproj).expanduser()
@@ -49,8 +56,8 @@ def main() -> int:
     check("llama-server", server.is_file(), str(server))
     check("USE_ACL_GRAPH", cache.is_file() and "USE_ACL_GRAPH:BOOL=ON" in cache.read_text(errors="ignore"), str(cache))
     ais_bench = os.environ.get("AIS_BENCH_BIN") or shutil.which("ais_bench")
-    if not ais_bench and DEFAULT_AIS_BENCH_BIN.is_file():
-        ais_bench = str(DEFAULT_AIS_BENCH_BIN)
+    if not ais_bench and default_ais_bench_bin.is_file():
+        ais_bench = str(default_ais_bench_bin)
     check("ais_bench", ais_bench is not None, str(ais_bench or "not found"))
     check(
         "qwen3-1.7b-gguf",

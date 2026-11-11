@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: bash run_llama_server.sh [text_10c|vl_small|vl_large] [--model PATH] [--mmproj PATH]
+# Usage: bash run_llama_server.sh [text_10c|vl_small|vl_large] [--config PATH] [--model PATH] [--mmproj PATH]
 # Default: text_10c
 SCENARIO=text_10c
+CONFIG_FILE=""
 CLI_MODEL=""
 CLI_MMPROJ=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --config)
+      [[ $# -ge 2 ]] || { echo "--config requires a path" >&2; exit 1; }
+      CONFIG_FILE="$2"
+      shift 2
+      ;;
     --model)
       [[ $# -ge 2 ]] || { echo "--model requires a path" >&2; exit 1; }
       CLI_MODEL="$2"
@@ -26,14 +32,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+CONFIG_FILE=${CONFIG_FILE:-${SCRIPT_DIR}/../config.json}
 ROOT=${PERF_REGRESSION_ROOT:-$(dirname "${SCRIPT_DIR}")}
 REPO_ROOT=${LLAMA_SOURCE:-$(cd "${SCRIPT_DIR}/../../../../.." && pwd)}
 BUILD_DIR=${LLAMA_BUILD_DIR:-${REPO_ROOT}/build-cann-aclgraph}
 
+eval "$(python3 "${SCRIPT_DIR}/test_config.py" --config "${CONFIG_FILE}" --engine llama --scenario "${SCENARIO}" --shell)"
+REPO_ROOT=${LLAMA_SOURCE:-${CFG_LLAMA_SOURCE:-${REPO_ROOT}}}
+BUILD_DIR=${LLAMA_BUILD_DIR:-${CFG_LLAMA_BUILD_DIR:-${REPO_ROOT}/build-cann-aclgraph}}
+
 # Source CANN and ATB environments so the server can find libascendcl and ATB.
-ASCEND_HOME=${ASCEND_HOME:-/usr/local/Ascend}
-CANN_SET_ENV=${CANN_SET_ENV:-}
-ATB_SET_ENV=${ATB_SET_ENV:-}
+ASCEND_HOME=${ASCEND_HOME:-${CFG_ASCEND_HOME}}
+CANN_SET_ENV=${CANN_SET_ENV:-${CFG_CANN_SET_ENV}}
+ATB_SET_ENV=${ATB_SET_ENV:-${CFG_ATB_SET_ENV}}
 
 if [[ -z "${CANN_SET_ENV}" && -n "${ASCEND_TOOLKIT_HOME:-}" ]]; then
   CANN_SET_ENV="${ASCEND_TOOLKIT_HOME}/set_env.sh"
@@ -68,23 +79,14 @@ if [[ -n "${ATB_HOME_PATH:-}" && -d "${ATB_HOME_PATH}/lib" ]]; then
   export LD_LIBRARY_PATH="${ATB_HOME_PATH}/lib:${LD_LIBRARY_PATH:-}"
 fi
 
-# Per-scenario defaults (overridable by env vars)
 case "${SCENARIO}" in
   text_10c)
-    DEFAULT_MODEL=/home/common/model/qwen3/Qwen3-1.7B-F16.gguf
+    DEFAULT_MODEL="${CFG_LLAMA_TEXT_MODEL}"
     DEFAULT_MMPROJ=""
-    DEFAULT_PORT=18112
-    DEFAULT_CTX=8192
-    DEFAULT_PARALLEL=10
-    DEFAULT_ACT_TYPE=f16
     ;;
   vl_small|vl_large)
-    DEFAULT_MODEL=/home/common/model/qwen3/Qwen3-VL-4B-Instruct/Qwen3VL-4B-Instruct-F16.gguf
-    DEFAULT_MMPROJ=/home/common/model/qwen3/Qwen3-VL-4B-Instruct/Qwen3VL-4B-Instruct-mmproj-f16.gguf
-    DEFAULT_PORT=18113
-    DEFAULT_CTX=32768
-    DEFAULT_PARALLEL=4
-    DEFAULT_ACT_TYPE=f16
+    DEFAULT_MODEL="${CFG_LLAMA_VL_MODEL}"
+    DEFAULT_MMPROJ="${CFG_LLAMA_VL_MMPROJ}"
     ;;
   *)
     echo "Unknown scenario: ${SCENARIO}" >&2
@@ -94,36 +96,41 @@ case "${SCENARIO}" in
 esac
 
 MODEL=${CLI_MODEL:-${DEFAULT_MODEL}}
-PORT=${PERF_SERVER_PORT:-${DEFAULT_PORT}}
-CTX=${PERF_LLAMA_CTX:-${DEFAULT_CTX}}
-PARALLEL=${PERF_LLAMA_PARALLEL:-${DEFAULT_PARALLEL}}
-THREADS=${PERF_LLAMA_THREADS:-8}
-THREADS_BATCH=${PERF_LLAMA_THREADS_BATCH:-8}
+PORT=${PERF_SERVER_PORT:-${CFG_PORT}}
+CTX=${PERF_LLAMA_CTX:-${CFG_CTX}}
+PARALLEL=${PERF_LLAMA_PARALLEL:-${CFG_PARALLEL}}
+THREADS=${PERF_LLAMA_THREADS:-${CFG_THREADS}}
+THREADS_BATCH=${PERF_LLAMA_THREADS_BATCH:-${CFG_THREADS_BATCH}}
 MMPROJ=${CLI_MMPROJ:-${DEFAULT_MMPROJ}}
 MMPROJ_ARGS=(--mmproj-auto)
 if [[ -n "${MMPROJ}" ]]; then
   MMPROJ_ARGS=(--mmproj "${MMPROJ}")
 fi
 
-export ASCEND_RT_VISIBLE_DEVICES=${PERF_NPU_ID:-5}
-export GGML_CANN_ACL_GRAPH=${PERF_LLAMA_ACL_GRAPH:-1}
-export GGML_CANN_PREFILL_USE_GRAPH=${PERF_LLAMA_PREFILL_GRAPH:-0}
-export GGML_CANN_FA_V5=1
-export GGML_CANN_WEIGHT_NZ=1
-export GGML_CANN_GDN_PROJ=1
-export GGML_CANN_GDN_SMALL=1
-export GGML_CANN_GDN_PREFILL_CHUNK=1
+export ASCEND_RT_VISIBLE_DEVICES=${PERF_NPU_ID:-${CFG_NPU_ID}}
+export GGML_CANN_ACL_GRAPH=${PERF_LLAMA_ACL_GRAPH:-${CFG_ACL_GRAPH}}
+export GGML_CANN_PREFILL_USE_GRAPH=${PERF_LLAMA_PREFILL_GRAPH:-${CFG_PREFILL_GRAPH}}
+export GGML_CANN_FA_V5=${CFG_FA_V5}
+export GGML_CANN_WEIGHT_NZ=${CFG_WEIGHT_NZ}
+export GGML_CANN_GDN_PROJ=${CFG_GDN_PROJ}
+export GGML_CANN_GDN_SMALL=${CFG_GDN_SMALL}
+export GGML_CANN_GDN_PREFILL_CHUNK=${CFG_GDN_PREFILL_CHUNK}
 
 mkdir -p "${ROOT}/logs" "${ROOT}/run"
 LOG=${ROOT}/logs/llama-server-${PORT}.log
 
-ACT_TYPE=${PERF_LLAMA_ACT_TYPE:-${DEFAULT_ACT_TYPE}}
+ACT_TYPE=${PERF_LLAMA_ACT_TYPE:-${CFG_ACT_TYPE}}
 ACT_ARGS=()
 if [[ "${ACT_TYPE}" != "none" ]]; then
   ACT_ARGS=(-at "${ACT_TYPE}")
 fi
+KV_PAGED_ARGS=()
+if [[ "${CFG_KV_PAGED}" == "1" ]]; then
+  KV_PAGED_ARGS=(--kv-paged)
+fi
+CACHE_RAM_ARGS=(--cache-ram "${CFG_CACHE_RAM}")
 MMPROJ_OFFLOAD_ARGS=()
-if [[ "${PERF_LLAMA_MMPROJ_OFFLOAD:-1}" != "1" ]]; then
+if [[ "${PERF_LLAMA_MMPROJ_OFFLOAD:-${CFG_MMPROJ_OFFLOAD}}" != "1" ]]; then
   MMPROJ_OFFLOAD_ARGS=(--no-mmproj-offload)
 fi
 
@@ -135,14 +142,14 @@ fi
   -np "${PARALLEL}" \
   -t "${THREADS}" \
   -tb "${THREADS_BATCH}" \
-  -ngl 99 \
-  -sm none \
-  -mg 0 \
-  --kv-paged \
-  --cache-ram 0 \
-  -kvbls 128 \
-  -b 2048 \
-  -ub 2048 \
+  -ngl "${CFG_NGPU_LAYERS}" \
+  -sm "${CFG_SAMPLING_MODE}" \
+  -mg "${CFG_MAIN_GPU}" \
+  "${KV_PAGED_ARGS[@]}" \
+  "${CACHE_RAM_ARGS[@]}" \
+  -kvbls "${CFG_KV_BLOCK_SIZE}" \
+  -b "${CFG_BATCH_SIZE}" \
+  -ub "${CFG_UBATCH_SIZE}" \
   "${ACT_ARGS[@]}" \
   "${MMPROJ_OFFLOAD_ARGS[@]}" \
   --metrics \

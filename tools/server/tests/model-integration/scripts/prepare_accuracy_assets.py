@@ -6,6 +6,11 @@ import sys
 import urllib.request
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "configs"))
+
+from config_modules.runtime_config import dataset_config
+
 
 REPO_ID = "maoxx241/textvqa_subset"
 
@@ -100,16 +105,15 @@ def prepare_textvqa(count: int, full_dataset: bool, output_dir: Path, endpoint: 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Prepare the TextVQA accuracy subset.")
+    parser.add_argument("--config", default=str(Path(__file__).resolve().parents[1] / "config.json"))
     parser.add_argument("--num-images", type=int, default=30)
     parser.add_argument("--full", action="store_true", help="prepare all TextVQA val rows")
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path(__file__).resolve().parents[1] / "assets" / "textvqa",
-    )
+    parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--hf-endpoint", default=None)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
+    if args.output_dir is None:
+        args.output_dir = Path(dataset_config("textvqa_accuracy_30", args.config)["path"]).parent
 
     if args.full and args.num_images > 0:
         parser.error("--full and --num-images are mutually exclusive")

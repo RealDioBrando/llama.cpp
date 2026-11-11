@@ -1,8 +1,14 @@
+import json
+from pathlib import Path
+
 from ais_bench.benchmark.openicl.icl_prompt_template import PromptTemplate
 from ais_bench.benchmark.openicl.icl_retriever import ZeroRetriever
 from ais_bench.benchmark.openicl.icl_inferencer import GenInferencer
 from config_modules.local_textvqa import LocalTextVQADataset
 from config_modules.local_textvqa import LocalTextVQAEvaluator
+
+CONFIG_PATH = Path(__file__).resolve().parents[2] / "config.json"
+textvqa_cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))["datasets"]["textvqa_accuracy_30"]
 
 
 reader_cfg = dict(
@@ -25,13 +31,12 @@ infer_cfg = dict(
 )
 
 eval_cfg = dict(evaluator=dict(type=LocalTextVQAEvaluator))
-
 textvqa_datasets = [
     dict(
         abbr="textvqa-accuracy-30",
         type=LocalTextVQADataset,
-        path="assets/textvqa/textvqa_json/textvqa_val_30.jsonl",
-        image_type="image_base64",
+        path=textvqa_cfg["path"],
+        image_type=textvqa_cfg["image_type"],
         reader_cfg=reader_cfg,
         infer_cfg=infer_cfg,
         eval_cfg=eval_cfg,

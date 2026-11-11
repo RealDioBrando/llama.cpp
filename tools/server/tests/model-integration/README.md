@@ -4,11 +4,11 @@ This directory contains three repeatable AISBench cases for llama-server and a v
 
 | scenario | model | workload | target |
 |---|---|---|---|
-| text_10c | Qwen3 1.7B | 10 concurrency, about 4096 input tokens, 2048 output tokens | TTFT <= 500 ms, TPOT <= 14 ms |
+| text_10c | Qwen3 1.7B | 10 concurrency, 10 GSM8K questions padded to about 4096 input tokens, 2048 output tokens | TTFT <= 500 ms, TPOT <= 14 ms |
 | vl_small | Qwen3 VL 4B | one 320x320 JPEG + text, 128 output tokens | E2E <= 30 ms |
 | vl_large | Qwen3 VL 4B | one 1280x720 JPEG + text, 128 output tokens | E2E <= 1000 ms |
 
-The llama.cpp case enables the CANN fast paths: ACL graph, FA V5, F16 activation cache, weight NZ, and the available GDN prefill/decode fused paths. GDN operators are model-dependent; they are enabled by environment variables and are skipped automatically when a model has no GDN layers.
+The llama.cpp case enables the CANN fast paths: ACL graph, FA V5, F16 activation cache, weight NZ, and the available GDN prefill/decode fused paths. GDN operators are model-dependent; they are enabled by `config.json` and are skipped automatically when a model has no GDN layers.
 
 Accuracy cases use AISBench. The text case uses GSM8K and the VL case uses
 TextVQA val images from OpenImages. `run_all.py` uses the first 30 unique
@@ -23,6 +23,34 @@ The VL cases enable mmproj offload by default. Set
 `PERF_LLAMA_MMPROJ_OFFLOAD=0` to keep the CLIP encoder on CPU when
 debugging CANN-specific regressions.
 
+## Configuration
+
+`config.json` is the single default source for runtime paths, models, datasets,
+scenarios, and server settings. It is organized as:
+
+| section | contents |
+|---|---|
+| `runtime` | NPU IDs, vLLM container, build paths/options, CANN/ATB env scripts, AISBench paths |
+| `models` | llama.cpp GGUF/mmproj paths, vLLM model directories, and tokenizer/HF directories |
+| `datasets` | dataset type, source path, subset size, tokenizer model, and image metadata. AISBench built-in datasets use `aisbench://`; local files use paths relative to this directory and are resolved to absolute paths. |
+| `scenarios` | model/dataset binding, AISBench workload, targets, and model-config names |
+| `servers` | llama.cpp and vLLM defaults plus per-scenario overrides and backend feature flags |
+
+Precedence is command-line option, then `config.json`. All entry scripts accept
+`--config`; if it is omitted, they use the adjacent `config.json`. To use an
+alternate configuration file, pass it on the command line:
+
+```bash
+python scripts/run_all.py --config /path/to/config.json --engine llama --scenario all
+bash scripts/run_llama_server.sh text_10c --config /path/to/config.json
+bash scripts/run_vllm_server.sh text_10c --config /path/to/config.json
+bash scripts/build_llama.sh --config /path/to/config.json
+```
+
+New server tuning knobs should be added under `servers.<engine>.defaults` or
+`servers.<engine>.scenarios.<name>`. A scenario value overrides the same field
+in the engine defaults.
+
 ## Remote layout
 
 The scripts derive the repository root from their own location:
@@ -32,8 +60,8 @@ llama.cpp/tools/server/tests/model-integration
 ```
 
 Run from the CANN container. The default NPU is device 5. Model paths have
-`/home/common` defaults and can be overridden with CLI options or the previous
-environment variables.
+`/home/common` defaults from `config.json` and can be overridden with CLI
+options or the previous environment variables.
 
 ## Build and prepare
 
@@ -77,9 +105,9 @@ The server uses the separate mmproj by default. `run_all.py` accepts
 `--qwen3-1-7b-path`, `--qwen3-vl-4b-path`, `--vllm-text-model`, and
 `--vllm-vl-model`.
 
-The fixed-token dataset uses `/home/common/model/qwen3/Qwen3-8B` as its
-default tokenizer directory and accepts `QWEN3_1_7B_PATH` as a fallback
-override.
+The fixed-token dataset uses the `tokenizer` path of `qwen3_1_7b` from
+`config.json`. `QWEN3_1_7B_PATH` or the `--qwen3-1-7b-path` option overrides it
+for one run.
 
 ## Run cases
 
@@ -129,12 +157,11 @@ For the 10-concurrency text case, the current CANN ACL graph path can abort with
 `PERF_LLAMA_ACL_GRAPH=0` for that case until the graph event lifecycle is fixed.
 This remains a compile-time ACL-graph build, but the text case runs eager.
 
-`run_all.py` defaults AISBench to `/usr/bin/python3`, source at
-`/home/z00575061/AISBench-benchmark`, site-packages at
-`/home/qzh/.venvs/aisbench/lib/python3.10/site-packages`, and CANN
-`/usr/local/Ascend/cann-9.1.0/set_env.sh`. Override them with
-`AIS_BENCH_BIN`, `AIS_BENCH_HOME`, or `CANN_SET_ENV`. If starting AISBench
-manually, prepend the config directory to `PYTHONPATH`:
+`run_all.py` reads AISBench and CANN paths from
+`config.json -> runtime.ais_bench` and `config.json -> runtime.cann`.
+Environment variables `AIS_BENCH_BIN`, `AIS_BENCH_HOME`, or `CANN_SET_ENV`
+override those values. If starting AISBench manually, prepend the config
+directory to `PYTHONPATH`:
 
 ```bash
 PYTHONPATH=$PWD/configs ais_bench ...

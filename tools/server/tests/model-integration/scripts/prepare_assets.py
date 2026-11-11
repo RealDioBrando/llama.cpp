@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from PIL import Image, ImageDraw
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "configs"))
+from config_modules.runtime_config import dataset_config
 
 
 def create_image(path: Path, width: int, height: int, label: str) -> None:
@@ -23,8 +28,11 @@ def create_mm_dataset(path: Path, image: Path, question: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=Path, default=Path(__file__).resolve().parents[1] / "assets")
+    parser.add_argument("--config", default=str(ROOT / "config.json"))
+    parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
+    if args.output is None:
+        args.output = Path(dataset_config("vl_image_small", args.config)["path"]).parent
     create_image(args.output / "image_320x320.jpg", 320, 320, "perf input 320x320")
     create_image(args.output / "image_1280x720.jpg", 1280, 720, "perf input 1280x720")
     question = "Describe this image briefly."
