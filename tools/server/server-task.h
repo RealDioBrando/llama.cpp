@@ -64,6 +64,10 @@ struct task_params {
 
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
 
+    // paged scheduler request priority: lower values are served first.
+    // only effective with --kv-paged --enable-priority (default 0)
+    int32_t priority = 0;
+
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 

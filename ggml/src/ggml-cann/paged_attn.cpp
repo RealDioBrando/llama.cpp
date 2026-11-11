@@ -94,18 +94,27 @@ struct atb_paged_state {
     }
 };
 
-atb_paged_state g_atb;
+// Per-device ATB state. With tensor parallelism every device needs its own
+// ATB context, operations, workspaces and streams, otherwise the devices
+// would overwrite each other's execute stream (see cann-tp-combined-design.md
+// section 7.3).
+atb_paged_state g_atb[GGML_CANN_MAX_DEVICES];
+
+atb_paged_state & get_atb(ggml_backend_cann_context & cann_ctx) {
+    return g_atb[cann_ctx.device];
+}
 
 void ensure_atb_ctx(ggml_backend_cann_context & cann_ctx) {
-    if (g_atb.ctx) {
-        ((atb::Context *) g_atb.ctx)->SetExecuteStream(cann_ctx.stream());
+    atb_paged_state & atb = get_atb(cann_ctx);
+    if (atb.ctx) {
+        ((atb::Context *) atb.ctx)->SetExecuteStream(cann_ctx.stream());
         return;
     }
     atb::Context * atb_ctx = nullptr;
     ATB_CHECK(atb::CreateContext(&atb_ctx));
     ATB_CHECK(atb_ctx->SetExecuteStream(cann_ctx.stream()));
-    g_atb.ctx = atb_ctx;
-    aclrtGetCurrentContext(&g_atb.saved_ctx);
+    atb.ctx = atb_ctx;
+    aclrtGetCurrentContext(&atb.saved_ctx);
 }
 
 atb::Operation * create_pa_op(int num_heads, int num_kv_heads, int head_dim, bool spec) {
@@ -157,11 +166,11 @@ atb::Operation * create_sa_op(int num_heads, int num_kv_heads, int head_dim, flo
     return op;
 }
 
-void setup_op(atb::Operation * op, const atb::VariantPack & vp, void ** ws, uint64_t * ws_sz,
+void setup_op(atb_paged_state & atb, atb::Operation * op, const atb::VariantPack & vp, void ** ws, uint64_t * ws_sz,
               atb::Context * atb_ctx, aclrtStream stream) {
     uint64_t needed = 0;
     {
-        std::lock_guard<std::mutex> lk(g_atb.mtx);
+        std::lock_guard<std::mutex> lk(atb.mtx);
         ATB_CHECK(op->Setup(vp, needed, atb_ctx));
     }
     const bool resize_ws = needed > *ws_sz;
@@ -185,17 +194,17 @@ void setup_op(atb::Operation * op, const atb::VariantPack & vp, void ** ws, uint
 
 // The full-prompt causal mask only depends on the padded prompt length, so it
 // can be reused by every layer and by later requests with the same length.
-void * get_prefill_causal_mask(int64_t max_len, aclrtStream stream) {
+void * get_prefill_causal_mask(atb_paged_state & atb, int64_t max_len, aclrtStream stream) {
     GGML_ASSERT(max_len > 0);
-    if (g_atb.prefill_mask && g_atb.prefill_mask_len == max_len) {
-        return g_atb.prefill_mask;
+    if (atb.prefill_mask && atb.prefill_mask_len == max_len) {
+        return atb.prefill_mask;
     }
 
-    if (g_atb.prefill_mask) {
+    if (atb.prefill_mask) {
         aclrtSynchronizeStream(stream);
-        ACL_CHECK(aclrtFree(g_atb.prefill_mask));
-        g_atb.prefill_mask     = nullptr;
-        g_atb.prefill_mask_len = -1;
+        ACL_CHECK(aclrtFree(atb.prefill_mask));
+        atb.prefill_mask     = nullptr;
+        atb.prefill_mask_len = -1;
     }
 
     const size_t mask_elems = (size_t) max_len * (size_t) max_len;
@@ -217,8 +226,8 @@ void * get_prefill_causal_mask(int64_t max_len, aclrtStream stream) {
 
     ACL_CHECK(aclrtMemcpyAsync(mask_dev, mask_bytes, mask_host.data(), mask_bytes,
                                ACL_MEMCPY_HOST_TO_DEVICE, stream));
-    g_atb.prefill_mask     = mask_dev;
-    g_atb.prefill_mask_len = max_len;
+    atb.prefill_mask     = mask_dev;
+    atb.prefill_mask_len = max_len;
     return mask_dev;
 }
 
@@ -277,6 +286,7 @@ void self_attention_prefill(ggml_backend_cann_context & ctx, void * q_f16, void 
                             void * out_f16, const std::vector<int32_t> & lengths,
                             const std::vector<int32_t> & offsets, int64_t n_heads, int64_t n_heads_kv,
                             int64_t head_dim, float scale, aclrtStream stream) {
+    atb_paged_state & atb = get_atb(ctx);
     const int64_t q_size  = n_heads * head_dim;
     const int64_t kv_size = n_heads_kv * head_dim;
     const int64_t n_seq   = (int64_t) lengths.size();
@@ -335,20 +345,20 @@ void self_attention_prefill(ggml_backend_cann_context & ctx, void * q_f16, void 
         }
     }
 
-    void * mask_dev = get_prefill_causal_mask(max_len, stream);
+    void * mask_dev = get_prefill_causal_mask(atb, max_len, stream);
 
-    bool sa_valid = g_atb.sa && g_atb.sa_heads == n_heads && g_atb.sa_kv_heads == n_heads_kv &&
-                    g_atb.sa_head_dim == head_dim && g_atb.sa_scale == scale;
+    bool sa_valid = atb.sa && atb.sa_heads == n_heads && atb.sa_kv_heads == n_heads_kv &&
+                    atb.sa_head_dim == head_dim && atb.sa_scale == scale;
     if (!sa_valid) {
-        if (g_atb.sa) {
-            atb::DestroyOperation((atb::Operation *) g_atb.sa);
-            g_atb.sa = nullptr;
+        if (atb.sa) {
+            atb::DestroyOperation((atb::Operation *) atb.sa);
+            atb.sa = nullptr;
         }
-        g_atb.sa = create_sa_op((int) n_heads, (int) n_heads_kv, (int) head_dim, scale);
-        g_atb.sa_heads    = n_heads;
-        g_atb.sa_kv_heads = n_heads_kv;
-        g_atb.sa_head_dim = head_dim;
-        g_atb.sa_scale    = scale;
+        atb.sa = create_sa_op((int) n_heads, (int) n_heads_kv, (int) head_dim, scale);
+        atb.sa_heads    = n_heads;
+        atb.sa_kv_heads = n_heads_kv;
+        atb.sa_head_dim = head_dim;
+        atb.sa_scale    = scale;
     }
 
     atb::Tensor q_t  = atb_tensor_maker::make(q_attn, {aligned, n_heads, head_dim}, ACL_FLOAT16);
@@ -361,9 +371,9 @@ void self_attention_prefill(ggml_backend_cann_context & ctx, void * q_f16, void 
     atb::VariantPack vp;
     vp.inTensors  = { q_t, k_t, v_t, mk_t, sl_t };
     vp.outTensors = { o_t };
-    setup_op(g_atb.sa, vp, &g_atb.ws_sa, &g_atb.ws_sa_sz, (atb::Context *) g_atb.ctx, stream);
-    ATB_CHECK(((atb::Operation *) g_atb.sa)->Execute(vp, (uint8_t *) g_atb.ws_sa, g_atb.ws_sa_sz,
-                                                     (atb::Context *) g_atb.ctx));
+    setup_op(atb, atb.sa, vp, &atb.ws_sa, &atb.ws_sa_sz, (atb::Context *) atb.ctx, stream);
+    ATB_CHECK(((atb::Operation *) atb.sa)->Execute(vp, (uint8_t *) atb.ws_sa, atb.ws_sa_sz,
+                                                     (atb::Context *) atb.ctx));
 
     if (aligned != total) {
         for (int64_t s = 0; s < n_seq; ++s) {
@@ -420,6 +430,7 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(kv_size % 16 == 0 && "NZ pool requires kv_size to be a multiple of 16");
 
     ensure_atb_ctx(ctx);
+    atb_paged_state & atb = get_atb(ctx);
     aclrtStream stream = ctx.stream();
 
     ggml_cann_pool_alloc q_alloc(ctx.pool(), n_tokens * n_heads * head_dim * sizeof(uint16_t));
@@ -451,38 +462,38 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         vp.outTensors = { kc, vc };
 
         // ReshapeCache needs a fresh op per token count (matches vLLM-ascend 310P)
-        if (g_atb.rac && g_atb.rac_tokens != n_tokens) {
-            atb::DestroyOperation((atb::Operation *) g_atb.rac);
-            g_atb.rac = nullptr;
+        if (atb.rac && atb.rac_tokens != n_tokens) {
+            atb::DestroyOperation((atb::Operation *) atb.rac);
+            atb.rac = nullptr;
         }
-        if (!g_atb.rac) {
+        if (!atb.rac) {
             atb::infer::ReshapeAndCacheParam param;
             param.compressType = atb::infer::ReshapeAndCacheParam::COMPRESS_TYPE_UNDEFINED;
             param.kvCacheCfg   = atb::infer::ReshapeAndCacheParam::K_CACHE_V_CACHE_NZ;
-            ATB_CHECK(atb::CreateOperation(param, &g_atb.rac));
-            g_atb.rac_tokens = n_tokens;
+            ATB_CHECK(atb::CreateOperation(param, &atb.rac));
+            atb.rac_tokens = n_tokens;
         }
 
         uint64_t needed = 0;
         {
-            std::lock_guard<std::mutex> lk(g_atb.mtx);
-            ATB_CHECK(((atb::Operation *) g_atb.rac)->Setup(vp, needed, (atb::Context *) g_atb.ctx));
+            std::lock_guard<std::mutex> lk(atb.mtx);
+            ATB_CHECK(((atb::Operation *) atb.rac)->Setup(vp, needed, (atb::Context *) atb.ctx));
         }
-        if (needed > g_atb.ws_rac_sz) {
-            if (g_atb.ws_rac) {
-                aclrtFree(g_atb.ws_rac);
-                g_atb.ws_rac    = nullptr;
-                g_atb.ws_rac_sz = 0;
+        if (needed > atb.ws_rac_sz) {
+            if (atb.ws_rac) {
+                aclrtFree(atb.ws_rac);
+                atb.ws_rac    = nullptr;
+                atb.ws_rac_sz = 0;
             }
-            aclError ret = aclrtMalloc(&g_atb.ws_rac, needed, ACL_MEM_MALLOC_HUGE_FIRST);
+            aclError ret = aclrtMalloc(&atb.ws_rac, needed, ACL_MEM_MALLOC_HUGE_FIRST);
             if (ret != ACL_SUCCESS) {
-                ret = aclrtMalloc(&g_atb.ws_rac, needed, ACL_MEM_MALLOC_NORMAL_ONLY);
+                ret = aclrtMalloc(&atb.ws_rac, needed, ACL_MEM_MALLOC_NORMAL_ONLY);
             }
             ACL_CHECK(ret);
-            g_atb.ws_rac_sz = needed;
+            atb.ws_rac_sz = needed;
         }
-        ATB_CHECK(((atb::Operation *) g_atb.rac)->Execute(vp, (uint8_t *) g_atb.ws_rac, needed,
-                                                          (atb::Context *) g_atb.ctx));
+        ATB_CHECK(((atb::Operation *) atb.rac)->Execute(vp, (uint8_t *) atb.ws_rac, needed,
+                                                          (atb::Context *) atb.ctx));
         const int64_t rac_us = paged_timing ? ggml_time_us() - rac_t0 : 0;
         if (paged_timing) {
             GGML_LOG_ERROR("[paged timing] rac n_tokens=%d n_seq=%d us=%lld\n", (int) n_tokens, (int) n_seq,
@@ -570,16 +581,16 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         atb::Tensor clt = atb_tensor_maker::make(cl_dev, {n_seq}, ACL_INT32, ACL_FORMAT_ND, cl_host.data());
         atb::Tensor out = atb_tensor_maker::make(out_f16, {n_seq, n_heads, head_dim}, ACL_FLOAT16);
 
-        if (!g_atb.pa || g_atb.pa_heads != n_heads || g_atb.pa_kv_heads != n_heads_kv ||
-                g_atb.pa_head_dim != head_dim) {
-            if (g_atb.pa) {
-                atb::DestroyOperation((atb::Operation *) g_atb.pa);
-                g_atb.pa = nullptr;
+        if (!atb.pa || atb.pa_heads != n_heads || atb.pa_kv_heads != n_heads_kv ||
+                atb.pa_head_dim != head_dim) {
+            if (atb.pa) {
+                atb::DestroyOperation((atb::Operation *) atb.pa);
+                atb.pa = nullptr;
             }
-            g_atb.pa = create_pa_op(n_heads, n_heads_kv, head_dim, /*spec=*/false);
-            g_atb.pa_heads    = n_heads;
-            g_atb.pa_kv_heads = n_heads_kv;
-            g_atb.pa_head_dim = head_dim;
+            atb.pa = create_pa_op(n_heads, n_heads_kv, head_dim, /*spec=*/false);
+            atb.pa_heads    = n_heads;
+            atb.pa_kv_heads = n_heads_kv;
+            atb.pa_head_dim = head_dim;
         }
 
         atb::VariantPack vp;
@@ -591,11 +602,11 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
                           *std::min_element(cl_host.begin(), cl_host.end()),
                           *std::max_element(cl_host.begin(), cl_host.end()));
         }
-        setup_op(g_atb.pa, vp, &g_atb.ws_pa, &g_atb.ws_pa_sz, (atb::Context *) g_atb.ctx, stream);
+        setup_op(atb, atb.pa, vp, &atb.ws_pa, &atb.ws_pa_sz, (atb::Context *) atb.ctx, stream);
         const int64_t pa_setup_us = paged_timing ? ggml_time_us() - pa_setup_t0 : 0;
         const int64_t pa_exec_t0 = paged_timing ? ggml_time_us() : 0;
-        ATB_CHECK(((atb::Operation *) g_atb.pa)->Execute(vp, (uint8_t *) g_atb.ws_pa, g_atb.ws_pa_sz,
-                                                         (atb::Context *) g_atb.ctx));
+        ATB_CHECK(((atb::Operation *) atb.pa)->Execute(vp, (uint8_t *) atb.ws_pa, atb.ws_pa_sz,
+                                                         (atb::Context *) atb.ctx));
         const int64_t pa_exec_us = paged_timing ? ggml_time_us() - pa_exec_t0 : 0;
         if (paged_timing) {
             GGML_LOG_ERROR("[paged timing] pa n_seq=%d setup_us=%lld exec_us=%lld meta_us=%lld fast=%d bt=%d q_cast_us=%lld kv_cast_us=%lld\n",
@@ -610,16 +621,16 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         // pool, which is the Splitfuse op.
         ggml_cann_pool_alloc sl_alloc(ctx.pool(), sizeof(int32_t));
 
-        if (!g_atb.sf || g_atb.sf_heads != n_heads || g_atb.sf_kv_heads != n_heads_kv ||
-                g_atb.sf_head_dim != head_dim) {
-            if (g_atb.sf) {
-                atb::DestroyOperation((atb::Operation *) g_atb.sf);
-                g_atb.sf = nullptr;
+        if (!atb.sf || atb.sf_heads != n_heads || atb.sf_kv_heads != n_heads_kv ||
+                atb.sf_head_dim != head_dim) {
+            if (atb.sf) {
+                atb::DestroyOperation((atb::Operation *) atb.sf);
+                atb.sf = nullptr;
             }
-            g_atb.sf = create_pa_op(n_heads, n_heads_kv, head_dim, /*spec=*/true);
-            g_atb.sf_heads    = n_heads;
-            g_atb.sf_kv_heads = n_heads_kv;
-            g_atb.sf_head_dim = head_dim;
+            atb.sf = create_pa_op(n_heads, n_heads_kv, head_dim, /*spec=*/true);
+            atb.sf_heads    = n_heads;
+            atb.sf_kv_heads = n_heads_kv;
+            atb.sf_head_dim = head_dim;
         }
 
         std::vector<int32_t> prefill_lengths;
@@ -698,9 +709,9 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
             atb::VariantPack vp;
             vp.inTensors  = { qa, kc, vc, btt, clt, mk, slt };
             vp.outTensors = { out };
-            setup_op(g_atb.sf, vp, &g_atb.ws_sf, &g_atb.ws_sf_sz, (atb::Context *) g_atb.ctx, stream);
-            ATB_CHECK(((atb::Operation *) g_atb.sf)->Execute(vp, (uint8_t *) g_atb.ws_sf, g_atb.ws_sf_sz,
-                                                             (atb::Context *) g_atb.ctx));
+            setup_op(atb, atb.sf, vp, &atb.ws_sf, &atb.ws_sf_sz, (atb::Context *) atb.ctx, stream);
+            ATB_CHECK(((atb::Operation *) atb.sf)->Execute(vp, (uint8_t *) atb.ws_sf, atb.ws_sf_sz,
+                                                             (atb::Context *) atb.ctx));
             if (paged_timing) {
                 GGML_LOG_ERROR("[paged timing] sf seq=%d len=%d us=%lld\n", (int) seq, (int) len,
                                (long long) (ggml_time_us() - sf_t0));
@@ -718,47 +729,48 @@ void ggml_cann_paged_attn(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cann_paged_attn_cleanup(ggml_backend_cann_context & cann_ctx) {
-    if (!g_atb.ctx) {
+    atb_paged_state & atb = get_atb(cann_ctx);
+    if (!atb.ctx) {
         return;
     }
 
-    ACL_CHECK(aclrtSetCurrentContext(g_atb.saved_ctx));
-    ((atb::Context *) g_atb.ctx)->SetExecuteStream(cann_ctx.stream());
+    ACL_CHECK(aclrtSetCurrentContext(atb.saved_ctx));
+    ((atb::Context *) atb.ctx)->SetExecuteStream(cann_ctx.stream());
     ACL_CHECK(aclrtSynchronizeDevice());
 
-    if (g_atb.rac)  atb::DestroyOperation((atb::Operation *) g_atb.rac);
-    if (g_atb.sa)   atb::DestroyOperation((atb::Operation *) g_atb.sa);
-    if (g_atb.pa)   atb::DestroyOperation((atb::Operation *) g_atb.pa);
-    if (g_atb.sf)   atb::DestroyOperation((atb::Operation *) g_atb.sf);
-    atb::DestroyContext((atb::Context *) g_atb.ctx);
+    if (atb.rac)  atb::DestroyOperation((atb::Operation *) atb.rac);
+    if (atb.sa)   atb::DestroyOperation((atb::Operation *) atb.sa);
+    if (atb.pa)   atb::DestroyOperation((atb::Operation *) atb.pa);
+    if (atb.sf)   atb::DestroyOperation((atb::Operation *) atb.sf);
+    atb::DestroyContext((atb::Context *) atb.ctx);
 
-    if (g_atb.ws_rac) ACL_CHECK(aclrtFree(g_atb.ws_rac));
-    if (g_atb.ws_sa)  ACL_CHECK(aclrtFree(g_atb.ws_sa));
-    if (g_atb.ws_pa)  ACL_CHECK(aclrtFree(g_atb.ws_pa));
-    if (g_atb.ws_sf)  ACL_CHECK(aclrtFree(g_atb.ws_sf));
-    if (g_atb.prefill_mask) ACL_CHECK(aclrtFree(g_atb.prefill_mask));
+    if (atb.ws_rac) ACL_CHECK(aclrtFree(atb.ws_rac));
+    if (atb.ws_sa)  ACL_CHECK(aclrtFree(atb.ws_sa));
+    if (atb.ws_pa)  ACL_CHECK(aclrtFree(atb.ws_pa));
+    if (atb.ws_sf)  ACL_CHECK(aclrtFree(atb.ws_sf));
+    if (atb.prefill_mask) ACL_CHECK(aclrtFree(atb.prefill_mask));
 
-    g_atb.ctx       = nullptr;
-    g_atb.rac       = nullptr;
-    g_atb.sa        = nullptr;
-    g_atb.pa        = nullptr;
-    g_atb.sf        = nullptr;
-    g_atb.ws_rac    = nullptr;
-    g_atb.ws_rac_sz = 0;
-    g_atb.ws_sa     = nullptr;
-    g_atb.ws_sa_sz  = 0;
-    g_atb.ws_pa     = nullptr;
-    g_atb.ws_pa_sz  = 0;
-    g_atb.ws_sf     = nullptr;
-    g_atb.ws_sf_sz  = 0;
-    g_atb.rac_tokens = -1;
-    g_atb.sa_heads   = -1;
-    g_atb.sa_kv_heads = -1;
-    g_atb.sa_head_dim = -1;
-    g_atb.sa_scale    = 0.0f;
-    g_atb.prefill_mask = nullptr;
-    g_atb.prefill_mask_len = -1;
-    g_atb.saved_ctx = nullptr;
+    atb.ctx       = nullptr;
+    atb.rac       = nullptr;
+    atb.sa        = nullptr;
+    atb.pa        = nullptr;
+    atb.sf        = nullptr;
+    atb.ws_rac    = nullptr;
+    atb.ws_rac_sz = 0;
+    atb.ws_sa     = nullptr;
+    atb.ws_sa_sz  = 0;
+    atb.ws_pa     = nullptr;
+    atb.ws_pa_sz  = 0;
+    atb.ws_sf     = nullptr;
+    atb.ws_sf_sz  = 0;
+    atb.rac_tokens = -1;
+    atb.sa_heads   = -1;
+    atb.sa_kv_heads = -1;
+    atb.sa_head_dim = -1;
+    atb.sa_scale    = 0.0f;
+    atb.prefill_mask = nullptr;
+    atb.prefill_mask_len = -1;
+    atb.saved_ctx = nullptr;
 }
 
 #endif  // GGML_CANN_HAS_ATB

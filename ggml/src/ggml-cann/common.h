@@ -33,6 +33,8 @@
 #include <array>
 #include <utility>
 
+#include "cann-worker.h"
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -111,6 +113,23 @@ bool                       parse_bool(const std::string & value);
 int                        parse_integer(const std::string & value);
 
 /**
+ * @brief Whether W8A8 routed-expert weights use the FRACTAL_NZ device layout.
+ *
+ * Matches the vllm-ascend 310P policy (WeightLayoutPolicy.FORCE_NZ): expert
+ * weights are NZ by default on 310P because the grouped-matmul operator only
+ * reaches full speed with pre-transformed weights. Set
+ * GGML_CANN_MOE_WEIGHT_NZ=0 to force the ND path for debugging.
+ * Other Ascend targets keep ND (the NZ descriptor is validated on 310P only).
+ */
+static inline bool ggml_cann_moe_weight_nz_enabled() {
+#ifdef ASCEND_310P
+    return parse_bool(get_env_as_lowercase("GGML_CANN_MOE_WEIGHT_NZ").value_or("on"));
+#else
+    return false;
+#endif
+}
+
+/**
  * @brief Return the CANN 9.1 AI-processor-affinity element capacity for a 2D
  *        W8A8 weight with GGML shape ne = [K, N].
  *
@@ -126,17 +145,6 @@ static inline size_t ggml_cann_w8a8_hp_elements(const ggml_tensor * tensor) {
 
 size_t ggml_cann_w8a8_expert_transformed_size(const ggml_tensor * tensor);
 
-/** @brief Byte offset of the resident FP32 per-channel scale array. */
-static inline size_t ggml_cann_w8a8_scale_offset(const ggml_tensor * tensor) {
-    return GGML_PAD(ggml_cann_w8a8_hp_elements(tensor), 128);
-}
-
-/** @brief Byte offset of the resident FP32 per-expert/per-channel scale plane. */
-static inline size_t ggml_cann_w8a8_expert_scale_offset(const ggml_tensor * tensor) {
-    GGML_ASSERT(tensor->type == GGML_TYPE_W8A8);
-    return GGML_PAD(ggml_cann_w8a8_expert_transformed_size(tensor), 128);
-}
-
 /**
  * @brief Whether the tensor is a 3D W8A8 expert weight.
  *
@@ -145,6 +153,50 @@ static inline size_t ggml_cann_w8a8_expert_scale_offset(const ggml_tensor * tens
  */
 static inline bool ggml_cann_w8a8_is_expert(const ggml_tensor * tensor) {
     return tensor->type == GGML_TYPE_W8A8 && tensor->ne[2] > 1 && tensor->ne[3] == 1;
+}
+
+/**
+ * @brief Whether a 3D Q8_0 expert weight is routed to the grouped W8A8 layout.
+ *
+ * The 310P grouped A8 operator needs one symmetric scale per [expert, output
+ * channel], so Q8_0 expert weights are re-quantized to that scheme at upload
+ * time (lossy: per-32-block scales collapse to a per-row maximum). Routed by
+ * tensor name suffix. Opt-out with GGML_CANN_Q8_MOE_W8A8=0; the master switch
+ * GGML_CANN_QUANT_MATMUL=0 also disables it.
+ */
+static bool ggml_cann_q8_moe_expert(const ggml_tensor * tensor) {
+#ifdef ASCEND_310P
+    static const bool enabled =
+        parse_bool(get_env_as_lowercase("GGML_CANN_Q8_MOE_W8A8").value_or("on")) &&
+        parse_bool(get_env_as_lowercase("GGML_CANN_QUANT_MATMUL").value_or("on"));
+    if (!enabled || tensor->type != GGML_TYPE_Q8_0 ||
+            tensor->ne[2] <= 1 || tensor->ne[3] != 1) {
+        return false;
+    }
+    const std::string name = ggml_get_name(tensor);
+    return name.find("ffn_gate_exps.weight")    != std::string::npos ||
+           name.find("ffn_up_exps.weight")      != std::string::npos ||
+           name.find("ffn_down_exps.weight")    != std::string::npos ||
+           name.find("ffn_gate_up_exps.weight") != std::string::npos;
+#else
+    return false;
+#endif
+}
+
+/** @brief Any 3D expert weight using the grouped A8 device layout. */
+static inline bool ggml_cann_a8_grouped_expert(const ggml_tensor * tensor) {
+    return ggml_cann_w8a8_is_expert(tensor) || ggml_cann_q8_moe_expert(tensor);
+}
+
+/** @brief Byte offset of the resident FP32 per-channel scale array. */
+static inline size_t ggml_cann_w8a8_scale_offset(const ggml_tensor * tensor) {
+    return GGML_PAD(ggml_cann_w8a8_hp_elements(tensor), 128);
+}
+
+/** @brief Byte offset of the resident FP32 per-expert/per-channel scale plane. */
+static inline size_t ggml_cann_w8a8_expert_scale_offset(const ggml_tensor * tensor) {
+    GGML_ASSERT(ggml_cann_a8_grouped_expert(tensor));
+    return GGML_PAD(ggml_cann_w8a8_expert_transformed_size(tensor), 128);
 }
 /**
  * @brief Abstract base class for memory pools used by CANN.
@@ -340,44 +392,24 @@ struct ggml_graph_node_properties {
         // would let one layer's graph be replayed with another layer's
         // weights.
         if (node->data != this->node_address && node->op != GGML_OP_VIEW) {
-            if (getenv("GGML_CANN_DEBUG_MATCH")) {
-                fprintf(stderr, "[MATCH-FAIL] op=%d name=%s: addr %p != %p\n",
-                    (int)node->op, ggml_get_name(node), node->data, this->node_address);
-            }
             return false;
         }
 
         // src address check: strict for all non-VIEW nodes (upstream).
 
         if (node->op != this->node_op) {
-            if (getenv("GGML_CANN_DEBUG_MATCH")) {
-                fprintf(stderr, "[MATCH-FAIL] name=%s: op %d != %d\n",
-                    ggml_get_name(node), (int)node->op, (int)this->node_op);
-            }
             return false;
         }
 
         if (node->type != this->node_type) {
-            if (getenv("GGML_CANN_DEBUG_MATCH")) {
-                fprintf(stderr, "[MATCH-FAIL] name=%s: type %d != %d\n",
-                    ggml_get_name(node), (int)node->type, (int)this->node_type);
-            }
             return false;
         }
 
         for (int i = 0; i < GGML_MAX_DIMS; i++) {
             if (node->ne[i] != this->ne[i]) {
-                if (getenv("GGML_CANN_DEBUG_MATCH")) {
-                    fprintf(stderr, "[MATCH-FAIL] name=%s: ne[%d] %ld != %ld\n",
-                        ggml_get_name(node), i, (long)node->ne[i], (long)this->ne[i]);
-                }
                 return false;
             }
             if (node->nb[i] != this->nb[i]) {
-                if (getenv("GGML_CANN_DEBUG_MATCH")) {
-                    fprintf(stderr, "[MATCH-FAIL] name=%s: nb[%d] %ld != %ld\n",
-                        ggml_get_name(node), i, (long)node->nb[i], (long)this->nb[i]);
-                }
                 return false;
             }
         }
@@ -385,57 +417,29 @@ struct ggml_graph_node_properties {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             if (node->src[i]) {
                 if (node->src[i]->data != this->src_address[i] && node->op != GGML_OP_VIEW) {
-                    if (getenv("GGML_CANN_DEBUG_MATCH")) {
-                        fprintf(stderr, "[MATCH-FAIL] name=%s: src[%d] '%s' addr %p != %p\n",
-                            ggml_get_name(node), i, ggml_get_name(node->src[i]),
-                            node->src[i]->data, this->src_address[i]);
-                    }
                     return false;
                 }
 
                 if (node->src[i]->type != this->src_type[i]) {
-                    if (getenv("GGML_CANN_DEBUG_MATCH")) {
-                        fprintf(stderr, "[MATCH-FAIL] name=%s: src[%d] '%s' type %d != %d\n",
-                            ggml_get_name(node), i, ggml_get_name(node->src[i]),
-                            (int)node->src[i]->type, (int)this->src_type[i]);
-                    }
                     return false;
                 }
 
                 for (int d = 0; d < GGML_MAX_DIMS; d++) {
                     if (node->src[i]->ne[d] != this->src_ne[i][d]) {
-                        if (getenv("GGML_CANN_DEBUG_MATCH")) {
-                            fprintf(stderr, "[MATCH-FAIL] name=%s: src[%d] '%s' ne[%d] %ld != %ld\n",
-                                ggml_get_name(node), i, ggml_get_name(node->src[i]),
-                                d, (long)node->src[i]->ne[d], (long)this->src_ne[i][d]);
-                        }
                         return false;
                     }
                     if (node->src[i]->nb[d] != this->src_nb[i][d]) {
-                        if (getenv("GGML_CANN_DEBUG_MATCH")) {
-                            fprintf(stderr, "[MATCH-FAIL] name=%s: src[%d] '%s' nb[%d] %ld != %ld\n",
-                                ggml_get_name(node), i, ggml_get_name(node->src[i]),
-                                d, (long)node->src[i]->nb[d], (long)this->src_nb[i][d]);
-                        }
                         return false;
                     }
                 }
             } else {
                 if (this->src_address[i] != nullptr) {
-                    if (getenv("GGML_CANN_DEBUG_MATCH")) {
-                        fprintf(stderr, "[MATCH-FAIL] name=%s: src[%d] now null, was %p\n",
-                            ggml_get_name(node), i, this->src_address[i]);
-                    }
                     return false;
                 }
             }
         }
 
         if (memcmp(this->op_params, node->op_params, GGML_MAX_OP_PARAMS) != 0) {
-            if (getenv("GGML_CANN_DEBUG_MATCH")) {
-                fprintf(stderr, "[MATCH-FAIL] name=%s: op_params differ (op=%d)\n",
-                    ggml_get_name(node), (int)node->op);
-            }
             return false;
         }
         return true;
@@ -595,9 +599,6 @@ struct ggml_cann_graph_lru_cache {
             ggml_cann_graph * old = cache_list.back();
             cache_list.pop_back();
             arena_bytes -= arena_bytes_of(old);
-            if (getenv("GGML_CANN_DEBUG_DECISION")) {
-                fprintf(stderr, "[GDEC] EVICT arena_blocks=%zu\n", old->arena_blocks.size());
-            }
             delete old;  // free the old graph
         }
         cache_list.push_front(new_node);
@@ -644,18 +645,12 @@ struct ggml_cann_graph_lru_cache {
      * @return true if found; false otherwise.
      */
     bool find_and_move_to_front(ggml_cgraph * cgraph) {
-        size_t idx = 0;
         for (auto & graph_ptr : this->cache_list) {
             if (graph_ptr->matches_cgraph(cgraph)) {
-                if (getenv("GGML_CANN_DEBUG_DECISION")) {
-                    fprintf(stderr, "[GDEC] MATCH idx=%zu cache=%zu nodes=%d\n",
-                        idx, this->cache_list.size(), (int) cgraph->n_nodes);
-                }
                 cache_list.remove(graph_ptr);
                 cache_list.push_front(graph_ptr);
                 return true;
             }
-            idx++;
         }
         return false;
     }
@@ -883,6 +878,7 @@ struct ggml_cann_gdn_cache {
 
     std::vector<std::array<void *, 3>> generations_; /**< superseded index-buffer generations (kept alive for old graphs). */
     std::map<std::pair<int64_t, int64_t>, void *> prefill_map_; /**< (batch, t) -> immutable [t]*batch device buffer. */
+    std::map<std::pair<int64_t, int64_t>, std::pair<void *, void *>> gqa_perm_map_; /**< (nk, nv) -> immutable {in, out} head-index tables. */
     std::map<std::array<int64_t, 3>, void *> snapshot_map_;
     size_t prefill_entries_ = 0;
     size_t prefill_device_bytes_ = 0;
@@ -1002,6 +998,44 @@ struct ggml_cann_gdn_cache {
     }
 
     /**
+     * @brief Return the device index tables that reorder the v-head axis
+     *        between the llama.cpp modulo mapping and the kernel's block
+     *        grouping, creating them once per (nk, nv) pair.
+     *
+     * @details With ratio = nv/nk, the kernel slot j must play the llama.cpp
+     *          head (j%ratio)*nk + j/ratio so both groupings agree on the
+     *          k-head; the inverse table undoes it on the outputs. Entries are
+     *          immutable after creation, same lifetime rules as prefill_map_.
+     *          GQA shapes are the only users (nk == nv never calls this).
+     */
+    void ensure_gqa_perm(int64_t nk, int64_t nv, void ** in_idx, void ** out_idx) {
+        const auto key = std::make_pair(nk, nv);
+        const auto it  = gqa_perm_map_.find(key);
+        if (it != gqa_perm_map_.end()) {
+            *in_idx  = it->second.first;
+            *out_idx = it->second.second;
+            return;
+        }
+        const int64_t ratio = nv / nk;
+        int32_t * host      = (int32_t *) malloc(2 * nv * sizeof(int32_t));
+        GGML_ASSERT(host != nullptr);
+        for (int64_t j = 0; j < nv; j++) {
+            host[j]             = (int32_t) ((j % ratio) * nk + j / ratio); // in: kernel slot j <- llama head
+            host[nv + j]        = (int32_t) ((j % nk) * ratio + j / nk);   // out: llama head j <- kernel slot
+        }
+        void * dev_in  = nullptr;
+        void * dev_out = nullptr;
+        ACL_CHECK(aclrtMalloc(&dev_in,  nv * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST));
+        ACL_CHECK(aclrtMalloc(&dev_out, nv * sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST));
+        ACL_CHECK(aclrtMemcpy(dev_in,  nv * sizeof(int32_t), host,             nv * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE));
+        ACL_CHECK(aclrtMemcpy(dev_out, nv * sizeof(int32_t), host + nv,        nv * sizeof(int32_t), ACL_MEMCPY_HOST_TO_DEVICE));
+        free(host);
+        gqa_perm_map_.emplace(key, std::make_pair(dev_in, dev_out));
+        *in_idx  = dev_in;
+        *out_idx = dev_out;
+    }
+
+    /**
      * @brief Free every device allocation owned by this cache. Idempotent.
      *
      * @details Must only run when no ACL graph can still reference these
@@ -1045,6 +1079,15 @@ struct ggml_cann_gdn_cache {
         }
         snapshot_map_.clear();
         prefill_entries_ = 0;
+        for (const auto & kv : gqa_perm_map_) {
+            if (kv.second.first != nullptr) {
+                ACL_CHECK(aclrtFree(kv.second.first));
+            }
+            if (kv.second.second != nullptr) {
+                ACL_CHECK(aclrtFree(kv.second.second));
+            }
+        }
+        gqa_perm_map_.clear();
         prefill_device_bytes_ = 0;
         max_batch = 0;
     }
@@ -1089,6 +1132,11 @@ struct ggml_backend_cann_context {
     bool                      capturing       = false;   /**< true between CaptureBegin/End. */
 #endif
     bool                   async_mode;
+    // explicit prefill/decode phase (set via ggml_backend_cann_set_prefill),
+    // replaces shape-based phase guessing for graph mode decisions
+    bool                   prefill_phase = false;
+    // per-device worker thread used when multiple CANN devices are active (TP)
+    std::unique_ptr<cann_worker> worker;
     // Rope Cache
     ggml_cann_rope_cache   rope_cache;
     // Constant Pool
@@ -1104,6 +1152,9 @@ struct ggml_backend_cann_context {
      * @param device Device ID.
      */
     explicit ggml_backend_cann_context(int device) : device(device), name("CANN" + std::to_string(device)) {
+        if (getenv("GGML_CANN_GDN_DEBUG")) {
+            fprintf(stderr, "[GDN] ctx CTOR dev=%d this=%p\n", device, (void *) this);
+        }
         ggml_cann_set_device(device);
         description = aclrtGetSocName();
 
@@ -1129,6 +1180,9 @@ struct ggml_backend_cann_context {
      *          (ACL_CHECK); they are not silently ignored.
      */
     ~ggml_backend_cann_context() {
+        if (getenv("GGML_CANN_GDN_DEBUG")) {
+            fprintf(stderr, "[GDN] ctx DTOR dev=%d this=%p\n", device, (void *) this);
+        }
         ggml_cann_set_device(device);
         for (int i = 0; i < GGML_CANN_MAX_STREAMS; ++i) {
             if (streams[i] != nullptr) {

@@ -75,8 +75,20 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
 
 void server_queue::defer(server_task && task) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
-    QUE_DBG("defer task, id = %d\n", task.id);
-    queue_tasks_deferred.push_back(std::move(task));
+    QUE_DBG("defer task, id = %d, priority = %d\n", task.id, task.params.priority);
+    if (priority_order && task.type == SERVER_TASK_TYPE_COMPLETION) {
+        // keep the deferred queue ordered by ascending priority; ties and
+        // non-completion tasks keep their arrival order
+        auto it = queue_tasks_deferred.begin();
+        for (; it != queue_tasks_deferred.end(); ++it) {
+            if (it->type == SERVER_TASK_TYPE_COMPLETION && it->params.priority > task.params.priority) {
+                break;
+            }
+        }
+        queue_tasks_deferred.insert(it, std::move(task));
+    } else {
+        queue_tasks_deferred.push_back(std::move(task));
+    }
     time_last_task = ggml_time_ms();
     condition_tasks.notify_one();
 }
@@ -145,8 +157,24 @@ bool server_queue::process_new_tasks(bool is_yielding) {
         if (queue_tasks.empty()) {
             return false;
         }
-        server_task task = std::move(queue_tasks.front());
-        queue_tasks.pop_front();
+        auto it = queue_tasks.begin();
+        if (priority_order) {
+            // control / cancel / metrics tasks stay first, in arrival order
+            auto it_ctl = std::find_if(queue_tasks.begin(), queue_tasks.end(),
+                    [](const server_task & t) { return t.type != SERVER_TASK_TYPE_COMPLETION; });
+            if (it_ctl != queue_tasks.end()) {
+                it = it_ctl;
+            } else {
+                // lowest priority value first; ties keep arrival order
+                for (auto i = queue_tasks.begin(); i != queue_tasks.end(); ++i) {
+                    if (i->params.priority < it->params.priority) {
+                        it = i;
+                    }
+                }
+            }
+        }
+        server_task task = std::move(*it);
+        queue_tasks.erase(it);
         lock.unlock();
 
         QUE_DBG("processing task, id = %d\n", task.id);

@@ -8,6 +8,7 @@
 #include <aclnnop/aclnn_copy.h>
 #include <aclnnop/aclnn_div.h>
 #include <aclnnop/aclnn_grouped_matmul_v4.h>
+#include <aclnnop/aclnn_grouped_matmul_weight_nz.h>
 #include <aclnnop/aclnn_gather_v2.h>
 #include <aclnnop/aclnn_moe_gating_top_k_softmax.h>
 #include <aclnnop/aclnn_moe_gating_top_k_softmax_v2.h>
@@ -19,6 +20,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -58,6 +60,18 @@ bool is_down_weight(const ggml_tensor * weight) {
     return name != nullptr && strstr(name, "ffn_down_exps.weight") != nullptr;
 }
 
+bool graph_has_w8a8_expert(const ggml_cgraph * graph) {
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr &&
+                (node->src[0]->type == GGML_TYPE_W8A8 ||
+                 ggml_cann_q8_moe_expert(node->src[0]))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool is_view_like(const ggml_tensor * tensor) {
     return tensor->op == GGML_OP_RESHAPE || tensor->op == GGML_OP_VIEW ||
            tensor->op == GGML_OP_PERMUTE || tensor->op == GGML_OP_TRANSPOSE ||
@@ -75,14 +89,21 @@ bool is_view_or_self(const ggml_tensor * tensor, const ggml_tensor * root) {
 }
 
 ggml_tensor * find_router_nodes(const ggml_cgraph * graph, int begin,
+                                const ggml_tensor * logits,
                                 ggml_tensor ** selected_out,
                                 ggml_tensor ** weights_out) {
-    ggml_tensor * logits = graph->nodes[begin];
     ggml_tensor * probs = nullptr;
     ggml_tensor * sorted = nullptr;
     ggml_tensor * selected = nullptr;
     ggml_tensor * weights = nullptr;
 
+    // The anchor is either the router matmul itself, or the softmax that
+    // consumes its logits when the matmul already ran. The router matmul is
+    // replicated (MIRRORED) since the router subgraph boundary was removed;
+    // the softmax anchor stays as a defensive fallback.
+    if (graph->nodes[begin]->op == GGML_OP_SOFT_MAX && graph->nodes[begin]->src[0] == logits) {
+        probs = graph->nodes[begin];
+    }
     for (int i = begin + 1; i < graph->n_nodes; ++i) {
         ggml_tensor * node = graph->nodes[i];
         if (node->op == GGML_OP_SOFT_MAX && node->src[0] == logits) {
@@ -220,20 +241,35 @@ static void run_sorted_grouped_matmul(ggml_backend_cann_context & ctx,
     acl_tensor_list_ptr input_list = ggml_cann_create_tensor_list(std::move(acl_input));
     acl_tensor_list_ptr weight_list = ggml_cann_create_tensor_list(std::move(acl_weight));
     acl_tensor_list_ptr output_list = ggml_cann_create_tensor_list(std::move(acl_output));
-    GGML_CANN_CALL_ACLNN_OP(ctx, GroupedMatmulV4, input_list.get(), weight_list.get(),
-                            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                            acl_cumsum.get(), nullptr, nullptr, nullptr, 2, 0, 0, 0,
-                            output_list.get(), nullptr, nullptr);
+    // GroupedMatmulV4 only accepts ND weights; the NZ-transformed expert
+    // stacks must run through aclnnGroupedMatmulWeightNz.
+    if (weight_format == ACL_FORMAT_FRACTAL_NZ) {
+        GGML_CANN_CALL_ACLNN_OP(ctx, GroupedMatmulWeightNz, input_list.get(), weight_list.get(),
+                                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                acl_cumsum.get(), nullptr, nullptr, nullptr, 2, 0, 0, 0,
+                                nullptr, 0, output_list.get(), nullptr, nullptr);
+    } else {
+        GGML_CANN_CALL_ACLNN_OP(ctx, GroupedMatmulV4, input_list.get(), weight_list.get(),
+                                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                acl_cumsum.get(), nullptr, nullptr, nullptr, 2, 0, 0, 0,
+                                output_list.get(), nullptr, nullptr);
+    }
 }
 
 static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
-                               const ggml_cgraph * graph, int router_idx,
+                               const ggml_cgraph * graph,
+                               const ggml_tensor * router,
                                int router_last, ggml_tensor * selected,
                                ggml_tensor * weights,
                                ggml_cann_pool_alloc * topk_ids,
-                               ggml_cann_pool_alloc * topk_weights,
                                int * last_fused_node) {
-    const ggml_tensor * router = graph->nodes[router_idx];
+    // router is the router logits tensor, [n_exp, n_token]; it may be the
+    // matmul node itself or the already computed logits referenced by the
+    // softmax anchor (defensive fallback, see the anchor lookup)
+
+    // Always fuse when the shape checks below pass: empty expert groups are
+    // skipped cheaply by the grouped matmuls, and the fused path drops the
+    // per-node MoeInitRoutingV2 dispatches of the fallback (decode included).
     static const bool debug =
         env_enabled("GGML_CANN_MOE_FULL_DEBUG", false);
     ggml_tensor * gate_node = nullptr;
@@ -302,9 +338,11 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
     ggml_tensor * down_node = nullptr;
     for (int i = glu_idx + 1; i < graph->n_nodes; ++i) {
         ggml_tensor * candidate = graph->nodes[i];
+        // the fused path feeds the down matmul its own sorted activations,
+        // so the per-pair input limits of the standalone grouped path do not
+        // apply here; the weight shape is validated after the dims are known
         if (candidate->op == GGML_OP_MUL_MAT_ID && candidate->src[0] != nullptr &&
-                is_down_weight(candidate->src[0]) && candidate->src[2] == selected &&
-                ggml_cann_mul_mat_id_grouped_supported(candidate)) {
+                is_down_weight(candidate->src[0]) && candidate->src[2] == selected) {
             down_node = candidate;
             break;
         }
@@ -359,7 +397,7 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
         return false;
     }
 
-    const int64_t n_exp    = router->src[0]->ne[1];
+    const int64_t n_exp    = router->ne[0];
     const int64_t n_used   = selected->ne[0];
     const int64_t n_token  = selected->ne[1];
     const int64_t n_rows   = n_used * n_token;
@@ -367,9 +405,18 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
     const bool merged_gate_up = gate_node == up_node;
     const int64_t n_ff     = merged_gate_up ? gate_node->ne[0] / 2 : gate_node->ne[0];
     const int64_t n_embd   = down_node->ne[0];
+    const ggml_tensor * down_weight = down_node->src[0];
     if (n_ff <= 0 || n_token <= 0 || n_used <= 0 ||
             (merged_gate_up && gate_node->ne[0] % 2 != 0) ||
-            gate_node->ne[0] != up_node->ne[0]) {
+            gate_node->ne[0] != up_node->ne[0] ||
+            // the down grouped matmul reads the weight as an
+            // [n_ff, n_embd, n_exp] stack, the real shape must match
+            down_weight->type != GGML_TYPE_F16 || down_weight->ne[3] != 1 ||
+            down_weight->ne[0] != n_ff || down_weight->ne[1] != n_embd ||
+            down_weight->ne[2] != n_exp ||
+            down_weight->ne[0] % 32 != 0 || down_weight->ne[1] % 32 != 0 ||
+            down_node->ne[1] != n_used || down_node->ne[2] != n_token ||
+            !ggml_is_contiguous(down_weight)) {
         if (debug) fprintf(stderr, "[MoE FULL] fail: bad shape\n");
         return false;
     }
@@ -386,9 +433,7 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
     const size_t i32 = sizeof(int32_t);
 
     ggml_cann_pool_alloc ids_alloc;
-    ggml_cann_pool_alloc probs_alloc;
     void * ids_data = nullptr;
-    void * probs_data = nullptr;
     if (topk_ids == nullptr) {
         ids_alloc.alloc(ctx.pool(), n_rows * i32);
         ids_data = ids_alloc.get();
@@ -404,21 +449,6 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
     } else {
         ids_data = topk_ids->get();
     }
-    if (topk_weights == nullptr) {
-        probs_alloc.alloc(ctx.pool(), n_rows * f32);
-        probs_data = probs_alloc.get();
-        int64_t dst_ne[2] = { n_used, n_token };
-        size_t  dst_nb[2] = { f32, n_used * f32 };
-        int64_t src_ne[2] = { n_used, n_token };
-        size_t  src_nb[2] = { weights->nb[1], weights->nb[2] };
-        acl_tensor_ptr acl_src = ggml_cann_create_tensor(
-            weights->data, ACL_FLOAT, f32, src_ne, src_nb, 2);
-        acl_tensor_ptr acl_dst = ggml_cann_create_tensor(
-            probs_data, ACL_FLOAT, f32, dst_ne, dst_nb, 2);
-        GGML_CANN_CALL_ACLNN_OP(ctx, InplaceCopy, acl_dst.get(), acl_src.get());
-    } else {
-        probs_data = topk_weights->get();
-    }
 
     ggml_cann_pool_alloc hidden16(ctx.pool(), n_hidden * n_token * f16);
     ggml_cann_pool_alloc sorted_x(ctx.pool(), n_rows * n_hidden * f16);
@@ -430,8 +460,6 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
                                 (merged_gate_up ? 0 : n_rows * n_ff) * f16);
     ggml_cann_pool_alloc activation(ctx.pool(), n_rows * n_ff * f16);
     ggml_cann_pool_alloc down_out(ctx.pool(), n_rows * n_embd * f16);
-    ggml_cann_pool_alloc probs16(ctx.pool(), n_rows * f16);
-    ggml_cann_pool_alloc routed(ctx.pool(), n_token * n_embd * f16);
 
     {
         const ggml_tensor * hidden = gate_node->src[1];
@@ -505,39 +533,35 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
                               down_out.get(), cumsum_i64.get(), n_ff, n_embd,
                               n_rows, n_exp);
 
-    int64_t probs_ne[2] = { n_used, n_token };
-    size_t  probs16_nb[2] = { f16, n_used * f16 };
-    size_t  probs32_nb[2] = { f32, n_used * f32 };
-    int64_t down_ne[2] = { n_embd, n_rows };
-    size_t  down_nb[2] = { f16, n_embd * f16 };
-    int64_t routed_ne[2] = { n_embd, n_token };
-    size_t  routed_nb[2] = { f16, n_embd * f16 };
-    acl_tensor_ptr acl_probs16 = ggml_cann_create_tensor(
-        probs16.get(), ACL_FLOAT16, f16, probs_ne, probs16_nb, 2);
-    acl_tensor_ptr acl_probs32 = ggml_cann_create_tensor(
-        probs_data, ACL_FLOAT, f32, probs_ne, probs32_nb, 2);
+    // gather the sorted rows back into the per-pair order of a mul_mat_id
+    // dst; the weighted mul and the top-k sum run as normal graph nodes
+    // after the fused region
+    int64_t pair_ne[2] = { n_embd, n_rows };
+    size_t  pair_nb[2] = { f16, n_embd * f16 };
+    ggml_cann_pool_alloc down_pair(ctx.pool(), n_rows * n_embd * f16);
     acl_tensor_ptr acl_down = ggml_cann_create_tensor(
-        down_out.get(), ACL_FLOAT16, f16, down_ne, down_nb, 2);
-    acl_tensor_ptr acl_routed = ggml_cann_create_tensor(
-        routed.get(), ACL_FLOAT16, f16, routed_ne, routed_nb, 2);
-    int64_t restore_shape[2] = { n_token, n_embd };
-    acl_int_array_ptr restore = ggml_cann_create_int_array(restore_shape, 2);
-    GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_probs32.get(), ACL_FLOAT16,
-                            acl_probs16.get());
-    GGML_CANN_CALL_ACLNN_OP(ctx, MoeTokenUnpermute, acl_down.get(),
-                            acl_row_idx.get(), acl_probs16.get(), false,
-                            restore.get(), acl_routed.get());
+        down_out.get(), ACL_FLOAT16, f16, pair_ne, pair_nb, 2);
+    acl_tensor_ptr acl_pair = ggml_cann_create_tensor(
+        down_pair.get(), ACL_FLOAT16, f16, pair_ne, pair_nb, 2);
+    GGML_CANN_CALL_ACLNN_OP(ctx, GatherV2, acl_down.get(), 0,
+                            acl_row_idx.get(), acl_pair.get());
 
-    size_t dst_nb[2] = { ggml_type_size(moe_out->type),
-                         n_embd * ggml_type_size(moe_out->type) };
-    acl_tensor_ptr acl_moe_out = ggml_cann_create_tensor(
-        moe_out, ACL_FLOAT, f32, routed_ne, dst_nb, 2);
-    GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_routed.get(), ACL_FLOAT,
-                            acl_moe_out.get());
+    int64_t dst3d_ne[3] = { n_embd, n_used, n_token };
+    size_t  pair3d_nb[3] = { f16, n_embd * f16, n_embd * n_used * f16 };
+    size_t  dst3d_nb[3]  = { down_node->nb[0], down_node->nb[1], down_node->nb[2] };
+    acl_tensor_ptr acl_pair3d = ggml_cann_create_tensor(
+        down_pair.get(), ACL_FLOAT16, f16, dst3d_ne, pair3d_nb, 3);
+    acl_tensor_ptr acl_down_dst = ggml_cann_create_tensor(
+        down_node->data, ggml_cann_type_mapping(down_node->type),
+        ggml_type_size(down_node->type), dst3d_ne, dst3d_nb, 3);
+    GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_pair3d.get(),
+                            ggml_cann_type_mapping(down_node->type),
+                            acl_down_dst.get());
 
-    *last_fused_node = final_idx;
+    *last_fused_node = down_idx;
     return true;
 }
+
 void run_moe_gmm(ggml_backend_cann_context & ctx, const ggml_tensor * weight,
                  const ggml_tensor * input, const ggml_tensor * ids,
                  ggml_cann_pool_alloc & input_alloc,
@@ -669,10 +693,19 @@ void run_moe_gmm(ggml_backend_cann_context & ctx, const ggml_tensor * weight,
     acl_tensor_list_ptr x_list = ggml_cann_create_tensor_list(std::move(acl_sorted_x));
     acl_tensor_list_ptr w_list = ggml_cann_create_tensor_list(std::move(acl_weight));
     acl_tensor_list_ptr out_list = ggml_cann_create_tensor_list(std::move(acl_gmm_out));
-    GGML_CANN_CALL_ACLNN_OP(ctx, GroupedMatmulV4, x_list.get(), w_list.get(), nullptr,
-                            nullptr, nullptr, nullptr, nullptr, nullptr, acl_c64.get(),
-                            nullptr, nullptr, nullptr, 2, 0, 0, 0, out_list.get(),
-                            nullptr, nullptr);
+    // GroupedMatmulV4 only accepts ND weights; the NZ-transformed expert
+    // stacks must run through aclnnGroupedMatmulWeightNz.
+    if (weight_format == ACL_FORMAT_FRACTAL_NZ) {
+        GGML_CANN_CALL_ACLNN_OP(ctx, GroupedMatmulWeightNz, x_list.get(), w_list.get(), nullptr,
+                                nullptr, nullptr, nullptr, nullptr, nullptr, acl_c64.get(),
+                                nullptr, nullptr, nullptr, 2, 0, 0, 0, nullptr, 0,
+                                out_list.get(), nullptr, nullptr);
+    } else {
+        GGML_CANN_CALL_ACLNN_OP(ctx, GroupedMatmulV4, x_list.get(), w_list.get(), nullptr,
+                                nullptr, nullptr, nullptr, nullptr, nullptr, acl_c64.get(),
+                                nullptr, nullptr, nullptr, 2, 0, 0, 0, out_list.get(),
+                                nullptr, nullptr);
+    }
 
     if (!gather_rows) {
         return;
@@ -730,8 +763,21 @@ bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
                                 const ggml_cgraph * graph, int node_idx,
                                 bool graph_has_w8a8_expert, int * last_fused_node) {
     ggml_tensor * node = graph->nodes[node_idx];
-    if (node->op != GGML_OP_MUL_MAT || node->src[0] == nullptr ||
-            node->src[1] == nullptr || !is_router_weight(node->src[0])) {
+    // anchor: the router matmul itself, or the softmax consuming its logits
+    // when the matmul already ran (defensive fallback: the router matmul is
+    // replicated now, no TP subgraph boundary sits between the two)
+    ggml_tensor * logits = nullptr;
+    bool logits_precomputed = false;
+    if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr &&
+            node->src[1] != nullptr && is_router_weight(node->src[0])) {
+        logits = node;
+    } else if (node->op == GGML_OP_SOFT_MAX && node->src[0] != nullptr &&
+               node->src[0]->op == GGML_OP_MUL_MAT &&
+               node->src[0]->src[0] != nullptr &&
+               is_router_weight(node->src[0]->src[0])) {
+        logits = node->src[0];
+        logits_precomputed = true;
+    } else {
         return false;
     }
 
@@ -747,16 +793,24 @@ bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
 
     ggml_tensor * selected = nullptr;
     ggml_tensor * weights = nullptr;
-    ggml_tensor * probs = find_router_nodes(graph, node_idx, &selected, &weights);
-    if (debug && debug_count++ < 12) {
+    ggml_tensor * probs = find_router_nodes(graph, node_idx, logits, &selected, &weights);
+    if (debug && debug_count++ < 4) {
         fprintf(stderr,
-                "[MoE ROUTER] idx=%d logits=%s ne=%ldx%ld cur=%s ne=%ldx%ld "
-                "probs=%d sel=%d w=%d\n",
-                node_idx, tensor_name(node->src[0]), (long) node->src[0]->ne[0],
-                (long) node->src[0]->ne[1], tensor_name(node->src[1]),
-                (long) node->src[1]->ne[0], (long) node->src[1]->ne[1],
+                "[MoE ROUTER] dev=%d idx=%d logits=%s ne=%ldx%ld pre=%d "
+                "probs=%d sel=%d w=%d n_nodes=%d\n",
+                ctx.device, node_idx, tensor_name(logits), (long) logits->ne[0],
+                (long) logits->ne[1], (int) logits_precomputed,
                 find_node_index(graph, probs), find_node_index(graph, selected),
-                find_node_index(graph, weights));
+                find_node_index(graph, weights), graph->n_nodes);
+        for (int i = node_idx; i < node_idx + 18 && i < graph->n_nodes; ++i) {
+            ggml_tensor * n = graph->nodes[i];
+            fprintf(stderr, "[MoE NODES] dev=%d %3d %-24s op=%-12s ne=[%lld,%lld,%lld,%lld] src0=%s src1=%s src2=%s\n",
+                    ctx.device, i, n->name, ggml_op_name(n->op),
+                    (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3],
+                    n->src[0] ? n->src[0]->name : "-",
+                    n->src[1] ? n->src[1]->name : "-",
+                    n->src[2] ? n->src[2]->name : "-");
+        }
     }
     if (probs == nullptr || selected == nullptr || weights == nullptr) {
         return false;
@@ -767,8 +821,8 @@ bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
         return false;
     }
 
-    const int64_t n_token = node->src[1]->ne[1];
-    const int64_t n_exp   = node->src[0]->ne[1];
+    const int64_t n_token = logits->ne[1];
+    const int64_t n_exp   = logits->ne[0];
     const int64_t n_used  = selected->ne[0];
     if (n_exp % 32 != 0) {
         return false;
@@ -777,12 +831,18 @@ bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
     constexpr int64_t chunk_rows = 3072;
     const int64_t chunks = (n_token + chunk_rows - 1) / chunk_rows;
 
+    if (!logits_precomputed) {
+        // The executor dispatches this hook instead of running the node, so the
+        // router matmul has not executed yet: compute it before reading the logits.
+        ggml_cann_mul_mat(ctx, logits);
+    }
+
     ggml_cann_pool_alloc logits16_alloc(ctx.pool(), n_token * n_exp * sizeof(uint16_t));
     {
         int64_t logits_ne[2] = { n_exp, n_token };
         size_t  src_nb[2]    = { sizeof(float), n_exp * sizeof(float) };
         size_t  dst_nb[2]    = { sizeof(uint16_t), n_exp * sizeof(uint16_t) };
-        acl_tensor_ptr src = ggml_cann_create_tensor(node->data, ACL_FLOAT,
+        acl_tensor_ptr src = ggml_cann_create_tensor(logits->data, ACL_FLOAT,
                                                      sizeof(float), logits_ne, src_nb, 2);
         acl_tensor_ptr dst = ggml_cann_create_tensor(logits16_alloc.get(), ACL_FLOAT16,
                                                      sizeof(uint16_t), logits_ne, dst_nb, 2);
@@ -876,16 +936,9 @@ bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
                                                         sizeof(float), topk_ne, topk32_nb, 2);
     GGML_CANN_CALL_ACLNN_OP(ctx, Div, acl_w32.get(), acl_sum.get(), acl_norm32.get());
 
-    // Full fusion is numerically invalid for W8A8 expert weights on this CANN
-    // build, so bypass it automatically when grouped MoE A8 is selected.
-    const bool full_fusion =
-        env_enabled("GGML_CANN_MOE_FULL_FUSION", !graph_has_w8a8_expert);
-    if (full_fusion &&
-            run_moe_full_fused(ctx, graph, node_idx, last, selected, weights,
-                               &topk_ids, &norm32, last_fused_node)) {
-        return true;
-    }
-
+    // fill the graph tensors before the fused attempt: the weighted node
+    // after the fused region reads the normalized weights, and the fallback
+    // path needs them too
     for (int64_t token = 0; token < n_token; ++token) {
         ACL_CHECK(aclrtMemcpyAsync(
             (char *) selected->data + token * selected->nb[1], n_used * sizeof(int32_t),
@@ -895,6 +948,83 @@ bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
             (char *) weights->data + token * weights->nb[2], n_used * sizeof(float),
             (char *) norm32.get() + token * n_used * sizeof(float),
             n_used * sizeof(float), ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
+    }
+
+    // Full fusion is numerically invalid for W8A8 expert weights on this CANN
+    // build, so bypass it automatically when grouped MoE A8 is selected.
+    // Evaluated per call: the W8A8 marker varies per graph.
+    const bool full_fusion =
+        env_enabled("GGML_CANN_MOE_FULL_FUSION", !graph_has_w8a8_expert);
+    if (full_fusion &&
+            run_moe_full_fused(ctx, graph, logits, last, selected, weights,
+                               &topk_ids, last_fused_node)) {
+        return true;
+    }
+
+    if (debug) {
+        ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
+        static int check_count = 0;
+        static int pass_count  = 0;
+        static int fail_count  = 0;
+        if (check_count < 4000) {
+            check_count++;
+            for (int64_t token = 0; token < std::min<int64_t>(n_token, 2); ++token) {
+                std::vector<float> h_logits(n_exp);
+                ACL_CHECK(aclrtMemcpy(h_logits.data(), n_exp * sizeof(float),
+                                      (char *) logits->data + token * n_exp * sizeof(float),
+                                      n_exp * sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST));
+                std::vector<float> ref(n_exp);
+                float mx = -1e30f;
+                for (auto v : h_logits) mx = std::max(mx, v);
+                float se = 0;
+                for (size_t i = 0; i < h_logits.size(); ++i) {
+                    ref[i] = expf(h_logits[i] - mx);
+                    se += ref[i];
+                }
+                for (auto & v : ref) v /= se;
+                std::vector<std::pair<float, int>> order(n_exp);
+                for (int i = 0; i < n_exp; ++i) order[i] = {ref[i], i};
+                std::partial_sort(order.begin(), order.begin() + n_used, order.end(),
+                                  [](auto & a, auto & b) { return a.first > b.first; });
+                float rsum = 0;
+                for (int i = 0; i < n_used; ++i) rsum += order[i].first;
+                std::vector<int32_t> h_ids(n_used), g_ids(n_used);
+                std::vector<float> h_w(n_used), g_w(n_used);
+                ACL_CHECK(aclrtMemcpy(h_ids.data(), n_used * sizeof(int32_t),
+                                      (char *) topk_ids.get() + token * n_used * sizeof(int32_t),
+                                      n_used * sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_HOST));
+                ACL_CHECK(aclrtMemcpy(h_w.data(), n_used * sizeof(float),
+                                      (char *) norm32.get() + token * n_used * sizeof(float),
+                                      n_used * sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST));
+                ACL_CHECK(aclrtMemcpy(g_ids.data(), n_used * sizeof(int32_t),
+                                      (char *) selected->data + token * selected->nb[1],
+                                      n_used * sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_HOST));
+                ACL_CHECK(aclrtMemcpy(g_w.data(), n_used * sizeof(float),
+                                      (char *) weights->data + token * weights->nb[2],
+                                      n_used * sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST));
+                bool ok = true;
+                for (int i = 0; i < n_used; ++i) {
+                    if (h_ids[i] != g_ids[i] || h_w[i] != g_w[i]) ok = false;
+                }
+                if (ok) {
+                    pass_count++;
+                } else {
+                    fail_count++;
+                    if (fail_count < 6) {
+                        fprintf(stderr, "[MoE ROUTER CHECK] copy mismatch dev=%d n_token=%ld token=%ld layer=%s\n",
+                                ctx.device, (long) n_token, (long) token, node->name);
+                        fprintf(stderr, "[MoE ROUTER CHECK] vendor:");
+                        for (int i = 0; i < n_used; ++i) fprintf(stderr, " %d(%.4f)", h_ids[i], h_w[i]);
+                        fprintf(stderr, "\n[MoE ROUTER CHECK] copied:");
+                        for (int i = 0; i < n_used; ++i) fprintf(stderr, " %d(%.4f)", g_ids[i], g_w[i]);
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
+            if (check_count % 500 == 0) {
+                fprintf(stderr, "[MoE ROUTER CHECK] dev=%d pass=%d fail=%d\n", ctx.device, pass_count, fail_count);
+            }
+        }
     }
 
     *last_fused_node = last;
@@ -941,7 +1071,7 @@ bool ggml_cann_moe_gate_up_fused(ggml_backend_cann_context & ctx,
         if (router_idx >= 0 && selected_idx > router_idx) {
             ggml_tensor * router_selected = nullptr;
             ggml_tensor * router_weights = nullptr;
-            find_router_nodes(graph, router_idx, &router_selected,
+            find_router_nodes(graph, router_idx, logits, &router_selected,
                               &router_weights);
             if (debug && router_selected != selected) {
                 fprintf(stderr, "[MoE FULL GATE] selected mismatch\n");
@@ -949,9 +1079,9 @@ bool ggml_cann_moe_gate_up_fused(ggml_backend_cann_context & ctx,
                 fprintf(stderr, "[MoE FULL GATE] no weights\n");
             }
             if (router_selected == selected && router_weights != nullptr &&
-                    run_moe_full_fused(ctx, graph, router_idx, selected_idx,
+                    run_moe_full_fused(ctx, graph, logits, selected_idx,
                                        selected, router_weights, nullptr,
-                                       nullptr, last_fused_node)) {
+                                       last_fused_node)) {
                 return true;
             }
         }
@@ -1060,8 +1190,11 @@ bool ggml_cann_moe_down_unpermute_fused(ggml_backend_cann_context & ctx,
                                         int * last_fused_node) {
     static const bool enabled = env_enabled("GGML_CANN_MOE_UNPERMUTE_FUSION", true);
     ggml_tensor * node = graph->nodes[node_idx];
+    // a8 (W8A8) expert weights carry a private layout that run_moe_gmm cannot
+    // map; they stay on the moe_ops grouped route
     if (!enabled || node->op != GGML_OP_MUL_MAT_ID || node->src[0] == nullptr ||
             !is_down_weight(node->src[0]) ||
+            ggml_cann_a8_grouped_expert(node->src[0]) ||
             !ggml_cann_mul_mat_id_grouped_supported(node)) {
         return false;
     }

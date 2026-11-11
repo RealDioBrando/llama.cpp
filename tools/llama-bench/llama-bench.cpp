@@ -28,6 +28,9 @@
 #include "llama.h"
 #include "log.h"
 
+// for setting the graph decode phase on the context (same contract as the server)
+#include "../../src/llama-context.h"
+
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
 #    ifndef NOMINMAX
@@ -2213,6 +2216,9 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
     llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
 
     for (int i = 0; i < n_gen; i++) {
+        // one-token continuation: mark the decode phase so phase-gated
+        // backend paths (e.g. CANN ACL graph capture) engage like in the server
+        ctx->graph_decode_mode = GGML_GRAPH_PHASE_DECODE;
         int res = llama_decode(ctx, llama_batch_get_one(&token, 1));
         if (res != 0) {
             fprintf(stderr, "%s: failed to decode generation batch, res = %d\n", __func__, res);
