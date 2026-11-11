@@ -96,6 +96,7 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
         }
         GGML_ASSERT(k_gpu_layers[il]->buffer && v_gpu_layers[il]->buffer && "GPU layer tensor has null buffer");
     }
+    ctx_buf_gpu = {ggml_context_ptr(ctx_gpu), ggml_backend_buffer_ptr(buf_gpu)};
 
     // Set up CPU context and tensor (for swapping)
     struct ggml_init_params cpu_params;
@@ -127,6 +128,7 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
         }
         GGML_ASSERT(k_cpu_layers[il]->buffer && v_cpu_layers[il]->buffer && "CPU layer tensor has null buffer");
     }
+    ctx_buf_cpu = {ggml_context_ptr(ctx_cpu), ggml_backend_buffer_ptr(buf_cpu)};
 
     // Setting up our block accountant
     block_manager.init(n_gpu_blocks, n_cpu_blocks, watermark);
