@@ -3126,6 +3126,7 @@ static void ggml_backend_cann_synchronize(ggml_backend_t backend) {
 static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
                                int                                 node_idx,
                                std::initializer_list<enum ggml_op> ops) {
+    static const bool fusion_debug = parse_bool(get_env_as_lowercase("GGML_CANN_FUSION_DEBUG").value_or(""));
     if ((ops.size() == 2) && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_RMS_NORM) {
         ggml_tensor * add_node       = cgraph->nodes[node_idx];
         ggml_tensor * rms_norm_node  = cgraph->nodes[node_idx + 1];
@@ -3147,9 +3148,18 @@ static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
             add_node->src[0]->ne[2] != add_node->src[1]->ne[2] || add_node->src[0]->ne[3] != add_node->src[1]->ne[3]) {
             return false;
         }
+        if (fusion_debug) {
+            GGML_LOG_DEBUG("cann fuse: ADD+RMS_NORM add='%s' rms='%s' idx=%d\n",
+                           ggml_get_name(add_node), ggml_get_name(rms_norm_node), node_idx);
+        }
         return true;
     }
 
+    if (fusion_debug) {
+        GGML_LOG_DEBUG("cann fuse: reject '%s' node='%s' idx=%d\n",
+                       ggml_op_name(cgraph->nodes[node_idx]->op),
+                       ggml_get_name(cgraph->nodes[node_idx]), node_idx);
+    }
     return false;
 }
 
