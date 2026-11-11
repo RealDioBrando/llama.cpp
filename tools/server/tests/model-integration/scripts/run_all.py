@@ -427,7 +427,18 @@ def main() -> int:
     parser.add_argument("--scenario", choices=["all", "text_10c", "vl_small", "vl_large"], default="all")
     parser.add_argument("--collect-only", action="store_true")
     parser.add_argument("--save-baseline", action="store_true")
-    parser.add_argument("--accuracy-mode", choices=["both", "off", "only"], default="both")
+    parser.add_argument(
+        "--bench-mode",
+        choices=["all", "perf", "accuracy"],
+        default="all",
+        help="benchmarks to run: all, perf, or accuracy",
+    )
+    parser.add_argument(
+        "--accuracy-mode",
+        choices=["both", "off", "only"],
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--accuracy-num-prompts", type=int, default=30)
     parser.add_argument("--accuracy-full", action="store_true")
     parser.add_argument(
@@ -459,6 +470,13 @@ def main() -> int:
         default=os.environ.get("VLLM_VL_MODEL") or DEFAULT_VLLM_VL_MODEL,
     )
     args = parser.parse_args()
+
+    if args.accuracy_mode is not None:
+        if args.bench_mode != "all":
+            parser.error("--accuracy-mode cannot be combined with --bench-mode")
+        args.bench_mode = {"both": "all", "off": "perf", "only": "accuracy"}[args.accuracy_mode]
+    run_perf = args.bench_mode in ("all", "perf")
+    run_accuracy = args.bench_mode in ("all", "accuracy")
 
     scenarios = list(SCENARIOS) if args.scenario == 'all' else [args.scenario]
     engines = ['llama', 'vllm'] if args.engine == 'both' else [args.engine]
@@ -511,9 +529,9 @@ def main() -> int:
                             print(f'ERROR: failed to start vllm server for {scenario}')
                             continue
                         vllm_started.add(port)
-                    if args.accuracy_mode != 'only':
+                    if run_perf:
                         run_benchmark(engine, scenario, ROOT / 'configs', paths)
-                    if args.accuracy_mode != 'off':
+                    if run_accuracy:
                         run_accuracy_benchmark(
                             engine,
                             scenario,
@@ -530,9 +548,9 @@ def main() -> int:
                         print(f'ERROR: failed to start llama server for {scenario}')
                         continue
                     try:
-                        if args.accuracy_mode != 'only':
+                        if run_perf:
                             run_benchmark(engine, scenario, ROOT / 'configs', paths)
-                        if args.accuracy_mode != 'off':
+                        if run_accuracy:
                             run_accuracy_benchmark(
                                 engine,
                                 scenario,
@@ -549,7 +567,7 @@ def main() -> int:
         results[engine] = {}
         for scenario in scenarios:
             results[engine][scenario] = collect(engine, scenario)
-            if args.accuracy_mode != 'off':
+            if run_accuracy:
                 results[engine][scenario].update(collect_accuracy(engine, scenario))
     write_summary(results)
 

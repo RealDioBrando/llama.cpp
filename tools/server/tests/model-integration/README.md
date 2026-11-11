@@ -112,14 +112,14 @@ python scripts/compare_report.py
 Run accuracy only:
 
 ```bash
-python scripts/run_all.py --engine llama --scenario text_10c --accuracy-mode only
-python scripts/run_all.py --engine llama --scenario vl_small --accuracy-mode only
+python scripts/run_all.py --engine llama --scenario text_10c --bench-mode accuracy
+python scripts/run_all.py --engine llama --scenario vl_small --bench-mode accuracy
 ```
 
 Run the full accuracy datasets:
 
 ```bash
-python scripts/run_all.py --engine llama --scenario all --accuracy-mode only --accuracy-full
+python scripts/run_all.py --engine llama --scenario all --bench-mode accuracy --accuracy-full
 ```
 
 Raw AISBench outputs are under `results/<engine>/<scenario>/<timestamp>`. Aggregated data is written to `results/summary.json`, `results/summary.md`, and `results/comparison.md`.
