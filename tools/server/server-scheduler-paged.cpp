@@ -104,16 +104,7 @@ bool server_scheduler_paged::init() {
 
     // warm the clip encoder so the first image request does not pay the
     // clip graph first-compile cost
-    // The synthetic-image warmup can abort on unsupported vision RoPE shapes.
-    // Allow it to be disabled for headless accuracy runs.
-    if (getenv("LLAMA_PAGED_MM_WARMUP") != nullptr) {
-        const char * mm_warmup_env = getenv("LLAMA_PAGED_MM_WARMUP");
-        if (mm_warmup_env[0] != '0') {
-            mm_warmup();
-        }
-    } else {
-        mm_warmup();
-    }
+    mm_warmup();
 
     SRV_INF("%s", "paged scheduler initialized\n");
     return true;
