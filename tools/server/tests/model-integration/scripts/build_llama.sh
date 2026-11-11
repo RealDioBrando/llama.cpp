@@ -37,11 +37,15 @@ if [[ -z "${ATB_SET_ENV}" && -f "${CFG_ASCEND_HOME}/nnal/atb/set_env.sh" ]]; the
 fi
 if [[ -n "${CANN_SET_ENV}" && -f "${CANN_SET_ENV}" ]]; then
   # shellcheck disable=SC1090
+  set +u
   source "${CANN_SET_ENV}"
+  set -u
 fi
 if [[ -n "${ATB_SET_ENV}" && -f "${ATB_SET_ENV}" ]]; then
   # shellcheck disable=SC1090
+  set +u
   source "${ATB_SET_ENV}"
+  set -u
 fi
 
 cmake -S "${LLAMA_SOURCE}" -B "${BUILD_DIR}" \
