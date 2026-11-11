@@ -433,6 +433,16 @@ def main() -> int:
         help="benchmarks to run: all, perf, or accuracy",
     )
     parser.add_argument(
+        "--perf-dataset",
+        default=None,
+        help="perf dataset key from the config datasets section (default: the scenario perf dataset)",
+    )
+    parser.add_argument(
+        "--perf-dataset-path",
+        default=None,
+        help="override the perf dataset file path for the selected scenarios",
+    )
+    parser.add_argument(
         "--accuracy-mode",
         choices=["both", "off", "only"],
         default=None,
@@ -487,6 +497,18 @@ def main() -> int:
     scenarios = list(SCENARIOS) if args.scenario == 'all' else [args.scenario]
     engines = ['llama', 'vllm'] if args.engine == 'both' else [args.engine]
 
+    perf_dataset_path = None
+    if args.perf_dataset is not None:
+        if args.perf_dataset not in CONFIG.get("datasets", {}):
+            parser.error(f"perf dataset not found in config: {args.perf_dataset}")
+        for scenario in scenarios:
+            SCENARIOS[scenario]["dataset"] = args.perf_dataset
+    if args.perf_dataset_path is not None:
+        perf_dataset_path = Path(args.perf_dataset_path).expanduser()
+        if not perf_dataset_path.is_file():
+            parser.error(f"perf dataset path not found: {perf_dataset_path}")
+        perf_dataset_path = perf_dataset_path.resolve()
+
     paths = ModelPaths(
         llama_text_model=Path(args.llama_text_model).expanduser(),
         llama_vl_model=Path(args.llama_vl_model).expanduser(),
@@ -518,42 +540,34 @@ def main() -> int:
         return 2
 
     if not args.collect_only:
-        for engine in engines:
-            if engine == 'vllm':
-                vllm_started = set()
-                for scenario in scenarios:
-                    cfg = VLLM_SERVERS[scenario]
-                    port = cfg['port']
-                    # skip if server already running on same port with same config
-                    need_restart = port not in vllm_started
-                    # vl_small and vl_large share port 18120 but different configs
-                    if port in vllm_started and scenario in ('vl_large',):
-                        need_restart = True
-                        vllm_started.discard(port)
-                    if need_restart:
-                        if not start_vllm_server(scenario, paths):
-                            print(f'ERROR: failed to start vllm server for {scenario}')
-                            continue
-                        vllm_started.add(port)
-                    if run_perf:
-                        run_benchmark(engine, scenario, ROOT / 'configs', paths)
-                    if run_accuracy:
-                        run_accuracy_benchmark(
-                            engine,
-                            scenario,
-                            ROOT / 'configs',
-                            paths,
-                            args.accuracy_num_prompts,
-                            args.accuracy_full,
-                        )
-                stop_vllm_server()
-            else:
-                for scenario in scenarios:
-                    proc = start_server(scenario, paths)
-                    if proc is None and os.environ.get("LLAMA_REUSE_SERVER") != "1":
-                        print(f'ERROR: failed to start llama server for {scenario}')
-                        continue
-                    try:
+        run_override = ROOT / "configs" / ".dataset_override.json"
+        if run_perf and perf_dataset_path is not None:
+            overrides = {}
+            if run_override.is_file():
+                overrides = json.loads(run_override.read_text(encoding="utf-8"))
+            datasets = overrides.setdefault("datasets", {})
+            for scenario in scenarios:
+                datasets[SCENARIOS[scenario]["dataset"]] = {"path": str(perf_dataset_path)}
+            run_override.write_text(json.dumps(overrides, indent=2) + "\n", encoding="utf-8")
+            print(f"perf dataset path override: {perf_dataset_path}")
+        try:
+            for engine in engines:
+                if engine == 'vllm':
+                    vllm_started = set()
+                    for scenario in scenarios:
+                        cfg = VLLM_SERVERS[scenario]
+                        port = cfg['port']
+                        # skip if server already running on same port with same config
+                        need_restart = port not in vllm_started
+                        # vl_small and vl_large share port 18120 but different configs
+                        if port in vllm_started and scenario in ('vl_large',):
+                            need_restart = True
+                            vllm_started.discard(port)
+                        if need_restart:
+                            if not start_vllm_server(scenario, paths):
+                                print(f'ERROR: failed to start vllm server for {scenario}')
+                                continue
+                            vllm_started.add(port)
                         if run_perf:
                             run_benchmark(engine, scenario, ROOT / 'configs', paths)
                         if run_accuracy:
@@ -565,9 +579,31 @@ def main() -> int:
                                 args.accuracy_num_prompts,
                                 args.accuracy_full,
                             )
-                    finally:
-                        if proc is not None:
-                            stop_server(proc)
+                    stop_vllm_server()
+                else:
+                    for scenario in scenarios:
+                        proc = start_server(scenario, paths)
+                        if proc is None and os.environ.get("LLAMA_REUSE_SERVER") != "1":
+                            print(f'ERROR: failed to start llama server for {scenario}')
+                            continue
+                        try:
+                            if run_perf:
+                                run_benchmark(engine, scenario, ROOT / 'configs', paths)
+                            if run_accuracy:
+                                run_accuracy_benchmark(
+                                    engine,
+                                    scenario,
+                                    ROOT / 'configs',
+                                    paths,
+                                    args.accuracy_num_prompts,
+                                    args.accuracy_full,
+                                )
+                        finally:
+                            if proc is not None:
+                                stop_server(proc)
+        finally:
+            if run_override.is_file():
+                run_override.unlink()
     results = {}
     for engine in engines:
         results[engine] = {}

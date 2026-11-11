@@ -51,6 +51,25 @@ New server tuning knobs should be added under `servers.<engine>.defaults` or
 `servers.<engine>.scenarios.<name>`. A scenario value overrides the same field
 in the engine defaults.
 
+## Perf dataset overrides
+
+`run_all.py` can point the perf workload at custom data without editing
+`config.json`:
+
+```bash
+# custom VL image/question jsonl (same format as assets/image_320x320_questions.jsonl)
+python scripts/run_all.py --engine llama --scenario vl_small --bench-mode perf \
+  --perf-dataset-path /path/to/images.jsonl
+
+# custom text perf data (same format as the gsm8k fixed-token dataset)
+python scripts/run_all.py --engine llama --scenario text_10c --bench-mode perf \
+  --perf-dataset-path /path/to/questions.jsonl
+```
+
+`--perf-dataset <key>` selects a different dataset entry from the config
+`datasets` section for the selected scenarios. `--perf-dataset-path` takes
+precedence over the dataset path in the config.
+
 ## Remote layout
 
 The scripts derive the repository root from their own location:

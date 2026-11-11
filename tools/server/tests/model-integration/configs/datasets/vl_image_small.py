@@ -1,15 +1,11 @@
-import json
-from pathlib import Path
-
 from ais_bench.benchmark.openicl.icl_prompt_template import PromptTemplate
 from ais_bench.benchmark.openicl.icl_retriever import ZeroRetriever
 from ais_bench.benchmark.openicl.icl_inferencer import GenInferencer
 
 from config_modules.local_mm_perf import LocalImagePerfDataset, NullEvaluator
+from config_modules.runtime_config import dataset_config
 
-CONFIG_PATH = Path(__file__).resolve().parents[2] / "config.json"
-dataset_cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))["datasets"]["vl_image_small"]
-dataset_cfg["path"] = str((CONFIG_PATH.parent / dataset_cfg["path"]).resolve())
+dataset_cfg = dataset_config("vl_image_small")
 
 
 reader_cfg = dict(input_columns=["question", "image"], output_column="answer")
