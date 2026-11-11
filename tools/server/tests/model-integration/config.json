@@ -22,10 +22,10 @@
       "atb_set_env": "/usr/local/Ascend/nnal/atb/set_env.sh"
     },
     "ais_bench": {
-      "python": "/usr/bin/python3",
+      "python": "/home/common/aisbench-venv/bin/python",
       "module": "ais_bench.benchmark.cli.main",
-      "site_packages": "/home/qzh/.venvs/aisbench/lib/python3.10/site-packages",
-      "source": "/home/z00575061/AISBench-benchmark",
+      "site_packages": "/home/common/aisbench-venv/lib/python3.10/site-packages",
+      "source": "/home/common/AISBench-benchmark",
       "stubs": ""
     }
   },
