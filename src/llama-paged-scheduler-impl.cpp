@@ -459,7 +459,8 @@ void llama_paged_scheduler_impl::process_running_list(llama_sequence_group_raw_l
         uint32_t rows = group->pending_draft.empty() ? 1u : 1u + (uint32_t) group->pending_draft.size();
         const llama_seq_segment * seg = group->segment_at(group->n_past);
         if (seg && seg->is_media) {
-            rows = seg->start_row + seg->n_tokens - group->n_past;
+            // Match the media slice emitted by populate_batch_from().
+            rows = std::min<uint32_t>(seg->start_row + seg->n_tokens - group->n_past, n_batch);
         }
         if (rows > (uint32_t) row_budget) {
             // token budget exhausted; this request decodes on a later step
@@ -540,7 +541,11 @@ void llama_paged_scheduler_impl::process_swapped_list(llama_sequence_group_raw_l
             break;
         }
         // A swapped decode group rejoins with its draft rows, not just one.
-        const uint32_t rows = 1u + (uint32_t) group->pending_draft.size();
+        uint32_t                  rows = 1u + (uint32_t) group->pending_draft.size();
+        const llama_seq_segment * seg  = group->segment_at(group->n_past);
+        if (seg && seg->is_media) {
+            rows = std::min<uint32_t>(seg->start_row + seg->n_tokens - group->n_past, n_batch);
+        }
         if (rows > (uint32_t) row_budget) {
             break;
         }

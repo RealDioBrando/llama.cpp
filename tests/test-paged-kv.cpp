@@ -5,6 +5,7 @@
 #include "llama-linear-prefix-index.h"
 #include "llama-paged-scheduler-impl.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -714,6 +715,141 @@ TEST(test_scheduler_draft_uses_step_budget) {
     EXPECT_TRUE(batch.token[3] == draft[2]);
 }
 
+TEST(test_scheduler_media_spans_batches) {
+    auto fixture = make_fixture(/*n_ctx=*/128, /*block_size=*/16, /*n_batch=*/16,
+                                /*n_gpu_blocks=*/16, /*n_cpu_blocks=*/2);
+    fixture.sched->set_prefix_cache_enabled(false);
+    std::vector<float> embeddings(48 * 4, 1.0f);
+    auto               group = make_group(0, 53);
+    group.has_media          = true;
+    std::fill_n(group.logical_seq.begin() + 2, 48, LLAMA_TOKEN_NULL);
+    llama_seq_segment prefix = {};
+    prefix.n_tokens          = 2;
+    llama_seq_segment media  = {};
+    media.start_row          = 2;
+    media.n_tokens           = 48;
+    media.is_media           = true;
+    media.embd               = embeddings.data();
+    media.embd_stride        = 4;
+    llama_seq_segment suffix = {};
+    suffix.start_row         = 50;
+    suffix.n_tokens          = 3;
+    group.segments           = { prefix, media, suffix };
+    EXPECT_TRUE(fixture.sched->queue_request(std::move(group)));
+
+    llama_batch batch = {};
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_TRUE(batch.n_tokens == 2);
+    fixture.sched->update(&batch, nullptr, 0);
+    for (int chunk = 0; chunk < 3; ++chunk) {
+        EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+        EXPECT_TRUE(batch.n_tokens == 16);
+        EXPECT_TRUE(batch.token == nullptr);
+        EXPECT_TRUE(batch.embd == embeddings.data() + chunk * 16 * 4);
+        fixture.sched->update(&batch, nullptr, 0);
+    }
+}
+
+TEST(test_scheduler_swapped_media_waits_for_batch_budget) {
+    auto fixture = make_fixture(/*n_ctx=*/128, /*block_size=*/16, /*n_batch=*/16,
+                                /*n_gpu_blocks=*/6, /*n_cpu_blocks=*/4);
+    fixture.sched->set_prefix_cache_enabled(false);
+    const llama_token sampled = 42;
+    llama_batch       batch   = {};
+    for (int32_t id = 0; id < 2; ++id) {
+        EXPECT_TRUE(fixture.sched->queue_request(make_group(id, 1)));
+        EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+        EXPECT_TRUE(batch.n_tokens == 1);
+        EXPECT_TRUE(batch.seq_id[0][0] == id);
+        const llama_paged_feedback fb = { id, &sampled, 1, 0 };
+        fixture.sched->update(&batch, &fb, 1);
+    }
+
+    std::vector<float> embeddings(48 * 4, 1.0f);
+    auto               group = make_group(2, 53);
+    group.has_media          = true;
+    std::fill_n(group.logical_seq.begin() + 2, 48, LLAMA_TOKEN_NULL);
+    llama_seq_segment prefix = {};
+    prefix.n_tokens          = 2;
+    llama_seq_segment media  = {};
+    media.start_row          = 2;
+    media.n_tokens           = 48;
+    media.is_media           = true;
+    media.embd               = embeddings.data();
+    media.embd_stride        = 4;
+    llama_seq_segment suffix = {};
+    suffix.start_row         = 50;
+    suffix.n_tokens          = 3;
+    group.segments           = { prefix, media, suffix };
+    EXPECT_TRUE(fixture.sched->queue_request(std::move(group)));
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_TRUE(batch.n_tokens == 2);
+    EXPECT_TRUE(batch.seq_id[0][0] == 2);
+    fixture.sched->update(&batch, nullptr, 0);
+
+    // Expanding request 0 evicts the newer media request to the CPU pool.
+    std::vector<llama_token> draft(15, 43);
+    EXPECT_TRUE(fixture.sched->attach_draft(0, draft.data(), (int32_t) draft.size()));
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_TRUE(batch.n_tokens == 16);
+    EXPECT_TRUE(batch.seq_id[0][0] == 0);
+    auto * restored = fixture.sched->get_group_from_id(2);
+    EXPECT_TRUE(restored != nullptr);
+    EXPECT_TRUE(restored->status == llama_sequence_group_status::SWAPPED);
+    EXPECT_TRUE(restored->n_past == 2);
+    EXPECT_TRUE(restored->block_table.size() == 4);
+    for (const auto block : restored->block_table) {
+        EXPECT_TRUE(block >= 6);
+    }
+    EXPECT_TRUE(fixture.kv->n_free_cpu_blocks() == 0);
+    std::vector<llama_token> accepted(16, 43);
+    accepted.back() = 44;
+    const llama_paged_feedback verified = { 0, accepted.data(), (int32_t) accepted.size(), 0 };
+    fixture.sched->update(&batch, &verified, 1);
+
+    // Free enough GPU blocks so only the remaining 15-row batch budget blocks swap-in.
+    EXPECT_TRUE(fixture.sched->cancel(1));
+    EXPECT_TRUE(fixture.kv->n_free_gpu_blocks() == 4);
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_TRUE(batch.n_tokens == 1);
+    EXPECT_TRUE(batch.token != nullptr);
+    EXPECT_TRUE(batch.seq_id[0][0] == 0);
+    EXPECT_TRUE(restored->status == llama_sequence_group_status::SWAPPED);
+    EXPECT_TRUE(restored->n_past == 2);
+    EXPECT_TRUE(fixture.kv->n_free_cpu_blocks() == 0);
+    const llama_paged_feedback stopped = { 0, &sampled, 1, 1 };
+    fixture.sched->update(&batch, &stopped, 1);
+
+    for (int chunk = 0; chunk < 3; ++chunk) {
+        EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+        EXPECT_TRUE(restored->status == llama_sequence_group_status::RUNNING);
+        EXPECT_TRUE(batch.n_tokens == 16);
+        EXPECT_TRUE(batch.token == nullptr);
+        EXPECT_TRUE(batch.seq_id[0][0] == 2);
+        EXPECT_TRUE(batch.embd == embeddings.data() + chunk * 16 * 4);
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            EXPECT_TRUE(batch.pos[i] == 2 + chunk * 16 + i);
+        }
+        for (const auto block : restored->block_table) {
+            EXPECT_TRUE(block < 6);
+        }
+        EXPECT_TRUE(fixture.kv->n_free_cpu_blocks() == 4);
+        fixture.sched->update(&batch, nullptr, 0);
+        EXPECT_TRUE(restored->n_past == (uint32_t) (2 + (chunk + 1) * 16));
+    }
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_TRUE(batch.n_tokens == 3);
+    EXPECT_TRUE(batch.token != nullptr);
+    EXPECT_TRUE(batch.seq_id[0][0] == 2);
+    EXPECT_TRUE(batch.pos[0] == 50);
+    const llama_paged_feedback finished = { 2, &sampled, 1, 1 };
+    fixture.sched->update(&batch, &finished, 1);
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_TRUE(batch.n_tokens == 0);
+    EXPECT_TRUE(fixture.kv->n_free_gpu_blocks() == 6);
+    EXPECT_TRUE(fixture.kv->n_free_cpu_blocks() == 4);
+}
+
 int main(int /*argc*/, char ** /*argv*/) {
     fprintf(stderr, "test-paged-kv: block_manager\n");
     RUN(test_block_manager_leak_simple);
@@ -751,6 +887,8 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_scheduler_prefix_cache_zero_suffix);
     RUN(test_scheduler_prefix_cache_eviction);
     RUN(test_scheduler_draft_uses_step_budget);
+    RUN(test_scheduler_media_spans_batches);
+    RUN(test_scheduler_swapped_media_waits_for_batch_budget);
 
     fprintf(stderr, "test-paged-kv: ALL PASSED\n");
     return 0;
