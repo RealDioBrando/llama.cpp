@@ -15,16 +15,17 @@ gsm8k_cfg = dict(_config["datasets"]["gsm8k_4k_2k_10"])
 if RUN_OVERRIDE_PATH.is_file():
     _overrides = json.loads(RUN_OVERRIDE_PATH.read_text(encoding="utf-8")).get("datasets", {})
     gsm8k_cfg.update(_overrides.get("gsm8k_4k_2k_10", {}))
-_path = Path(gsm8k_cfg["path"]).expanduser()
-if _path.is_absolute():
-    gsm8k_cfg["path"] = str(_path.resolve())
-elif not _path.as_posix().startswith("aisbench://"):
-    gsm8k_cfg["path"] = str((CONFIG_PATH.parent / _path).resolve())
-else:
+_raw_path = str(gsm8k_cfg["path"]).strip()
+if _raw_path.startswith("aisbench://"):
     _aisbench_source = Path(_config["runtime"]["ais_bench"]["source"]).expanduser()
     gsm8k_cfg["path"] = str(
-        (_aisbench_source / "ais_bench" / gsm8k_cfg["path"][len("aisbench://"):]).resolve()
+        (_aisbench_source / "ais_bench" / _raw_path[len("aisbench://"):]).resolve()
     )
+else:
+    _path = Path(_raw_path).expanduser()
+    if not _path.is_absolute():
+        _path = CONFIG_PATH.parent / _path
+    gsm8k_cfg["path"] = str(_path.resolve())
 
 
 reader_cfg = dict(input_columns=["question"], output_column="answer")
