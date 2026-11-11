@@ -619,6 +619,7 @@ llama_memory_context_ptr llama_kv_cache_paged::init_batch(llama_batch_allocr & b
         // Do not use balloc's internal batch. It does not carry any paged metadata.
         GGML_ASSERT(last_paged_info && "no paged batch info set before init_batch was called.");
         ctx->set_batch_data(*last_paged_info);
+        ctx->derive_current_batch_data();
         return ctx;
     } while (false);
 
