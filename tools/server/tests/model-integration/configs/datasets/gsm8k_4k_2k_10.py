@@ -1,12 +1,28 @@
+import json
+from pathlib import Path
+
 from ais_bench.benchmark.openicl.icl_prompt_template import PromptTemplate
 from ais_bench.benchmark.openicl.icl_retriever import ZeroRetriever
 from ais_bench.benchmark.openicl.icl_inferencer import GenInferencer
 
 from config_modules.fixed_datasets import NullEvaluator
 from config_modules.local_gsm8k import GSM8KFixedTokenDataset
-from config_modules.runtime_config import dataset_config
 
-gsm8k_cfg = dataset_config("gsm8k_4k_2k_10")
+CONFIG_PATH = Path(__file__).resolve().parents[2] / "config.json"
+RUN_OVERRIDE_PATH = Path(__file__).resolve().parents[1] / ".dataset_override.json"
+_config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+gsm8k_cfg = dict(_config["datasets"]["gsm8k_4k_2k_10"])
+if RUN_OVERRIDE_PATH.is_file():
+    _overrides = json.loads(RUN_OVERRIDE_PATH.read_text(encoding="utf-8")).get("datasets", {})
+    gsm8k_cfg.update(_overrides.get("gsm8k_4k_2k_10", {}))
+_path = Path(gsm8k_cfg["path"]).expanduser()
+if _path.is_absolute():
+    gsm8k_cfg["path"] = str(_path.resolve())
+else:
+    _aisbench_source = Path(_config["runtime"]["ais_bench"]["source"]).expanduser()
+    gsm8k_cfg["path"] = str(
+        (_aisbench_source / "ais_bench" / gsm8k_cfg["path"][len("aisbench://"):]).resolve()
+    )
 
 
 reader_cfg = dict(input_columns=["question"], output_column="answer")
