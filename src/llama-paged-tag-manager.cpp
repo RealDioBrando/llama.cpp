@@ -12,9 +12,9 @@ llama_paged_tag_manager::snapshot llama_paged_tag_manager::materialize(
         const std::vector<request_ref> & requests) const {
     snapshot s;
 
-    // owned: reusable blocks grouped by the owner tag stored on the physical
-    // block. collect_tag_blocks() applies the liveness filter (GPU-resident,
-    // still owning the hash; ref_count may be 0 for cache-resident blocks).
+    // owned: every reusable block is filed under each tag in its tag set.
+    // collect_tag_blocks() applies the liveness filter (GPU-resident, still
+    // owning the hash; ref_count may be 0 for cache-resident blocks).
     std::unordered_set<uint32_t> reusable_full;
     full_cache->collect_tag_blocks(s.owned_full, &reusable_full);
     if (linear_cache != nullptr) {

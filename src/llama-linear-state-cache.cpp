@@ -38,6 +38,10 @@ llama_linear_state_cache::llama_linear_state_cache(const llama_model & model,
             &pool);
 
     block_manager.init(n_gpu_blocks, n_cpu_blocks, /*watermark=*/ 0.0f);
+    // The pool kind is fixed by the owner here (init happens in the ctor);
+    // the callback is whatever was staged on the cache, usually nullptr.
+    block_manager.set_pool_kind(LLAMA_PAGED_POOL_LINEAR);
+    block_manager.set_evict_pick_cb(evict_pick_cb_, evict_pick_ud_);
 
     LLAMA_LOG_INFO("%s: linear state cache: %u GPU blocks, %u CPU blocks, %u planes\n", __func__,
                    n_gpu_blocks, n_cpu_blocks, 1 + n_rs_seq);
@@ -130,9 +134,13 @@ bool llama_linear_state_cache::ensure_active(llama_seq_id seq_id, const std::str
         // The tag is an ownership annotation only; an existing ACTIVE state
         // block is never re-tagged (it is not reusable anyway). Repair an
         // empty annotation when the caller supplies one: a failed checkpoint
-        // fork may have dropped it on an earlier attempt.
+        // fork may have dropped it on an earlier attempt. Keep the block's tag
+        // set consistent, but never tag a CPU-resident (swapped) block.
         if (!tag.empty() && seqs[seq_id].tag.empty()) {
             seqs[seq_id].tag = tag;
+            if (block_manager.is_gpu(seqs[seq_id].block_id)) {
+                block_manager.set_tag(seqs[seq_id].block_id, tag);
+            }
         }
         return true;
     }
@@ -143,6 +151,13 @@ bool llama_linear_state_cache::ensure_active(llama_seq_id seq_id, const std::str
         return false;
     }
     mem->zero_state_block(block_id, /*gpu=*/true);
+
+    // Record the owner tag on the physical block. The ACTIVE block is not
+    // reusable, but the tag is part of the block's tag set until the block
+    // loses its cache identity (see prefix-cache-evict-policy.md 2.3).
+    if (!tag.empty()) {
+        block_manager.set_tag(block_id, tag);
+    }
 
     seq_state st;
     st.block_id = block_id;
@@ -206,6 +221,10 @@ bool llama_linear_state_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_
     st.pos      = src->second.pos;
     st.rollback = 0;
     st.tag      = src->second.tag;  // fork inherits the owner tag
+    // The fresh ACTIVE block carries the same tag as ensure_active() does.
+    if (!st.tag.empty()) {
+        block_manager.set_tag(dst_id, st.tag);
+    }
     seqs[seq_id_dst] = st;
     return true;
 }
@@ -359,7 +378,9 @@ bool llama_linear_state_cache::create_checkpoint(llama_seq_id seq_id, uint64_t c
     mem->copy_state_block(it->second.block_id, /*src_gpu=*/true, dst_local, ckpt_gpu);
 
     // Only GPU checkpoints are reusable and therefore visible in the tag ->
-    // block mapping. CPU checkpoints stay untagged.
+    // block mapping. CPU checkpoints stay untagged. set_tag() unions the tag
+    // into the block's sorted set; there is no primary/first tag (tag() only
+    // returns the lowest interned id as a representative).
     if (ckpt_gpu) {
         block_manager.set_tag(ckpt_id, it->second.tag);
     }
@@ -371,6 +392,8 @@ bool llama_linear_state_cache::create_checkpoint(llama_seq_id seq_id, uint64_t c
         checkpoint_index.invalidate_block(old_block);
         if (block_manager.block_has_hash(old_block) &&
             block_manager.block_hash(old_block) == chain_hash) {
+            // The replaced checkpoint loses its cache identity: dropping the
+            // hash also clears its accumulated tag set.
             block_manager.clear_block_hash(old_block);
         }
         if (block_manager.block_ref_count(old_block) > 0) {
@@ -444,6 +467,19 @@ bool llama_linear_state_cache::fork_checkpoint(uint64_t chain_hash, llama_seq_id
     st.rollback = 0;
     st.tag      = owner_tag;
     seqs[seq_id] = st;
+
+    // The request now owns both physical blocks: the restored ACTIVE block and
+    // the source checkpoint, which stays cache-resident and may be forked
+    // again. Record the owner tag on the block's tag set (not just in
+    // seq_state) so an eviction policy can see every tag that used it.
+    if (!owner_tag.empty()) {
+        block_manager.set_tag(active_id, owner_tag);
+        // CPU checkpoints stay untagged, exactly like create_checkpoint():
+        // only GPU-resident checkpoints participate in the tag -> block map.
+        if (block_manager.is_gpu(src_block)) {
+            block_manager.add_tag(src_block, owner_tag);
+        }
+    }
     checkpoint_index.touch(chain_hash);
 
     unpin();
@@ -497,6 +533,10 @@ bool llama_linear_state_cache::swap_in(llama_seq_id seq_id) {
         return false;
     }
     mem->copy_state_block(it->second.block_id - n_gpu_blocks, /*src_gpu=*/false, gpu_id, /*dst_gpu=*/true);
+    // Keep the ACTIVE block's tag consistent with ensure_active()/seq_cp.
+    if (!it->second.tag.empty()) {
+        block_manager.set_tag(gpu_id, it->second.tag);
+    }
     release_block(it->second.block_id);
     it->second.block_id = gpu_id;
     return true;
@@ -534,6 +574,22 @@ const std::string & llama_linear_state_cache::block_tag(uint32_t block_id) const
     return block_manager.tag(block_id);
 }
 
+void llama_linear_state_cache::set_evict_pick_cb(llama_paged_evict_pick_cb cb, void * ud) {
+    // Stored so clear() can re-install them after the block manager is rebuilt.
+    evict_pick_cb_ = cb;
+    evict_pick_ud_ = ud;
+    block_manager.set_pool_kind(LLAMA_PAGED_POOL_LINEAR);
+    block_manager.set_evict_pick_cb(cb, ud);
+}
+
+bool llama_linear_state_cache::gpu_checkout_refused_by_policy() const {
+    return block_manager.gpu_checkout_refused_by_policy();
+}
+
+void llama_linear_state_cache::reset_gpu_checkout_refusal() {
+    block_manager.reset_gpu_checkout_refusal();
+}
+
 void llama_linear_state_cache::collect_tag_blocks(
         std::unordered_map<std::string, std::unordered_set<uint32_t>> & owned) const {
     for (const auto & [chain_hash, e] : checkpoint_index.entries()) {
@@ -541,9 +597,14 @@ void llama_linear_state_cache::collect_tag_blocks(
         if (!checkpoint_is_live(e) || !block_manager.is_gpu(e.block_id)) {
             continue;
         }
-        const std::string & tag = block_manager.tag(e.block_id);
-        if (!tag.empty()) {
-            owned[tag].insert(e.block_id);
+        // Attribute the checkpoint to every tag in its set: tag() is only a
+        // representative (lowest interned id), not an owner.
+        const uint32_t n_tags = block_manager.tag_count(e.block_id);
+        for (uint32_t t = 0; t < n_tags; ++t) {
+            const char * tag = block_manager.tag_at(e.block_id, t);
+            if (tag != nullptr) {
+                owned[tag].insert(e.block_id);
+            }
         }
     }
 }
@@ -642,6 +703,10 @@ void llama_linear_state_cache::clear() {
 
     block_manager = llama_block_manager();
     block_manager.init(n_gpu_blocks, n_cpu_blocks, /*watermark=*/ 0.0f);
+    // The fresh block manager lost the eviction policy: re-install it so that
+    // llama_memory_clear() does not silently disable it.
+    block_manager.set_pool_kind(LLAMA_PAGED_POOL_LINEAR);
+    block_manager.set_evict_pick_cb(evict_pick_cb_, evict_pick_ud_);
 
     rollback_to_reset.clear();
 

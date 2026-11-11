@@ -1918,6 +1918,104 @@ extern "C" {
                                                        llama_paged_on_finish_cb       cb,
                                                        void *                         user_data);
 
+    //
+    // GPU eviction policy (doc docs/kvcache-manager/prefix-cache-evict-policy.md)
+    //
+
+    // GPU free-list node. Opaque in the C API: the pointer chain returned by
+    // llama_paged_free_block_next() is the real free queue (zero copy, no
+    // snapshot). All node pointers are only valid during the callback call.
+    typedef struct llama_paged_free_block llama_paged_free_block;
+
+    LLAMA_API const llama_paged_free_block * llama_paged_free_block_next(
+            const llama_paged_free_block * block);                 // NULL terminates
+    LLAMA_API uint32_t     llama_paged_free_block_id      (const llama_paged_free_block * block);
+    LLAMA_API int32_t      llama_paged_free_block_has_hash(const llama_paged_free_block * block);
+    LLAMA_API uint64_t     llama_paged_free_block_hash    (const llama_paged_free_block * block);
+    // Representative tag (lowest interned id of the block's set), kept for
+    // single-tag callers. Does not imply "first owner". NULL when untagged.
+    LLAMA_API const char * llama_paged_free_block_tag     (const llama_paged_free_block * block);
+    // Full tag set of the node: every tag that used the block while it stayed
+    // cache-resident, deduplicated. tag_at() enumerates them in ascending
+    // interned-id order; tag_count() is 0 for untagged nodes.
+    LLAMA_API uint32_t     llama_paged_free_block_tag_count(const llama_paged_free_block * block);
+    LLAMA_API const char * llama_paged_free_block_tag_at   (const llama_paged_free_block * block, uint32_t index);
+    // Exact tag membership. has_tag() only looks the string up in the
+    // process-wide interner and never inserts it; an unknown tag returns 0.
+    // has_tag_id() is the fast O(log k) path for policies that resolve their
+    // tags once with llama_paged_tag_intern().
+    LLAMA_API int32_t      llama_paged_free_block_has_tag   (const llama_paged_free_block * block, const char * tag);
+    LLAMA_API int32_t      llama_paged_free_block_has_tag_id(const llama_paged_free_block * block, uint32_t tag_id);
+
+    // Process-wide tag interner. Resolve a policy tag once, then query blocks
+    // by id. tag_id 0 = invalid/empty. llama_paged_tag_intern() inserts; tag
+    // ids are stable for the process lifetime (there is no removal).
+    LLAMA_API uint32_t     llama_paged_tag_intern(const char * tag);
+    LLAMA_API const char * llama_paged_tag_name  (uint32_t tag_id);  // NULL for 0/invalid
+
+    // Which GPU pool is asking. Full-attention and linear-state pools have
+    // independent block-id spaces, so the kind MUST be passed to the callback.
+    typedef enum llama_paged_pool_kind {
+        LLAMA_PAGED_POOL_FULL   = 0,   // full-attention KV pool
+        LLAMA_PAGED_POOL_LINEAR = 1,   // linear-state pool (GPU segment)
+    } llama_paged_pool_kind;
+
+    // Batch eviction picker (kv_paged only).
+    //
+    //   ud           user data registered with the setter below
+    //   pool         which GPU pool the head belongs to
+    //   n_needed     minimum number of cache-resident blocks that MUST be
+    //                sacrificed by this allocation (num_blocks - plain_free_blocks)
+    //   head         head of that pool's GPU free list, in queue order
+    //   out_ids      buffer filled by the callback, capacity out_capacity
+    //   out_capacity capacity of out_ids; >= n_needed, and may be larger so the
+    //                callback can deliberately sacrifice a bigger batch
+    //
+    // Traverse with llama_paged_free_block_next(), fill out_ids with the block ids
+    // to sacrifice in sacrifice order, and return the number of ids written.
+    //
+    // Return 0 means "no block may be sacrificed": if n_needed > 0 the allocation
+    // fails atomically and no block is touched (the request stays waiting / gets
+    // preempted). Legacy FIFO behaviour is obtained by NOT installing a callback
+    // (setter with cb == NULL), not by returning 0.
+    //
+    // Runs on the scheduler thread, inside allocation; must not call back into the
+    // scheduler / cache / block manager, and must not mutate the list.
+    typedef uint32_t (*llama_paged_evict_pick_cb)(
+            void *                         ud,
+            llama_paged_pool_kind          pool,
+            uint32_t                       n_needed,
+            const llama_paged_free_block * head,
+            uint32_t *                     out_ids,
+            uint32_t                       out_capacity);
+
+    // Default picker: walk the list and return the first n_needed cache-resident
+    // nodes in queue order ("earliest cached blocks first"). Note this is NOT
+    // byte-identical to legacy FIFO allocation when plain and cached blocks are
+    // interleaved; pass cb == NULL to the setter for exact legacy behaviour.
+    LLAMA_API uint32_t llama_paged_evict_pick_default(void *                         ud,
+                                                      llama_paged_pool_kind          pool,
+                                                      uint32_t                       n_needed,
+                                                      const llama_paged_free_block * head,
+                                                      uint32_t *                     out_ids,
+                                                      uint32_t                       out_capacity);
+
+    // Install an eviction policy on a live scheduler.
+    //
+    // `cb == NULL` restores the legacy FIFO policy. The callback is synchronously
+    // installed on both the full-attention and the linear-state GPU pools and
+    // affects only evictions from that point on (no cache state is rebuilt).
+    //
+    // Threading: must be called from the thread that drives the scheduler, before
+    // llama_paged_scheduler_warmup() / the first step(), or between two steps.
+    // The scheduler takes no lock, so concurrent use with a running step is UB.
+    //
+    // Returns false when `sched` is NULL.
+    LLAMA_API bool llama_paged_scheduler_set_evict_decision(
+            struct llama_paged_scheduler * sched,
+            llama_paged_evict_pick_cb      cb,
+            void *                         user_data);
+
     // Cancel a queued or in-flight request. The request is removed from the
     // scheduler, its blocks are released (CPU-pool blocks included) and the
     // finish callback fires synchronously. Returns false when request_id is

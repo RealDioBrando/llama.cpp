@@ -51,15 +51,33 @@ class llama_kv_cache_paged : public llama_memory_i {
 
     // Prefix cache support: share already populated blocks by reference.
     bool share_blocks(llama_sequence_group & group, const llama_block_ids & src_ids);
-    bool add_ref_blocks(const llama_block_ids & ids);
+    // `tag` (when non-empty) is recorded on every block in the list once the
+    // whole operation succeeds. A block keeps every tag that used it while it
+    // stayed cache-resident; clearing happens only on cache-identity loss.
+    bool add_ref_blocks(const llama_block_ids & ids, const std::string & tag = "");
     // Acquire refs for a block list whose blocks may be either live or
     // cache-resident (ref_count == 0). Cache-resident blocks are taken out of
     // the free queue. All-or-nothing; on failure every acquired ref is undone.
-    bool acquire_blocks(const llama_block_ids & ids);
+    // Tags are added in a second pass, only after the whole acquisition
+    // succeeded.
+    bool acquire_blocks(const llama_block_ids & ids, const std::string & tag = "");
     uint32_t block_ref_count(uint32_t block_id) const;
     bool is_block_gpu(uint32_t block_id) const;
     bool block_has_hash(uint32_t block_id) const;
     uint64_t block_hash(uint32_t block_id) const;
+
+    // GPU eviction policy used when an allocation must sacrifice cache-resident
+    // blocks (docs/kvcache-manager/prefix-cache-evict-policy.md). cb == nullptr
+    // restores the legacy FIFO path. The settings are kept on the cache object
+    // and re-installed whenever clear() rebuilds the block manager. Must be
+    // called from the scheduler thread (the scheduler takes no lock).
+    void set_evict_pick_cb(llama_paged_evict_pick_cb cb, void * ud);
+
+    // True when a GPU checkout failed because the installed eviction picker
+    // refused to name enough victims (expected back-pressure, not capacity
+    // exhaustion). Cleared by reset_gpu_checkout_refusal() once per step.
+    bool gpu_checkout_refused_by_policy() const;
+    void reset_gpu_checkout_refusal();
 
     // Copy the KV content of one allocated block into another allocated
     // block (same pool). Used by fork to give a child its own copy of a
@@ -101,9 +119,9 @@ class llama_kv_cache_paged : public llama_memory_i {
     const std::string & block_tag(uint32_t block_id) const;
 
     // Tag aggregation (query-time materialization, doc tag-kv-block-usage):
-    // walks the live, GPU-resident prefix entries and groups their block ids
-    // by owner tag. `reusable_ids`, when set, receives every live GPU-resident
-    // prefix block id regardless of whether it carries a tag.
+    // walks the live, GPU-resident prefix entries and files each block under
+    // every tag in its tag set. `reusable_ids`, when set, receives every live
+    // GPU-resident prefix block id regardless of whether it carries a tag.
     void collect_tag_blocks(std::unordered_map<std::string, std::unordered_set<uint32_t>> & owned,
                             std::unordered_set<uint32_t> * reusable_ids = nullptr) const;
 
@@ -179,6 +197,12 @@ class llama_kv_cache_paged : public llama_memory_i {
     enum ggml_type kv_type;
 
     llama_block_manager block_manager;
+
+    // Eviction policy registered through set_evict_pick_cb(). Kept here so
+    // clear() can re-install it after rebuilding the block manager; otherwise
+    // llama_memory_clear() would silently drop the policy.
+    llama_paged_evict_pick_cb evict_pick_cb_ = nullptr;
+    void *                    evict_pick_ud_ = nullptr;
 
     // Non-owning pointer to the batch currently being processed.
     // Lifetime: set by the scheduler at the end of step(), cleared at the

@@ -6,6 +6,7 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -70,6 +71,46 @@ bool server_scheduler_paged::init() {
 
     cancelled.assign(port.slot_pool().size(), 0);
 
+    // Test/grayscale hook: LLAMA_SERVER_PAGED_EVICT_PROTECT_TAGS=keep,tenantA
+    // protects every cache-resident block carrying one of these tags from
+    // eviction. Unset or empty keeps the legacy FIFO policy. Install before
+    // warmup so the policy also applies to warmup allocations.
+    const char * env_protect = getenv("LLAMA_SERVER_PAGED_EVICT_PROTECT_TAGS");
+    if (env_protect != nullptr && env_protect[0] != '\0') {
+        std::string tags_str(env_protect);
+        size_t start = 0;
+        while (start <= tags_str.size()) {
+            size_t end = tags_str.find(',', start);
+            if (end == std::string::npos) {
+                end = tags_str.size();
+            }
+            std::string tag = tags_str.substr(start, end - start);
+            const size_t first = tag.find_first_not_of(" \t\r\n");
+            const size_t last  = tag.find_last_not_of(" \t\r\n");
+            if (first != std::string::npos) {
+                tag = tag.substr(first, last - first + 1);
+                evict_protect_tags.push_back(llama_paged_tag_intern(tag.c_str()));
+            }
+            if (end == tags_str.size()) {
+                break;
+            }
+            start = end + 1;
+        }
+
+        if (!evict_protect_tags.empty()) {
+            std::string joined;
+            for (uint32_t tag_id : evict_protect_tags) {
+                const char * tag_name = llama_paged_tag_name(tag_id);
+                if (!joined.empty()) {
+                    joined += ",";
+                }
+                joined += tag_name != nullptr ? tag_name : "";
+            }
+            llama_paged_scheduler_set_evict_decision(sched, evict_pick_protect_tags, this);
+            SRV_INF("paged eviction policy: protecting prefix-cache tags [%s]\n", joined.c_str());
+        }
+    }
+
     llama_paged_scheduler_set_on_finish(sched, on_finish_thunk, this);
 
     if (!llama_paged_scheduler_warmup(sched, ctx)) {
@@ -82,6 +123,44 @@ bool server_scheduler_paged::init() {
 
     SRV_INF("%s", "paged scheduler initialized\n");
     return true;
+}
+
+bool server_scheduler_paged::set_evict_decision(llama_paged_evict_pick_cb cb, void * user_data) {
+    if (sched == nullptr) {
+        return false;
+    }
+    return llama_paged_scheduler_set_evict_decision(sched, cb, user_data);
+}
+
+uint32_t server_scheduler_paged::evict_pick_protect_tags(void * ud, llama_paged_pool_kind /*pool*/,
+                                                         uint32_t n_needed, const llama_paged_free_block * head,
+                                                         uint32_t * out_ids, uint32_t out_capacity) {
+    const auto & protected_tags = static_cast<server_scheduler_paged *>(ud)->evict_protect_tags;
+
+    if (head == nullptr || out_ids == nullptr || out_capacity == 0 || n_needed == 0) {
+        return 0;
+    }
+
+    const uint32_t n_max = std::min(n_needed, out_capacity);
+    uint32_t       n     = 0;
+    for (const llama_paged_free_block * it = head; it != nullptr && n < n_max;
+         it = llama_paged_free_block_next(it)) {
+        // plain blocks are not cache-resident, nothing to protect
+        if (!llama_paged_free_block_has_hash(it)) {
+            continue;
+        }
+        bool protected_block = false;
+        for (uint32_t tag_id : protected_tags) {
+            if (llama_paged_free_block_has_tag_id(it, tag_id)) {
+                protected_block = true;
+                break;
+            }
+        }
+        if (!protected_block) {
+            out_ids[n++] = llama_paged_free_block_id(it);
+        }
+    }
+    return n;
 }
 
 server_slot * server_scheduler_paged::pick_idle_slot() {

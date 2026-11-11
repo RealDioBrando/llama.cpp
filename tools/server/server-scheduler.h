@@ -98,6 +98,10 @@ struct server_scheduler_interface {
     virtual bool get_tag_usage(const std::string & /*tag*/, bool /*include_blocks*/, json & /*out*/) {
         return false;
     }
+
+    // Install a paged prefix-cache eviction policy. Paged-only: the default
+    // report "not supported" so non-paged servers leave the policy untouched.
+    virtual bool set_evict_decision(llama_paged_evict_pick_cb /*cb*/, void * /*ud*/) { return false; }
 };
 
 // returns the paged scheduler when params.kv_paged is set, nullptr otherwise

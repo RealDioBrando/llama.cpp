@@ -237,6 +237,14 @@ public:
         metrics.reset_bucket();
     }
 
+    // forward a paged prefix-cache eviction policy to the scheduling strategy
+    bool set_paged_evict_decision(llama_paged_evict_pick_cb cb, void * user_data) {
+        if (!scheduler) {
+            return false;
+        }
+        return scheduler->set_evict_decision(cb, user_data);
+    }
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -3729,6 +3737,10 @@ void server_context::terminate() {
 
 llama_context * server_context::get_llama_context() const {
     return impl->ctx_tgt;
+}
+
+bool server_context::set_paged_evict_decision(llama_paged_evict_pick_cb cb, void * user_data) {
+    return impl->set_paged_evict_decision(cb, user_data);
 }
 
 server_response_reader server_context::get_response_reader() {

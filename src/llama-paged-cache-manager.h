@@ -34,6 +34,18 @@ class llama_paged_cache_manager {
     void set_prefix_enabled(bool enabled);
     bool prefix_enabled() const;
 
+    // GPU eviction policy installed on both pools (full-attention and, when
+    // present, linear state). cb == nullptr restores the legacy FIFO path.
+    // Servers register once and the facade forwards to the two caches.
+    void set_evict_pick_cb(llama_paged_evict_pick_cb cb, void * ud);
+
+    // True when a GPU allocation in the current step failed only because the
+    // installed eviction picker refused (full or linear pool). The scheduler
+    // uses this to distinguish policy back-pressure from capacity exhaustion.
+    bool gpu_checkout_refused_by_policy() const;
+    // Clears the per-step refusal flag on both caches.
+    void reset_gpu_checkout_refusal();
+
     //
     // Prefix cache
     //

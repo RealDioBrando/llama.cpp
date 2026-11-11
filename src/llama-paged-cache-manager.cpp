@@ -30,6 +30,25 @@ bool llama_paged_cache_manager::prefix_enabled() const {
     return full_cache->prefix_enabled();
 }
 
+void llama_paged_cache_manager::set_evict_pick_cb(llama_paged_evict_pick_cb cb, void * ud) {
+    full_cache->set_evict_pick_cb(cb, ud);
+    if (linear_cache) {
+        linear_cache->set_evict_pick_cb(cb, ud);
+    }
+}
+
+bool llama_paged_cache_manager::gpu_checkout_refused_by_policy() const {
+    return full_cache->gpu_checkout_refused_by_policy() ||
+           (linear_cache && linear_cache->gpu_checkout_refused_by_policy());
+}
+
+void llama_paged_cache_manager::reset_gpu_checkout_refusal() {
+    full_cache->reset_gpu_checkout_refusal();
+    if (linear_cache) {
+        linear_cache->reset_gpu_checkout_refusal();
+    }
+}
+
 uint64_t llama_paged_cache_manager::hash_block(uint64_t                         prev,
                                                const std::vector<llama_token> & tokens,
                                                uint32_t                         block_idx,
@@ -202,7 +221,7 @@ bool llama_paged_cache_manager::reserve_prefix_candidate(llama_sequence_group & 
                 return true;
             }
             // fall through with the refreshed candidate
-            if (!full_cache->acquire_blocks(c2.block_ids)) {
+            if (!full_cache->acquire_blocks(c2.block_ids, group.tag)) {
                 linear_cache->release(seq_id);
                 return false;
             }
@@ -216,7 +235,7 @@ bool llama_paged_cache_manager::reserve_prefix_candidate(llama_sequence_group & 
         }
     }
 
-    if (!full_cache->acquire_blocks(c.block_ids)) {
+    if (!full_cache->acquire_blocks(c.block_ids, group.tag)) {
         if (linear_cache) {
             linear_cache->release(seq_id);
             linear_cache->ensure_active(seq_id, group.tag);

@@ -22,6 +22,7 @@ class server_scheduler_paged final : public server_scheduler_interface {
     void update() override;
     bool get_kv_stats(llama_paged_kv_cache_stats & out) override;
     bool get_tag_usage(const std::string & tag, bool include_blocks, json & out) override;
+    bool set_evict_decision(llama_paged_evict_pick_cb cb, void * user_data) override;
 
   private:
     server_slot * pick_idle_slot();
@@ -47,6 +48,12 @@ class server_scheduler_paged final : public server_scheduler_interface {
     void on_finish(int32_t request_id);
     static void on_finish_thunk(int32_t request_id, const llama_token * tokens, int32_t n_tokens, void * user_data);
 
+    // built-in env-gated policy (LLAMA_SERVER_PAGED_EVICT_PROTECT_TAGS):
+    // skip cache-resident nodes carrying any of the protected tag ids
+    static uint32_t evict_pick_protect_tags(void * ud, llama_paged_pool_kind pool,
+                                            uint32_t n_needed, const llama_paged_free_block * head,
+                                            uint32_t * out_ids, uint32_t out_capacity);
+
     // n_cmpl > 1: fork the prefilled parent into the waiting child slots and
     // sample each child's first token out-of-batch from the parent's logits
     void fork_children(server_slot & parent, int32_t tok_idx,
@@ -65,6 +72,11 @@ class server_scheduler_paged final : public server_scheduler_interface {
     server_context_port & port;
 
     llama_paged_scheduler * sched = nullptr;
+
+    // interned ids of the built-in eviction policy's protected tags. Owned
+    // here (not by the scheduler) so they outlive it; the callback user data
+    // is `this`.
+    std::vector<uint32_t> evict_protect_tags;
 
     // owned and recycled by llama_paged_scheduler_prepare_batch
     llama_batch paged_batch = {};

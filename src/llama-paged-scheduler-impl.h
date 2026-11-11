@@ -40,6 +40,9 @@ class llama_paged_scheduler_impl {
     bool                   append_segment(int32_t request_id, const llama_paged_segment & seg);
     void update(const llama_batch * batch, const llama_paged_feedback * feedback, int32_t n_feedback);
     void set_on_finish(llama_paged_on_finish_cb cb, void * user_data);
+    // Install (or, with cb == nullptr, uninstall) the GPU eviction picker on
+    // both paged caches. Must run on the scheduler thread, not during step().
+    void set_evict_decision(llama_paged_evict_pick_cb cb, void * user_data);
     bool cancel(int32_t request_id);
     bool fork_request(int32_t src_id, int32_t dst_id);
     bool attach_draft(int32_t request_id, const llama_token * draft, int32_t n_draft);

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "llama.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -17,8 +19,56 @@
 // The free queue is an intrusive FIFO (doubly linked) because the cache wants
 // prefix-preserving eviction (release in reverse order) and O(1) touch/removal
 // when a free cached block is reused.
+
+// Free-queue node. This is also the concrete type behind the opaque C API type
+// `llama_paged_free_block` (declared in include/llama.h): an eviction picker
+// callback receives the head of the real free queue and walks it through
+// llama_paged_free_block_next() - zero copy, no snapshot.
+//
+// Node addresses are stable for the lifetime of the owning registry: the
+// registry vectors are only resized inside llama_block_manager::init(), never
+// while a node pointer (internal or handed to a callback) is alive.
+struct llama_paged_free_block {
+    uint32_t id        = 0;
+    uint32_t ref_count = 0;
+    bool     is_gpu    = false;
+
+    // Prefix-cache identity. `has_hash` is the authoritative "cache resident"
+    // bit; `hash` is the chain hash registered for this block.
+    bool     has_hash  = false;
+    uint64_t hash      = 0;
+
+    // Every tag that has used this block while it stayed cache-resident
+    // (historical union, not just the current owner). Only GPU blocks are
+    // tagged: the CPU pool does not participate in eviction and is being
+    // refactored. Tag strings are interned
+    // process-wide into stable uint32_t ids; this vector is sorted and
+    // deduplicated, so membership is O(log k) and indexed enumeration is O(1).
+    // No "first owner" is tracked. The set survives free() while the block
+    // keeps its hash and is cleared when the hash is dropped or a non-cached
+    // block is freed.
+    std::vector<uint32_t> tag_ids;
+
+
+    // Intrusive free-queue links (raw node pointers, nullptr = none).
+    bool                     in_free = false;
+    llama_paged_free_block * prev    = nullptr;
+    llama_paged_free_block * next    = nullptr;
+};
+
 class llama_block_manager {
   public:
+    // The free lists are stored as raw node pointers into the two registry
+    // vectors below. Copying the object would deep-copy the vectors but leave
+    // the copied links pointing into the source buffers, so copying is not
+    // allowed. Moves are fine: the vector buffers (and therefore the nodes)
+    // are stolen as a whole, so the link pointers stay valid in the target.
+    llama_block_manager()                                        = default;
+    llama_block_manager(const llama_block_manager &)             = delete;
+    llama_block_manager & operator=(const llama_block_manager &) = delete;
+    llama_block_manager(llama_block_manager &&)                  = default;
+    llama_block_manager & operator=(llama_block_manager &&)      = default;
+
     // Emitted when a checkout pops a cache-resident block. The hash entry must
     // be removed from the owning prefix index before the block is reused.
     struct evicted_block {
@@ -26,27 +76,31 @@ class llama_block_manager {
         uint32_t block_id  = 0;
     };
 
+    // Eviction policy for GPU checkouts (see
+    // docs/kvcache-manager/prefix-cache-evict-policy.md). The callback is only
+    // invoked when the current allocation MUST sacrifice cache-resident blocks;
+    // `evict_pick_cb == nullptr` keeps the legacy FIFO behaviour unchanged.
+    //
+    // The cache owning this block manager installs both the callback and the
+    // pool kind (full-attention vs linear-state block-id spaces overlap, so the
+    // kind must come from the owner).
+    llama_paged_evict_pick_cb evict_pick_cb = nullptr;
+    void *                    evict_pick_ud = nullptr;
+    llama_paged_pool_kind     pool_kind     = LLAMA_PAGED_POOL_FULL;
+
+    void set_evict_pick_cb(llama_paged_evict_pick_cb cb, void * ud);
+    void set_pool_kind(llama_paged_pool_kind kind);
+
+    // True when a GPU checkout failed only because the installed eviction
+    // picker refused to name enough victims (design §8.4). That is expected
+    // back-pressure, not capacity exhaustion, so the scheduler must not treat
+    // it as a deadlock. The flag accumulates until reset by its owner (once per
+    // scheduling step) and is cleared by init().
+    bool gpu_checkout_refused_by_policy() const;
+    void reset_gpu_checkout_refusal();
+
   private:
-    struct physical_block {
-        uint32_t id         = 0;
-        uint32_t ref_count  = 0;
-        bool     is_gpu     = false;
-
-        // Prefix-cache identity. `has_hash` is the authoritative "cache
-        // resident" bit; `hash` is the chain hash registered for this block.
-        bool     has_hash   = false;
-        uint64_t hash       = 0;
-
-        // Owner tag of the request that first checked this block out. It
-        // survives free() while the block stays cache-resident, and is
-        // cleared when the hash is dropped or a non-cached block is freed.
-        std::string tag;
-
-        // Intrusive free-queue links (global block ids; -1 = none).
-        bool    in_free = false;
-        int32_t prev    = -1;
-        int32_t next    = -1;
-    };
+    using physical_block = llama_paged_free_block;
 
     using physical_block_bool = std::vector<physical_block>;
     using physical_block_ids  = std::vector<uint32_t>;
@@ -55,15 +109,17 @@ class llama_block_manager {
     physical_block_bool cpu_registry;
 
     // Free queues (FIFO): pop_front for allocation, push_back for release.
-    int32_t free_head_gpu = -1;
-    int32_t free_tail_gpu = -1;
-    int32_t free_head_cpu = -1;
-    int32_t free_tail_cpu = -1;
+    physical_block * free_head_gpu = nullptr;
+    physical_block * free_tail_gpu = nullptr;
+    physical_block * free_head_cpu = nullptr;
+    physical_block * free_tail_cpu = nullptr;
 
     size_t n_free_gpu = 0;   // queue length (includes cache-resident blocks)
     size_t n_free_cpu = 0;
     size_t n_cached_gpu = 0; // subset of n_free_gpu with has_hash == true
     size_t n_cached_cpu = 0;
+
+    bool gpu_checkout_refused_by_policy_ = false;
 
     uint32_t watermark_gpu_safety_num_blocks;
     uint32_t watermark_cpu_safety_num_blocks;
@@ -74,9 +130,20 @@ class llama_block_manager {
     physical_block *       block_at(uint32_t id);
     const physical_block * block_at(uint32_t id) const;
 
-    void     queue_push_back(uint32_t id);
-    uint32_t queue_pop_front(bool gpu);
-    void     queue_remove(uint32_t id);
+    // Drop the whole tag set. Must be called exactly
+    // where cache identity is lost, never while the block keeps has_hash.
+    void clear_tags(physical_block & b);
+
+    // Intrusive FIFO primitives, node-pointer based.
+    void            queue_push_back(physical_block * b);
+    physical_block * queue_pop_front(bool gpu);
+    void            queue_remove(physical_block * b);
+
+    // GPU checkout helpers. "plain" means !has_hash, i.e. NOT cache-resident.
+    physical_block_ids pop_front_n_gpu(uint32_t num_blocks,
+                                       std::vector<evicted_block> * evicted);
+    physical_block *   pop_front_plain_gpu();
+    physical_block_ids pop_front_plain_n_gpu(uint32_t num_blocks);
 
   public:
     void init(uint32_t n_gpu, uint32_t n_cpu, float watermark);
@@ -90,11 +157,19 @@ class llama_block_manager {
     size_t n_allocatable_cpu_blocks() const;
     size_t n_cached_gpu_blocks() const;
 
+    // Number of GPU free-queue nodes with has_hash == false (O(1) from the
+    // n_free_gpu / n_cached_gpu counters).
+    size_t n_plain_free_gpu_blocks() const;
+
     bool has_free_gpu_blocks(uint32_t num_requested_blocks) const;
     bool has_free_cpu_blocks(uint32_t num_requested_blocks) const;
 
     // Allocation. Cache-resident victims are reported through `evicted` (GPU
     // only; CPU blocks are not part of the prefix index in this phase).
+    //
+    // When an eviction callback is installed, GPU checkout either sacrifices
+    // exactly the blocks named by the callback or fails atomically (empty
+    // result, no block touched). Plain free blocks are never sacrificed.
     physical_block_ids checkout_gpu_blocks(uint32_t num_blocks,
                                            std::vector<evicted_block> * evicted = nullptr);
     physical_block_ids checkout_cpu_blocks(uint32_t num_blocks,
@@ -117,11 +192,26 @@ class llama_block_manager {
     void     set_block_hash(uint32_t id, uint64_t hash);
     void     clear_block_hash(uint32_t id);
 
-    // Owner tag of the block that first checked it out. Writing a tag on a
-    // free non-cached block is a caller bug and only produces a warning.
+    // Add a tag to the block's tag set (deduplicated, sorted by interned id).
+    // There is no primary/first-owner tag: tag() below returns the lowest
+    // interned id only as a representative for legacy single-tag callers.
+    // Writing a tag on a free non-cached block is a caller bug and only
+    // produces a warning; an empty tag is ignored.
     void set_tag(uint32_t id, const std::string & tag);
+    void add_tag(uint32_t id, const std::string & tag);
 
-    // Returns an empty string for free/unknown blocks and out-of-range ids.
+    // Binary search over the block's interned tag ids.
+    bool has_tag_id(uint32_t id, uint32_t tag_id) const;
+
+    // Number of tags currently recorded on the block (0 for free/unknown ids).
+    uint32_t tag_count(uint32_t id) const;
+
+    // Interned name of the index-th tag, nullptr when out of range.
+    const char * tag_at(uint32_t id, uint32_t index) const;
+
+    // Representative tag name (lowest interned id of the set, not necessarily
+    // the tag written first to this block), for legacy single-tag callers.
+    // Empty string for free/unknown blocks and for blocks with no tags.
     const std::string & tag(uint32_t id) const;
 
     void release_gpu_blocks(const physical_block_ids & freed_blocks);

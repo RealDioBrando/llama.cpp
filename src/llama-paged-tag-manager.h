@@ -12,8 +12,12 @@
 #include <vector>
 
 // Aggregated KV footprint of one owner tag (doc tag-kv-block-usage):
-//   full_blocks   - live, reusable full-attention blocks owned by the tag;
-//   linear_blocks - live GPU checkpoints owned by the tag.
+//   full_blocks   - live, reusable full-attention blocks whose tag set
+//                   contains the tag;
+//   linear_blocks - live GPU checkpoints whose tag set contains the tag.
+// A block used by several tags is attributed to each of them (there is no
+// first-owner/primary tag), so per-tag counts are memberships and are not
+// additive across tags.
 // Shared references are exposed as block ids only and never counted.
 struct llama_paged_tag_usage {
     uint64_t full_blocks   = 0;
@@ -38,14 +42,14 @@ struct llama_paged_pool_stats {
 //
 // Only *reusable* blocks count: live, GPU-resident full prefix-index blocks
 // and live GPU checkpoints. Partial tail blocks, linear ACTIVE state blocks,
-// CPU-pool blocks and swapped blocks are invisible. The owner tag itself is
+// CPU-pool blocks and swapped blocks are invisible. The interned tag set is
 // stored on the physical block by llama_block_manager; this class keeps no
 // state of its own and materializes a snapshot per query:
 //
-//   1. owned_*    : reusable blocks grouped by their physical owner tag
-//                   (llama_kv_cache_paged / llama_linear_state_cache);
+//   1. owned_*    : reusable blocks grouped by every tag in the block's tag
+//                   set (llama_kv_cache_paged / llama_linear_state_cache);
 //   2. shared_full: block-table entries of tagged requests that point at a
-//                   reusable block owned by someone else.
+//                   reusable block whose tag set does not contain that tag.
 //
 // Because shared references are derived on demand, a request finishing only
 // drops its own shared entries; the owner mapping is unaffected as long as

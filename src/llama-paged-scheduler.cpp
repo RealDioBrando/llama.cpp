@@ -317,6 +317,40 @@ LLAMA_API void llama_paged_scheduler_set_on_finish(struct llama_paged_scheduler 
     sched->impl.set_on_finish(cb, user_data);
 }
 
+LLAMA_API bool llama_paged_scheduler_set_evict_decision(struct llama_paged_scheduler * sched,
+                                                        llama_paged_evict_pick_cb      cb,
+                                                        void *                         user_data) {
+    if (!sched) {
+        return false;
+    }
+    sched->impl.set_evict_decision(cb, user_data);
+    return true;
+}
+
+LLAMA_API uint32_t llama_paged_evict_pick_default(void *                         ud,
+                                                  llama_paged_pool_kind          pool,
+                                                  uint32_t                       n_needed,
+                                                  const llama_paged_free_block * head,
+                                                  uint32_t *                     out_ids,
+                                                  uint32_t                       out_capacity) {
+    (void) ud;
+    (void) pool;
+    if (head == nullptr || out_ids == nullptr || out_capacity == 0 || n_needed == 0) {
+        return 0;
+    }
+
+    const uint32_t n_max = std::min(n_needed, out_capacity);
+    uint32_t       n     = 0;
+    for (const llama_paged_free_block * it = head; it != nullptr && n < n_max;
+         it = llama_paged_free_block_next(it)) {
+        if (!llama_paged_free_block_has_hash(it)) {
+            continue;
+        }
+        out_ids[n++] = llama_paged_free_block_id(it);
+    }
+    return n;
+}
+
 LLAMA_API bool llama_paged_scheduler_get_seq_state(struct llama_paged_scheduler * sched,
                                                    int32_t                        request_id,
                                                    struct llama_paged_seq_state * out_state) {

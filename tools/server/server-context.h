@@ -110,6 +110,11 @@ struct server_context {
 
     // note: must be set before load_model() is called
     void set_state_callback(server_state_callback_t callback);
+
+    // Install a paged prefix-cache eviction policy. Paged scheduler only.
+    // Must be called on the main loop thread, outside update().
+    // Returns false when there is no paged scheduler.
+    bool set_paged_evict_decision(llama_paged_evict_pick_cb cb, void * user_data);
 };
 
 

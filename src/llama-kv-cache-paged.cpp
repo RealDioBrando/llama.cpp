@@ -126,6 +126,26 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
 
     // Setting up our block accountant
     block_manager.init(n_gpu_blocks, n_cpu_blocks, watermark);
+    // The pool kind is fixed by the owner; the callback is whatever was staged
+    // on the cache (a no-op when init() runs before the setter, as usual).
+    block_manager.set_pool_kind(LLAMA_PAGED_POOL_FULL);
+    block_manager.set_evict_pick_cb(evict_pick_cb_, evict_pick_ud_);
+}
+
+void llama_kv_cache_paged::set_evict_pick_cb(llama_paged_evict_pick_cb cb, void * ud) {
+    // Stored so clear() can re-install them after the block manager is rebuilt.
+    evict_pick_cb_ = cb;
+    evict_pick_ud_ = ud;
+    block_manager.set_pool_kind(LLAMA_PAGED_POOL_FULL);
+    block_manager.set_evict_pick_cb(cb, ud);
+}
+
+bool llama_kv_cache_paged::gpu_checkout_refused_by_policy() const {
+    return block_manager.gpu_checkout_refused_by_policy();
+}
+
+void llama_kv_cache_paged::reset_gpu_checkout_refusal() {
+    block_manager.reset_gpu_checkout_refusal();
 }
 
 bool llama_kv_cache_paged::allocate(int32_t num_tokens, llama_sequence_group & group) {
@@ -150,8 +170,14 @@ bool llama_kv_cache_paged::allocate(int32_t num_tokens, llama_sequence_group & g
     // index entries before the blocks are handed out.
     llama_block_ids new_ids = checkout_gpu_blocks(num_requested_blocks);
     if (new_ids.size() != num_requested_blocks) {
-        LLAMA_LOG_ERROR("%s: checkout returned %zu of %d blocks.\n", __func__, new_ids.size(), num_requested_blocks);
-        if (!new_ids.empty()) {
+        if (new_ids.empty()) {
+            // An installed eviction policy may legitimately refuse to sacrifice
+            // cache-resident blocks (design §8.4): the request simply stays
+            // waiting, so this is expected back-pressure, not an error.
+            LLAMA_LOG_DEBUG("%s: GPU checkout refused %d block(s); request stays waiting.\n", __func__,
+                            num_requested_blocks);
+        } else {
+            LLAMA_LOG_ERROR("%s: checkout returned %zu of %d blocks.\n", __func__, new_ids.size(), num_requested_blocks);
             block_manager.release_gpu_blocks(new_ids);
         }
         return false;
@@ -383,6 +409,14 @@ bool llama_kv_cache_paged::swap_in(llama_sequence_group & group) {
 
     free_blocks(group);
     group.block_table = std::move(new_ids);
+
+    // The restored GPU copies are private and unhashed. Record the requesting
+    // tag so the block keeps the full set of tags that used it while it stays
+    // cache-resident. set_tag is allowed here: every restored block is owned
+    // by the group (ref_count > 0).
+    for (const uint32_t id : group.block_table) {
+        block_manager.set_tag(id, group.tag);
+    }
     return true;
 }
 
@@ -458,9 +492,16 @@ void llama_kv_cache_paged::collect_tag_blocks(
         if (reusable_ids) {
             reusable_ids->insert(id);
         }
-        const std::string & tag = block_manager.tag(id);
-        if (!tag.empty()) {
-            owned[tag].insert(id);
+        // Attribute the block to EVERY tag that used it while cache-resident.
+        // With the multi-tag model there is no owner/primary tag, and tag()
+        // would expose only the lowest interned id, silently dropping the
+        // others from the per-tag statistics.
+        const uint32_t n_tags = block_manager.tag_count(id);
+        for (uint32_t t = 0; t < n_tags; ++t) {
+            const char * tag = block_manager.tag_at(id, t);
+            if (tag != nullptr) {
+                owned[tag].insert(id);
+            }
         }
     }
 }
@@ -471,14 +512,14 @@ void llama_kv_cache_paged::concat_block_ids(llama_block_ids &       to_block_tab
 }
 
 bool llama_kv_cache_paged::share_blocks(llama_sequence_group & group, const llama_block_ids & src_ids) {
-    if (!add_ref_blocks(src_ids)) {
+    if (!add_ref_blocks(src_ids, group.tag)) {
         return false;
     }
     concat_block_ids(group.block_table, src_ids);
     return true;
 }
 
-bool llama_kv_cache_paged::add_ref_blocks(const llama_block_ids & ids) {
+bool llama_kv_cache_paged::add_ref_blocks(const llama_block_ids & ids, const std::string & tag) {
     llama_block_ids added;
     added.reserve(ids.size());
     for (const uint32_t id : ids) {
@@ -496,10 +537,17 @@ bool llama_kv_cache_paged::add_ref_blocks(const llama_block_ids & ids) {
         }
         added.push_back(id);
     }
+    // Tag only after the whole operation succeeded: on failure the caller gets
+    // its refs back and the blocks must not have picked up a phantom tag.
+    if (!tag.empty()) {
+        for (const uint32_t id : ids) {
+            block_manager.set_tag(id, tag);
+        }
+    }
     return true;
 }
 
-bool llama_kv_cache_paged::acquire_blocks(const llama_block_ids & ids) {
+bool llama_kv_cache_paged::acquire_blocks(const llama_block_ids & ids, const std::string & tag) {
     llama_block_ids acquired;
     acquired.reserve(ids.size());
     for (const uint32_t id : ids) {
@@ -518,6 +566,13 @@ bool llama_kv_cache_paged::acquire_blocks(const llama_block_ids & ids) {
             return false;
         }
         acquired.push_back(id);
+    }
+    // Second pass: record the requesting tag only once the whole acquisition
+    // succeeded, so an atomic failure leaves every tag set untouched.
+    if (!tag.empty()) {
+        for (const uint32_t id : ids) {
+            block_manager.set_tag(id, tag);
+        }
     }
     return true;
 }
@@ -679,6 +734,10 @@ void llama_kv_cache_paged::clear(bool data) {
 
     block_manager = llama_block_manager();
     block_manager.init(num_gpu_blocks, num_cpu_blocks, watermark);
+    // The fresh block manager lost the eviction policy: re-install it so that
+    // llama_memory_clear() does not silently disable it.
+    block_manager.set_pool_kind(LLAMA_PAGED_POOL_FULL);
+    block_manager.set_evict_pick_cb(evict_pick_cb_, evict_pick_ud_);
 
     if (data) {
         for (const auto * pool : { &k_gpu_layers, &v_gpu_layers, &k_cpu_layers, &v_cpu_layers }) {
