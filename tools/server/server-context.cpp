@@ -3705,6 +3705,39 @@ llama_context * server_context::get_llama_context() const {
     return impl->ctx_tgt;
 }
 
+server_tokens server_context::tokenize_with_rgb_image(const std::string & prompt,
+                                                      const unsigned char * rgb,
+                                                      uint32_t width,
+                                                      uint32_t height) const {
+    if (impl->mctx == nullptr || rgb == nullptr || width == 0 || height == 0) {
+        return server_tokens();
+    }
+
+    // build a bitmap straight from the pixels - no stb_image decode, no container header
+    mtmd::bitmaps bitmaps;
+    bitmaps.entries.emplace_back(width, height, rgb);
+    if (bitmaps.entries.back().ptr == nullptr) {
+        return server_tokens();
+    }
+
+    mtmd_input_text inp_txt = {
+        prompt.data(),
+        prompt.size(),
+        /* add_special   */ true,
+        /* parse_special */ true,
+    };
+
+    mtmd::input_chunks chunks(mtmd_input_chunks_init());
+    auto bitmaps_c_ptr = bitmaps.c_ptr();
+    const int32_t tokenized = mtmd_tokenize(impl->mctx, chunks.ptr.get(), &inp_txt,
+                                            bitmaps_c_ptr.data(), bitmaps_c_ptr.size());
+    if (tokenized != 0) {
+        return server_tokens();
+    }
+
+    return server_tokens(chunks, true);
+}
+
 server_response_reader server_context::get_response_reader() {
     return impl->get_response_reader();
 }
