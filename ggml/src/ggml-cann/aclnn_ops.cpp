@@ -90,6 +90,7 @@
 #include <aclnnop/aclnn_logical_not.h>
 #include <aclnnop/aclnn_masked_fill_scalar.h>
 #include <aclnnop/aclnn_upsample_nearest_2d.h>
+#include <aclnnop/aclnn_upsample_bilinear_2d.h>
 #include <aclnnop/aclnn_weight_quant_batch_matmul_v2.h>
 #include <aclnnop/level2/aclnn_dynamic_quant.h>
 #include <aclnnop/level2/aclnn_quant_matmul_v5.h>
@@ -944,6 +945,22 @@ void ggml_cann_upsample_nearest2d(ggml_backend_cann_context & ctx, ggml_tensor *
     acl_int_array_ptr    output_size_array = ggml_cann_create_int_array(output_size.data(), 2);
 
     GGML_CANN_CALL_ACLNN_OP(ctx, UpsampleNearest2d, acl_src.get(), output_size_array.get(), acl_dst.get());
+}
+
+void ggml_cann_upsample_bilinear2d(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+    ggml_tensor *  src     = dst->src[0];
+    acl_tensor_ptr acl_src = ggml_cann_create_tensor(src, nullptr, nullptr, 0, ACL_FORMAT_NCHW);
+    acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst, nullptr, nullptr, 0, ACL_FORMAT_NCHW);
+
+    const bool align_corners = (ggml_get_op_params_i32(dst, 0) & GGML_SCALE_FLAG_ALIGN_CORNERS) != 0;
+    const double scales_h   = (double) dst->ne[1] / (double) src->ne[1];
+    const double scales_w   = (double) dst->ne[0] / (double) src->ne[0];
+
+    std::vector<int64_t> output_size{ dst->ne[1], dst->ne[0] };
+    acl_int_array_ptr    output_size_array = ggml_cann_create_int_array(output_size.data(), 2);
+
+    GGML_CANN_CALL_ACLNN_OP(ctx, UpsampleBilinear2d, acl_src.get(), output_size_array.get(), align_corners,
+                            scales_h, scales_w, acl_dst.get());
 }
 
 /**
@@ -2477,9 +2494,7 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
                                         bcast_weight_nb[3], bcast_weight_nb[4], bcast_weight_nb[5] };
     acl_tensor_ptr acl_weight_tensor;
 
-    // Only check env once.
-    static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
-    bool used_tied_copy = false;
+    aclFormat weight_format = ACL_FORMAT_ND;
 #ifdef ASCEND_310P
     // The tied lm head (token_embd.weight) keeps its ND data for GET_ROWS;
     // mul_mat reads a separate FRACTAL_NZ copy prepared once at weight-load
@@ -2491,21 +2506,66 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor * 
             acl_weight_tensor = ggml_cann_create_tensor(it->second->buffer, ACL_FLOAT16, sizeof(uint16_t),
                                                         transpose_ne, transpose_nb, n_dims,
                                                         ACL_FORMAT_FRACTAL_NZ);
-            used_tied_copy = true;
+            weight_format = ACL_FORMAT_FRACTAL_NZ;
         }
     }
 #endif
 
-    if (!used_tied_copy && weight_to_nz && weight->type != GGML_TYPE_BF16 &&
-        ggml_cann_is_weight_layout_candidate(weight)) {
+    if (weight_format == ACL_FORMAT_ND && ggml_cann_is_weight_layout_candidate(weight)) {
         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_FRACTAL_NZ);
-    } else if (!used_tied_copy) {
+        weight_format = ACL_FORMAT_FRACTAL_NZ;
+    }
+    if (weight_format == ACL_FORMAT_ND) {
         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_ND);
     }
     acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst, bcast_dst_ne, bcast_dst_nb, n_dims);
 
     switch (n_dims) {
         case 2:
+#ifdef ASCEND_310P
+            if (input->type == GGML_TYPE_F16 && input->ne[1] > 1 &&
+                weight_format == ACL_FORMAT_FRACTAL_NZ) {
+                // aclnnMatmul is the F16/NZ prefill fast path. CANN tiling
+                // rejects some M and mat2 shape combinations (M=2048 with
+                // K=2560/N=4096 is one), while ND mat2 or other NZ shapes
+                // can pass. Probe the executor first and use the stable
+                // F32-activation Mm path for rejected shapes.
+                uint64_t       probe_ws   = 0;
+                aclOpExecutor * probe_exec = nullptr;
+                if (aclnnMatmulGetWorkspaceSize(acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(),
+                                                2, &probe_ws, &probe_exec) == ACL_SUCCESS) {
+                    GGML_CANN_CALL_ACLNN_OP(ctx, Matmul, acl_input_tensor.get(), acl_weight_tensor.get(),
+                                            acl_dst.get(), 2);
+                    break;
+                }
+
+                // Fallback: cast the F16 activation to F32, run the stable
+                // aclnnMm over the NZ weight, then cast the F32 result back.
+                ggml_cann_pool_alloc f32_input_allocator(ctx.pool());
+                ggml_cann_pool_alloc f32_dst_allocator(ctx.pool());
+                const size_t input_elems = (size_t) bcast_input_ne[0] * bcast_input_ne[1];
+                const size_t dst_elems   = (size_t) bcast_dst_ne[0] * bcast_dst_ne[1];
+                void * f32_input = f32_input_allocator.alloc(input_elems * sizeof(float));
+                void * f32_dst   = f32_dst_allocator.alloc(dst_elems * sizeof(float));
+
+                size_t f32_input_nb[GGML_MAX_DIMS * 2];
+                size_t f32_dst_nb[GGML_MAX_DIMS * 2];
+                for (int64_t i = 0; i < n_dims; ++i) {
+                    f32_input_nb[i] = bcast_input_nb[i] * 2;
+                    f32_dst_nb[i]   = bcast_dst_nb[i] * 2;
+                }
+
+                acl_tensor_ptr f32_input_tensor = ggml_cann_create_tensor(f32_input, ACL_FLOAT, sizeof(float),
+                                                                          bcast_input_ne, f32_input_nb, n_dims);
+                acl_tensor_ptr f32_dst_tensor   = ggml_cann_create_tensor(f32_dst, ACL_FLOAT, sizeof(float),
+                                                                          bcast_dst_ne, f32_dst_nb, n_dims);
+                aclnn_cast(ctx, acl_input_tensor.get(), f32_input_tensor.get(), ACL_FLOAT);
+                GGML_CANN_CALL_ACLNN_OP(ctx, Mm, f32_input_tensor.get(), acl_weight_tensor.get(),
+                                        f32_dst_tensor.get(), 2);
+                aclnn_cast(ctx, f32_dst_tensor.get(), acl_dst.get(), ACL_FLOAT16);
+                break;
+            }
+#endif
             GGML_CANN_CALL_ACLNN_OP(ctx, Mm, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(), 2);
             break;
         case 3:
@@ -3631,7 +3691,7 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     // The composite path below only supports full-width rotation
     // (n_dims == ne[0]); partial rope falls through to the generic
     // RotaryPositionEmbedding path (head/tail split).
-    if (!has_tail) {
+    if (!has_tail && n_dims == src0->ne[0]) {
     // Special ROPE operation for 310P
 
     // roll input
@@ -3717,7 +3777,7 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     }
 
     // TODO: n_dims < ne0
-    GGML_ASSERT(n_dims == src0->ne[0]);
+    GGML_ASSERT(n_dims == src0->ne[0] || is_vision || mrope_used);
 
     // input * scale
     ggml_cann_pool_alloc roll_mul_scale_allocator(ctx.pool(), ggml_nbytes(src0));
@@ -3805,6 +3865,22 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     // Step 2: Prepare head tensors for tail splitting if needed
     acl_tensor_ptr acl_src_head;
     acl_tensor_ptr acl_dst_head;
+    bool                 src_contig_used = !src_dst_need_trans && !ggml_is_contiguous(src0);
+    ggml_cann_pool_alloc src_contig_allocator(ctx.pool());
+    ggml_cann_pool_alloc rope_dst_contig_allocator(ctx.pool());
+    acl_tensor_ptr       acl_src_contig;
+    acl_tensor_ptr       acl_rope_dst_contig;
+    size_t               src_contig_nb[GGML_MAX_DIMS] = {};
+    if (src_contig_used) {
+        src_contig_nb[0] = sizeof(float);
+        for (int i = 1; i < GGML_MAX_DIMS; i++) {
+            src_contig_nb[i] = src_contig_nb[i - 1] * src0->ne[i - 1];
+        }
+        src_contig_allocator.alloc(ggml_nelements(src0) * sizeof(float));
+        acl_src_contig = ggml_cann_create_tensor(src_contig_allocator.get(), ACL_FLOAT, sizeof(float), src0->ne,
+                                                 src_contig_nb, GGML_MAX_DIMS);
+        cann_copy(ctx, acl_src.get(), acl_src_contig.get());
+    }
     if (has_tail) {
         // Create head views for RotaryPositionEmbedding (only first rope_dims dimensions)
         // RotaryPositionEmbedding requires contiguous dst tensor, so we use a temporary buffer
@@ -3812,6 +3888,9 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
             // Use F32 trans tensor strides
             acl_src_head = ggml_cann_create_tensor((char *) src_trans_buffer, ACL_FLOAT, sizeof(float), head_ne,
                                                    src_dst_trans_nb, GGML_MAX_DIMS);
+        } else if (src_contig_used) {
+            acl_src_head = ggml_cann_create_tensor(acl_src_contig.get(), ACL_FLOAT, sizeof(float), head_ne,
+                                                   src_contig_nb, GGML_MAX_DIMS);
         } else {
             // Use original F32 tensor strides
             acl_src_head = ggml_cann_create_tensor((char *) src0->data, ACL_FLOAT, sizeof(float), head_ne, src0->nb,
@@ -3851,6 +3930,13 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         // Rotate full tensor (no tail), using trans tensors
         GGML_CANN_CALL_ACLNN_OP(ctx, RotaryPositionEmbedding, acl_src_trans_tensor.get(), acl_cos_reshape_tensor.get(),
                                 acl_sin_reshape_tensor.get(), acl_mode, acl_dst_trans_tensor.get());
+    } else if (src_contig_used) {
+        rope_dst_contig_allocator.alloc(ggml_nelements(dst) * sizeof(float));
+        acl_rope_dst_contig = ggml_cann_create_tensor(rope_dst_contig_allocator.get(), ACL_FLOAT, sizeof(float),
+                                                      dst->ne, src_contig_nb, GGML_MAX_DIMS);
+        GGML_CANN_CALL_ACLNN_OP(ctx, RotaryPositionEmbedding, acl_src_contig.get(), acl_cos_reshape_tensor.get(),
+                                acl_sin_reshape_tensor.get(), acl_mode, acl_rope_dst_contig.get());
+        cann_copy(ctx, acl_rope_dst_contig.get(), acl_dst.get());
     } else if (src0->data == dst->data && !ggml_is_contiguous(src0)) {
         // In-place on non-contiguous tensor: RotaryPositionEmbedding cannot safely
         // read and write the same non-contiguous buffer. Use contiguous temporaries.
@@ -4654,6 +4740,7 @@ static void ggml_cann_flash_attn_ext_310p(ggml_backend_cann_context & ctx, ggml_
 
     GGML_ASSERT(ggml_cann_type_mapping(src1->type) == ACL_FLOAT16);
     GGML_ASSERT(src3 != nullptr && src3->type == GGML_TYPE_F16);
+
 
     // helper: ggml-order ne [D, heads, seq, B] -> ACL (B, seq, heads, D) contiguous BSND
     auto bsnd = [](int64_t * ne, size_t * nb, int64_t d, int64_t h, int64_t s, int64_t b, size_t es) {

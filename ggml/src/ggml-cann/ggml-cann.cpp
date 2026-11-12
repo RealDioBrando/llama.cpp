@@ -3117,7 +3117,11 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context & ctx, struct gg
             ggml_cann_concat(ctx, dst);
             break;
         case GGML_OP_UPSCALE:
-            ggml_cann_upsample_nearest2d(ctx, dst);
+            if ((ggml_get_op_params_i32(dst, 0) & 0xff) == GGML_SCALE_MODE_BILINEAR) {
+                ggml_cann_upsample_bilinear2d(ctx, dst);
+            } else {
+                ggml_cann_upsample_nearest2d(ctx, dst);
+            }
             break;
         case GGML_OP_PAD:
             ggml_cann_pad(ctx, dst);
@@ -3499,6 +3503,7 @@ static void ggml_backend_cann_synchronize(ggml_backend_t backend) {
 static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
                                int                                 node_idx,
                                std::initializer_list<enum ggml_op> ops) {
+    static const bool fusion_debug = parse_bool(get_env_as_lowercase("GGML_CANN_FUSION_DEBUG").value_or(""));
     // CANN backend supports fusing ADD + RMS_NORM operations
     if ((ops.size() == 2) && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_RMS_NORM) {
         if (node_idx + 1 >= cgraph->n_nodes) {
@@ -3528,11 +3533,19 @@ static bool ggml_cann_can_fuse(const struct ggml_cgraph *          cgraph,
             add_node->src[0]->ne[2] != add_node->src[1]->ne[2] || add_node->src[0]->ne[3] != add_node->src[1]->ne[3]) {
             return false;
         }
+        if (fusion_debug) {
+            GGML_LOG_DEBUG("cann fuse: ADD+RMS_NORM add='%s' rms='%s' idx=%d\n",
+                           ggml_get_name(add_node), ggml_get_name(norm_node), node_idx);
+        }
         return true;
     }
 
-    // 其他融合模式走 ggml 原生通用判断
-    return ggml_can_fuse(cgraph, node_idx, ops);
+    if (fusion_debug) {
+        GGML_LOG_DEBUG("cann fuse: reject '%s' node='%s' idx=%d\n",
+                       ggml_op_name(cgraph->nodes[node_idx]->op),
+                       ggml_get_name(cgraph->nodes[node_idx]), node_idx);
+    }
+    return false;
 }
 
 #ifdef USE_ACL_GRAPH
@@ -4219,11 +4232,11 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                     case GGML_TYPE_F16:
                     case GGML_TYPE_F32:
                         // Same residency contract as the K-quant paths below:
-                        // the weight must already live in a CANN (or
-                        // CANN-only meta) buffer holding the device layout.
-                        // A weight in a host buffer holds raw bytes, e.g.
+                        // a weight in a host buffer holds raw bytes, e.g.
                         // with -ngl 0, and must stay on its own backend.
-                        if (op->src[0]->buffer == nullptr ||
+                        // Tensors without a buffer are not yet placed (scan
+                        // time activations), so residency is undetermined.
+                        if (op->src[0]->buffer != nullptr &&
                                 !ggml_backend_buft_is_cann(op->src[0]->buffer->buft)) {
                             return false;
                         }
@@ -4235,7 +4248,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                         // already live in a CANN buffer holding the device layout.
 #ifdef ASCEND_310P
                         if (ggml_cann_kq_matmul_path(op->src[0]) != GGML_CANN_KQ_NONE) {
-                            if (op->src[0]->buffer == nullptr ||
+                            if (op->src[0]->buffer != nullptr &&
                                 !ggml_backend_buft_is_cann(op->src[0]->buffer->buft)) {
                                 return false;
                             }
@@ -4276,7 +4289,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                             // (upstream cpy_tensor_async also refuses to copy
                             // matmul weights). So with e.g. -ngl 0 we must report
                             // "not supported" and let the op stay on its backend.
-                            if (op->src[0]->buffer == nullptr ||
+                            if (op->src[0]->buffer != nullptr &&
                                 !ggml_backend_buft_is_cann(op->src[0]->buffer->buft)) {
                                 return false;
                             }
@@ -4294,7 +4307,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 case GGML_TYPE_F32:
                     // experts need the load-time fractal layout: same
                     // residency contract as GGML_OP_MUL_MAT above
-                    if (op->src[0]->buffer == nullptr ||
+                    if (op->src[0]->buffer != nullptr &&
                             !ggml_backend_buft_is_cann(op->src[0]->buffer->buft)) {
                         return false;
                     }
@@ -4330,7 +4343,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                         if (moe_cpu) {
                             return false;
                         }
-                        if (op->src[0]->buffer == nullptr ||
+                        if (op->src[0]->buffer != nullptr &&
                                 !ggml_backend_buft_is_cann(op->src[0]->buffer->buft)) {
                             return false;
                         }
@@ -4441,10 +4454,10 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                      op->ne[1] * op->ne[3] > op->ne[2] * 8)) {
                     return false;
                 }
-                // Partial rope (n_dims < ne[0]) takes the
-                // RotaryPositionEmbedding path in ggml_cann_rope; only
-                // contiguous inputs are supported there.
-                if (!ggml_is_contiguous(op->src[0])) {
+                // Partial rope (n_dims < ne[0]) materializes non-contiguous
+                // F32 input in ggml_cann_rope. Keep the full-width composite
+                // path restricted to contiguous input.
+                if (rope_dims == op->src[0]->ne[0] && !ggml_is_contiguous(op->src[0])) {
                     return false;
                 }
 #endif
@@ -4457,7 +4470,8 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
                 if (op->src[0]->ne[2] * op->ne[3] != op->src[0]->ne[3] * op->ne[2]) {
                     return false;
                 }
-                if (op->op_params[0] != GGML_SCALE_MODE_NEAREST) {
+                const int mode = op->op_params[0] & 0xff;
+                if (mode != GGML_SCALE_MODE_NEAREST && mode != GGML_SCALE_MODE_BILINEAR) {
                     return false;
                 }
                 if (op->op_params[0] & GGML_SCALE_FLAG_ANTIALIAS) {
