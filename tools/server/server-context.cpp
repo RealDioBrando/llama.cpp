@@ -3781,7 +3781,6 @@ server_tokens server_context::tokenize_with_rgb_image(const std::string & prompt
 
     return server_tokens(chunks, true);
 }
-}
 
 server_response_reader server_context::get_response_reader() {
     return impl->get_response_reader();
