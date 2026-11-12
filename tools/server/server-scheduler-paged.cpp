@@ -89,7 +89,7 @@ bool server_scheduler_paged::init() {
             const size_t last  = tag.find_last_not_of(" \t\r\n");
             if (first != std::string::npos) {
                 tag = tag.substr(first, last - first + 1);
-                evict_protect_tags.push_back(llama_paged_tag_intern(tag.c_str()));
+                evict_protect_tags.insert(tag);
             }
             if (end == tags_str.size()) {
                 break;
@@ -99,12 +99,11 @@ bool server_scheduler_paged::init() {
 
         if (!evict_protect_tags.empty()) {
             std::string joined;
-            for (uint32_t tag_id : evict_protect_tags) {
-                const char * tag_name = llama_paged_tag_name(tag_id);
+            for (const std::string & tag : evict_protect_tags) {
                 if (!joined.empty()) {
                     joined += ",";
                 }
-                joined += tag_name != nullptr ? tag_name : "";
+                joined += tag;
             }
             llama_paged_scheduler_set_evict_decision(sched, evict_pick_protect_tags, this);
             SRV_INF("paged eviction policy: protecting prefix-cache tags [%s]\n", joined.c_str());
@@ -150,8 +149,8 @@ uint32_t server_scheduler_paged::evict_pick_protect_tags(void * ud, llama_paged_
             continue;
         }
         bool protected_block = false;
-        for (uint32_t tag_id : protected_tags) {
-            if (llama_paged_free_block_has_tag_id(it, tag_id)) {
+        for (const std::string & tag : protected_tags) {
+            if (llama_paged_free_block_has_tag(it, tag.c_str())) {
                 protected_block = true;
                 break;
             }

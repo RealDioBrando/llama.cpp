@@ -494,8 +494,8 @@ void llama_kv_cache_paged::collect_tag_blocks(
         }
         // Attribute the block to EVERY tag that used it while cache-resident.
         // With the multi-tag model there is no owner/primary tag, and tag()
-        // would expose only the lowest interned id, silently dropping the
-        // others from the per-tag statistics.
+        // would expose only one representative, silently dropping the others
+        // from the per-tag statistics.
         const uint32_t n_tags = block_manager.tag_count(id);
         for (uint32_t t = 0; t < n_tags; ++t) {
             const char * tag = block_manager.tag_at(id, t);

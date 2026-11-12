@@ -7,6 +7,8 @@
 #include "server-scheduler.h"
 
 #include <mutex>
+#include <set>
+#include <string>
 
 struct llama_paged_scheduler;
 struct mtmd_input_chunk;
@@ -49,7 +51,7 @@ class server_scheduler_paged final : public server_scheduler_interface {
     static void on_finish_thunk(int32_t request_id, const llama_token * tokens, int32_t n_tokens, void * user_data);
 
     // built-in env-gated policy (LLAMA_SERVER_PAGED_EVICT_PROTECT_TAGS):
-    // skip cache-resident nodes carrying any of the protected tag ids
+    // skip cache-resident nodes carrying any of the protected tags
     static uint32_t evict_pick_protect_tags(void * ud, llama_paged_pool_kind pool,
                                             uint32_t n_needed, const llama_paged_free_block * head,
                                             uint32_t * out_ids, uint32_t out_capacity);
@@ -73,10 +75,9 @@ class server_scheduler_paged final : public server_scheduler_interface {
 
     llama_paged_scheduler * sched = nullptr;
 
-    // interned ids of the built-in eviction policy's protected tags. Owned
-    // here (not by the scheduler) so they outlive it; the callback user data
-    // is `this`.
-    std::vector<uint32_t> evict_protect_tags;
+    // protected tags of the built-in eviction policy. Owned here (not by the
+    // scheduler) so they outlive it; the callback user data is `this`.
+    std::set<std::string> evict_protect_tags;
 
     // owned and recycled by llama_paged_scheduler_prepare_batch
     llama_batch paged_batch = {};

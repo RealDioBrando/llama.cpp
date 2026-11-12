@@ -42,7 +42,7 @@ struct llama_paged_pool_stats {
 //
 // Only *reusable* blocks count: live, GPU-resident full prefix-index blocks
 // and live GPU checkpoints. Partial tail blocks, linear ACTIVE state blocks,
-// CPU-pool blocks and swapped blocks are invisible. The interned tag set is
+// CPU-pool blocks and swapped blocks are invisible. The tag string set is
 // stored on the physical block by llama_block_manager; this class keeps no
 // state of its own and materializes a snapshot per query:
 //

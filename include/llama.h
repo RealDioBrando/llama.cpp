@@ -1932,26 +1932,17 @@ extern "C" {
     LLAMA_API uint32_t     llama_paged_free_block_id      (const llama_paged_free_block * block);
     LLAMA_API int32_t      llama_paged_free_block_has_hash(const llama_paged_free_block * block);
     LLAMA_API uint64_t     llama_paged_free_block_hash    (const llama_paged_free_block * block);
-    // Representative tag (lowest interned id of the block's set), kept for
-    // single-tag callers. Does not imply "first owner". NULL when untagged.
+    // Representative tag (lexicographically first of the block's set), kept
+    // for single-tag callers. Does not imply "first owner". NULL when untagged.
     LLAMA_API const char * llama_paged_free_block_tag     (const llama_paged_free_block * block);
     // Full tag set of the node: every tag that used the block while it stayed
-    // cache-resident, deduplicated. tag_at() enumerates them in ascending
-    // interned-id order; tag_count() is 0 for untagged nodes.
+    // cache-resident, deduplicated. tag_at() enumerates them in lexicographic
+    // order; tag_count() is 0 for untagged nodes.
     LLAMA_API uint32_t     llama_paged_free_block_tag_count(const llama_paged_free_block * block);
     LLAMA_API const char * llama_paged_free_block_tag_at   (const llama_paged_free_block * block, uint32_t index);
-    // Exact tag membership. has_tag() only looks the string up in the
-    // process-wide interner and never inserts it; an unknown tag returns 0.
-    // has_tag_id() is the fast O(log k) path for policies that resolve their
-    // tags once with llama_paged_tag_intern().
+    // Exact tag membership (O(log k) string comparison). An unknown tag
+    // returns 0; the query never mutates any state.
     LLAMA_API int32_t      llama_paged_free_block_has_tag   (const llama_paged_free_block * block, const char * tag);
-    LLAMA_API int32_t      llama_paged_free_block_has_tag_id(const llama_paged_free_block * block, uint32_t tag_id);
-
-    // Process-wide tag interner. Resolve a policy tag once, then query blocks
-    // by id. tag_id 0 = invalid/empty. llama_paged_tag_intern() inserts; tag
-    // ids are stable for the process lifetime (there is no removal).
-    LLAMA_API uint32_t     llama_paged_tag_intern(const char * tag);
-    LLAMA_API const char * llama_paged_tag_name  (uint32_t tag_id);  // NULL for 0/invalid
 
     // Which GPU pool is asking. Full-attention and linear-state pools have
     // independent block-id spaces, so the kind MUST be passed to the callback.

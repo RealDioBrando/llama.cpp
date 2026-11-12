@@ -379,8 +379,8 @@ bool llama_linear_state_cache::create_checkpoint(llama_seq_id seq_id, uint64_t c
 
     // Only GPU checkpoints are reusable and therefore visible in the tag ->
     // block mapping. CPU checkpoints stay untagged. set_tag() unions the tag
-    // into the block's sorted set; there is no primary/first tag (tag() only
-    // returns the lowest interned id as a representative).
+    // into the block's set; there is no primary/first tag (tag() only returns
+    // one representative).
     if (ckpt_gpu) {
         block_manager.set_tag(ckpt_id, it->second.tag);
     }
@@ -598,7 +598,7 @@ void llama_linear_state_cache::collect_tag_blocks(
             continue;
         }
         // Attribute the checkpoint to every tag in its set: tag() is only a
-        // representative (lowest interned id), not an owner.
+        // representative, not an owner.
         const uint32_t n_tags = block_manager.tag_count(e.block_id);
         for (uint32_t t = 0; t < n_tags; ++t) {
             const char * tag = block_manager.tag_at(e.block_id, t);

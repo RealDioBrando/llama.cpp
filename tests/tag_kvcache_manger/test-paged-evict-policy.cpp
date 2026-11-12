@@ -187,23 +187,19 @@ static void test_multi_tag_set() {
     bm.init(4, 0, 0.0f);
     bm.set_block_hash(0, 0xB000);
 
-    // Intern the tag that is written SECOND first, so the lowest interned id
-    // differs from the tag written first to the block. This distinguishes the
-    // new "representative = min id" semantics from the old "first owner" one.
-    const uint32_t id_early = llama_paged_tag_intern("multi-tag-interning-early");
+    // Write the lexicographically LATER tag first, so the representative tag
+    // differs from the tag written first to the block.
     bm.set_tag(0, "multi-tag-written-first");
     bm.add_tag(0, "multi-tag-interning-early");
-    const uint32_t id_late = llama_paged_tag_intern("multi-tag-written-first");
 
-    CHECK(id_early < id_late);
     CHECK_EQ(bm.tag_count(0), 2u);
-    CHECK(bm.has_tag_id(0, id_early));
-    CHECK(bm.has_tag_id(0, id_late));
-    CHECK(!bm.has_tag_id(0, llama_paged_tag_intern("multi-tag-absent")));
-    // Representative = lowest interned id, NOT the tag written first.
+    CHECK(bm.has_tag(0, "multi-tag-interning-early"));
+    CHECK(bm.has_tag(0, "multi-tag-written-first"));
+    CHECK(!bm.has_tag(0, "multi-tag-absent"));
+    // Representative = lexicographically first, NOT the tag written first.
     CHECK(bm.tag(0) == "multi-tag-interning-early");
 
-    // tag_at() enumerates in ascending interned-id order.
+    // tag_at() enumerates in lexicographic order.
     CHECK(std::strcmp(bm.tag_at(0, 0), "multi-tag-interning-early") == 0);
     CHECK(std::strcmp(bm.tag_at(0, 1), "multi-tag-written-first") == 0);
     CHECK(bm.tag_at(0, 2) == nullptr);
@@ -221,7 +217,7 @@ static void test_tags_survive_cache_resident_release() {
     CHECK(bm.block_has_hash(0));
     CHECK_EQ(bm.block_ref_count(0), 0u);
     CHECK_EQ(bm.tag_count(0), 1u);
-    CHECK(bm.has_tag_id(0, llama_paged_tag_intern("owner")));
+    CHECK(bm.has_tag(0, "owner"));
 }
 
 static void test_tags_cleared_on_eviction() {
@@ -246,19 +242,6 @@ static void test_tags_cleared_on_clear_hash() {
 
     bm.clear_block_hash(0);
     CHECK_EQ(bm.tag_count(0), 0u);
-}
-
-static void test_interner_roundtrip() {
-    const uint32_t a1 = llama_paged_tag_intern("intern-A");
-    const uint32_t a2 = llama_paged_tag_intern("intern-A");
-    const uint32_t b  = llama_paged_tag_intern("intern-B");
-    CHECK_EQ(a1, a2);
-    CHECK(a1 != 0u && b != 0u && a1 != b);
-    CHECK(std::strcmp(llama_paged_tag_name(a1), "intern-A") == 0);
-    CHECK(std::strcmp(llama_paged_tag_name(b), "intern-B") == 0);
-    CHECK_EQ(llama_paged_tag_intern(nullptr), 0u);
-    CHECK_EQ(llama_paged_tag_intern(""), 0u);
-    CHECK(llama_paged_tag_name(0) == nullptr);
 }
 
 // A block tagged before it ever gets a hash must lose its tag when it is
@@ -293,9 +276,8 @@ static void test_tags_cleared_on_release_to_plain() {
 
 // Exercise every public C accessor from inside a picker callback, where node
 // pointers are valid. Also checks the NULL sentinel for untagged nodes and
-// that has_tag() never inserts into the process-wide interner.
+// that has_tag() is a pure read-only query.
 struct accessor_probe {
-    uint32_t    early_id  = 0;
     int         nodes     = 0;
     uint32_t    tagged_id = 0;
     uint32_t    untagged_id = 0;
@@ -304,7 +286,6 @@ struct accessor_probe {
     std::string at1;
     std::string rep;
     int         has_early_str = -1;
-    int         has_early_id  = -1;
     int         has_unknown   = -1;
     int         untagged_tag_is_null = -1;
 
@@ -331,8 +312,7 @@ static uint32_t pick_inspect_accessors_cb(void * ud, llama_paged_pool_kind pool,
             p->at1 = b != nullptr ? b : "";
             p->rep = r != nullptr ? r : "<null>";
             p->has_early_str = llama_paged_free_block_has_tag(it, "c-accessor-early");
-            p->has_early_id  = llama_paged_free_block_has_tag_id(it, p->early_id);
-            p->has_unknown   = llama_paged_free_block_has_tag(it, "c-accessor-never-interned");
+            p->has_unknown   = llama_paged_free_block_has_tag(it, "c-accessor-never-written");
             if (p->victim_id == 0) {
                 p->victim_id = id;   // fall back to a tagged block if needed
             }
@@ -355,14 +335,11 @@ static void test_c_free_block_accessors() {
     bm.set_block_hash(0, 0xF000);
     bm.set_block_hash(1, 0xF001);
 
-    // Second-written tag gets the lower id, so tag() cannot be "first owner".
+    // Both tags are written to block 0; tag() reports the lexicographically
+    // first one, not necessarily the tag written first.
     accessor_probe probe;
-    probe.early_id = llama_paged_tag_intern("c-accessor-early");
     bm.set_tag(0, "c-accessor-late");
     bm.add_tag(0, "c-accessor-early");
-
-    // Probe for "does has_tag insert?": capture the current next id.
-    const uint32_t before_id = llama_paged_tag_intern("c-accessor-probe-before");
 
     bm.set_evict_pick_cb(pick_inspect_accessors_cb, &probe);
     const auto ids = bm.checkout_gpu_blocks(1);   // sacrifices the untagged node 1
@@ -371,20 +348,14 @@ static void test_c_free_block_accessors() {
     CHECK_EQ(probe.tagged_count, 2u);
     CHECK(probe.at0 == "c-accessor-early");
     CHECK(probe.at1 == "c-accessor-late");
-    CHECK(probe.rep == "c-accessor-early");       // representative = min id
+    CHECK(probe.rep == "c-accessor-early");       // representative
     CHECK_EQ(probe.has_early_str, 1);
-    CHECK_EQ(probe.has_early_id, 1);
     CHECK_EQ(probe.has_unknown, 0);
     CHECK_EQ(probe.untagged_tag_is_null, 1);      // NULL sentinel, not ""
     CHECK_EQ(ids.size(), 1u);
     if (!ids.empty()) {
         CHECK_EQ(ids[0], probe.untagged_id);
     }
-
-    // has_tag() must not have interned "c-accessor-never-interned": the next
-    // inserted tag gets the very next id.
-    const uint32_t after_id = llama_paged_tag_intern("c-accessor-probe-after");
-    CHECK_EQ(after_id, before_id + 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -576,9 +547,8 @@ static void test_tag_based_picker() {
     }
     CHECK(bm.block_has_hash(0));
     CHECK(bm.block_has_hash(1));
-    const uint32_t keep_id = llama_paged_tag_intern("keep");
-    CHECK(bm.has_tag_id(0, keep_id));
-    CHECK(bm.has_tag_id(1, keep_id));
+    CHECK(bm.has_tag(0, "keep"));
+    CHECK(bm.has_tag(1, "keep"));
     // Blocks 0/1 also carry the "seed" tag: the set holds both tags.
     CHECK(bm.tag_count(0) >= 2u);
     CHECK(bm.tag_count(1) >= 2u);
@@ -1068,7 +1038,7 @@ static void test_prefix_reuse_unions_tags() {
     fixture.kv->collect_tag_blocks(owned, nullptr);
     CHECK(owned["reuse-C"].count(id) == 1u);
 
-    // The representative tag is still the lowest interned id (A interned first).
+    // The representative tag is the lexicographically first one ("reuse-A").
     CHECK(fixture.kv->block_tag(id) == "reuse-A");
 
     // swap_in also re-tags the restored private GPU block (swap_out clears the
@@ -1117,7 +1087,6 @@ int main() {
     run("tags_cleared_on_release_to_plain", test_tags_cleared_on_release_to_plain);
     run("tags_cleared_on_eviction", test_tags_cleared_on_eviction);
     run("tags_cleared_on_clear_hash", test_tags_cleared_on_clear_hash);
-    run("interner_roundtrip", test_interner_roundtrip);
     run("c_free_block_accessors", test_c_free_block_accessors);
     run("prefix_reuse_unions_tags", test_prefix_reuse_unions_tags);
 

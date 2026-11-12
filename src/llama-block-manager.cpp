@@ -4,66 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <deque>
-#include <mutex>
-#include <unordered_map>
-
-namespace {
-
-// Process-wide tag interner. Tag strings are mapped to small uint32_t ids so
-// that per-block tag sets are plain sorted integer vectors: an eviction policy
-// resolves its tag(s) once, then queries blocks with a binary search instead of
-// repeated string comparisons. Ids start at 1 (0 = no tag) and never change;
-// names are stored in a deque so c_str() pointers stay stable for the process
-// lifetime and can be handed out through the C API.
-class tag_interner {
-  public:
-    uint32_t intern(const std::string & tag) {
-        if (tag.empty()) {
-            return 0;
-        }
-        std::lock_guard<std::mutex> lock(mu);
-        const auto it = ids.find(tag);
-        if (it != ids.end()) {
-            return it->second;
-        }
-        names.push_back(tag);
-        const uint32_t tag_id = (uint32_t) names.size();
-        ids.emplace(names.back(), tag_id);
-        return tag_id;
-    }
-
-    uint32_t find(const std::string & tag) const {
-        if (tag.empty()) {
-            return 0;
-        }
-        std::lock_guard<std::mutex> lock(mu);
-        const auto it = ids.find(tag);
-        return it == ids.end() ? 0 : it->second;
-    }
-
-    const std::string & name(uint32_t tag_id) const {
-        static const std::string empty;
-        if (tag_id == 0) {
-            return empty;
-        }
-        std::lock_guard<std::mutex> lock(mu);
-        if (tag_id > names.size()) {
-            return empty;
-        }
-        return names[tag_id - 1];
-    }
-
-  private:
-    mutable std::mutex                        mu;
-    std::unordered_map<std::string, uint32_t> ids;
-    std::deque<std::string>                   names;   // id - 1 indexes this
-};
-
-// One instance shared by all pools: tag ids are process-wide and stable.
-tag_interner g_tag_interner;
-
-} // namespace
+#include <iterator>
 
 void llama_block_manager::init(uint32_t n_gpu, uint32_t n_cpu, float watermark) {
     LLAMA_LOG_INFO("%s: Block manager initialized: n_free_gpu_blocks=%d, n_free_cpu_blocks=%d\n", __func__, n_gpu,
@@ -576,7 +517,7 @@ void llama_block_manager::clear_block_hash(uint32_t id) {
 }
 
 void llama_block_manager::clear_tags(physical_block & b) {
-    b.tag_ids.clear();
+    b.tags.clear();
 }
 
 void llama_block_manager::add_tag(uint32_t id, const std::string & tag) {
@@ -599,14 +540,7 @@ void llama_block_manager::add_tag(uint32_t id, const std::string & tag) {
         LLAMA_LOG_WARN("%s: tag '%s' rejected on free block %u\n", __func__, tag.c_str(), id);
         return;
     }
-    const uint32_t tag_id = g_tag_interner.intern(tag);
-    if (tag_id == 0) {
-        return;
-    }
-    const auto it = std::lower_bound(b->tag_ids.begin(), b->tag_ids.end(), tag_id);
-    if (it == b->tag_ids.end() || *it != tag_id) {
-        b->tag_ids.insert(it, tag_id);
-    }
+    b->tags.insert(tag);
 }
 
 void llama_block_manager::set_tag(uint32_t id, const std::string & tag) {
@@ -615,37 +549,36 @@ void llama_block_manager::set_tag(uint32_t id, const std::string & tag) {
     add_tag(id, tag);
 }
 
-bool llama_block_manager::has_tag_id(uint32_t id, uint32_t tag_id) const {
-    if (tag_id == 0) {
-        return false;
-    }
+bool llama_block_manager::has_tag(uint32_t id, const std::string & tag) const {
     const physical_block * b = block_at(id);
     if (!b) {
         return false;
     }
-    return std::binary_search(b->tag_ids.begin(), b->tag_ids.end(), tag_id);
+    return b->tags.find(tag) != b->tags.end();
 }
 
 uint32_t llama_block_manager::tag_count(uint32_t id) const {
     const physical_block * b = block_at(id);
-    return b ? (uint32_t) b->tag_ids.size() : 0;
+    return b ? (uint32_t) b->tags.size() : 0;
 }
 
 const char * llama_block_manager::tag_at(uint32_t id, uint32_t index) const {
     const physical_block * b = block_at(id);
-    if (!b || index >= b->tag_ids.size()) {
+    if (!b || index >= b->tags.size()) {
         return nullptr;
     }
-    return g_tag_interner.name(b->tag_ids[index]).c_str();
+    auto it = b->tags.begin();
+    std::advance(it, index);
+    return it->c_str();
 }
 
 const std::string & llama_block_manager::tag(uint32_t id) const {
     static const std::string empty;
     const physical_block * b = block_at(id);
-    if (!b || b->tag_ids.empty()) {
+    if (!b || b->tags.empty()) {
         return empty;
     }
-    return g_tag_interner.name(b->tag_ids.front());
+    return *b->tags.begin();
 }
 
 // ---------------------------------------------------------------------------
@@ -676,46 +609,28 @@ const char * llama_paged_free_block_tag(const llama_paged_free_block * block) {
     if (block == nullptr) {
         return nullptr;
     }
-    if (block->tag_ids.empty()) {
+    if (block->tags.empty()) {
         return nullptr;   // matches the public contract: NULL when untagged
     }
-    return g_tag_interner.name(block->tag_ids.front()).c_str();
+    return block->tags.begin()->c_str();
 }
 
 uint32_t llama_paged_free_block_tag_count(const llama_paged_free_block * block) {
-    return block != nullptr ? (uint32_t) block->tag_ids.size() : 0;
+    return block != nullptr ? (uint32_t) block->tags.size() : 0;
 }
 
 const char * llama_paged_free_block_tag_at(const llama_paged_free_block * block, uint32_t index) {
-    if (block == nullptr || index >= block->tag_ids.size()) {
+    if (block == nullptr || index >= block->tags.size()) {
         return nullptr;
     }
-    return g_tag_interner.name(block->tag_ids[index]).c_str();
+    auto it = block->tags.begin();
+    std::advance(it, index);
+    return it->c_str();
 }
 
 int32_t llama_paged_free_block_has_tag(const llama_paged_free_block * block, const char * tag) {
     if (block == nullptr || tag == nullptr) {
         return 0;
     }
-    const uint32_t tag_id = g_tag_interner.find(tag);
-    if (tag_id == 0) {
-        return 0;   // unknown tag: do not insert from a read-only query
-    }
-    return std::binary_search(block->tag_ids.begin(), block->tag_ids.end(), tag_id) ? 1 : 0;
-}
-
-int32_t llama_paged_free_block_has_tag_id(const llama_paged_free_block * block, uint32_t tag_id) {
-    if (block == nullptr || tag_id == 0) {
-        return 0;
-    }
-    return std::binary_search(block->tag_ids.begin(), block->tag_ids.end(), tag_id) ? 1 : 0;
-}
-
-uint32_t llama_paged_tag_intern(const char * tag) {
-    return tag != nullptr ? g_tag_interner.intern(tag) : 0;
-}
-
-const char * llama_paged_tag_name(uint32_t tag_id) {
-    const std::string & name = g_tag_interner.name(tag_id);
-    return name.empty() ? nullptr : name.c_str();
+    return block->tags.find(tag) != block->tags.end() ? 1 : 0;
 }
