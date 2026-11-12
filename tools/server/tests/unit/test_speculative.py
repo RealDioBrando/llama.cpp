@@ -395,6 +395,77 @@ class TestPagedTextSpeculative:
             local.stop()
 
     @pytest.mark.parametrize("stream", (False, True), ids=("response", "stream"))
+    @pytest.mark.parametrize(
+        "max_tokens", (1, 64), ids=("first-token", "last-token-after-drafts")
+    )
+    def test_paged_completes_output_budget(
+        self, text_case, tmp_path, stream, max_tokens
+    ):
+        local, payload, draft, spec_type = text_case
+        request = dict(payload, max_tokens=max_tokens)
+        local.spec_type = "none"
+        local.log_path = str(tmp_path / "target.log")
+        try:
+            local.start(timeout_seconds=240)
+            baseline = local.make_request("POST", "/v1/chat/completions", request)
+            assert baseline.status_code == 200, baseline.body
+        finally:
+            local.stop()
+        assert len(baseline.body["__verbose"]["tokens"]) == max_tokens
+        local.model_draft, local.spec_type = draft, spec_type
+        local.log_path = str(tmp_path / "draft.log")
+        local.start(timeout_seconds=240)
+        for _ in range(2):
+            # The final non-drafted token must follow cleanup of rejected draft KV.
+            if stream:
+                chunks = list(
+                    local.make_stream_request(
+                        "POST",
+                        "/v1/chat/completions",
+                        dict(
+                            request, stream=True, stream_options={"include_usage": True}
+                        ),
+                    )
+                )
+                assert chunks and all("error" not in chunk for chunk in chunks), chunks
+                usage = next(
+                    chunk["usage"] for chunk in reversed(chunks) if chunk.get("usage")
+                )
+                timings = next(
+                    chunk["timings"]
+                    for chunk in reversed(chunks)
+                    if chunk.get("timings")
+                )
+                content = "".join(
+                    choice.get("delta", {}).get("content") or ""
+                    for chunk in chunks
+                    for choice in chunk.get("choices", [])
+                )
+                finishes = [
+                    choice["finish_reason"]
+                    for chunk in chunks
+                    for choice in chunk.get("choices", [])
+                    if choice.get("finish_reason") is not None
+                ]
+                assert finishes == ["length"]
+            else:
+                response = local.make_request("POST", "/v1/chat/completions", request)
+                assert response.status_code == 200, response.body
+                assert (
+                    response.body["__verbose"]["tokens"]
+                    == baseline.body["__verbose"]["tokens"]
+                )
+                assert response.body["choices"][0]["finish_reason"] == "length"
+                usage, timings = response.body["usage"], response.body["timings"]
+                content = response.body["choices"][0]["message"]["content"]
+            assert usage["completion_tokens"] == max_tokens
+            assert content == baseline.body["choices"][0]["message"]["content"]
+            assert timings["cache_n"] == 0
+            if max_tokens > 1:
+                assert timings.get("draft_n", 0) > 0, timings
+                assert 0 < timings.get("draft_n_accepted", 0) <= timings["draft_n"]
+
+    @pytest.mark.parametrize("stream", (False, True), ids=("response", "stream"))
     def test_paged_draft_keeps_consecutive_kv(self, text_case, tmp_path, stream):
         from pathlib import Path
 

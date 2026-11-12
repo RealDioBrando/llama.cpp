@@ -849,6 +849,7 @@ void server_scheduler_paged::mm_warmup() {
 
 void server_scheduler_paged::prepare_drafts() {
     bool any_drafting = false;
+    std::vector<server_slot *> drafted;
 
     for (auto & slot : port.slot_pool()) {
         if (!slot.can_speculate() || !slot.is_processing() || slot.state != SLOT_STATE_GENERATING || slot.task->tokens.has_mtmd ||
@@ -879,6 +880,7 @@ void server_scheduler_paged::prepare_drafts() {
             /* .result   = */ &slot.spec_draft,
         };
         any_drafting = true;
+        drafted.push_back(&slot);
     }
 
     if (any_drafting) {
@@ -886,8 +888,11 @@ void server_scheduler_paged::prepare_drafts() {
         port.yield([&]() { common_speculative_draft(port.spec_ctx()); });
     }
 
-    for (auto & slot : port.slot_pool()) {
-        if (!slot.can_speculate() || slot.state != SLOT_STATE_GENERATING || slot.spec_draft.empty()) {
+    // Carried drafts are already attached and counted; only submit new drafts.
+    for (auto * slot_ptr : drafted) {
+        auto & slot = *slot_ptr;
+        slot.stats.n_draft_tokens += slot.spec_draft.size();
+        if (slot.spec_draft.empty()) {
             continue;
         }
         if (!llama_paged_scheduler_attach_draft(sched, slot.id, slot.spec_draft.data(),
