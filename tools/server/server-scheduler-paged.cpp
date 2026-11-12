@@ -852,7 +852,7 @@ void server_scheduler_paged::prepare_drafts() {
     std::vector<server_slot *> drafted;
 
     for (auto & slot : port.slot_pool()) {
-        if (!slot.can_speculate() || !slot.is_processing() || slot.state != SLOT_STATE_GENERATING || slot.task->tokens.has_mtmd ||
+        if (!slot.can_speculate() || !slot.is_processing() || slot.state != SLOT_STATE_GENERATING ||
             !slot.has_next_token || !slot.has_budget()) {
             continue;
         }

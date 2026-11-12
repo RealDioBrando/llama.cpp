@@ -312,6 +312,34 @@ class TestVLSpeculative:
         assert timings["draft_n"] > 0
         assert 0 <= timings["draft_n_accepted"] <= timings["draft_n"]
 
+    def test_paged_text_request_with_loaded_projector(self, vl_case, monkeypatch):
+        local, _, draft, spec_type = vl_case
+        monkeypatch.setenv("LLAMA_ARG_FIT", "on")
+        monkeypatch.setenv("LLAMA_ARG_SPEC_DRAFT_P_MIN", "0")
+        local.kv_paged = True
+        local.model_draft, local.spec_type = draft, spec_type
+        request = {
+            "messages": [
+                {"role": "user", "content": "Count from 1 to 100, separated by commas."}
+            ],
+            "max_tokens": 32,
+            "temperature": 0,
+            "seed": 1234,
+            "ignore_eos": True,
+            "cache_prompt": False,
+            "return_tokens": True,
+            "verbose": True,
+        }
+        local.start(timeout_seconds=240)
+        # A loaded projector marks even a text-only request as has_mtmd.
+        response = local.make_request("POST", "/v1/chat/completions", request)
+        assert response.status_code == 200, response.body
+        assert response.body["usage"]["completion_tokens"] == 32
+        assert len(response.body["__verbose"]["tokens"]) == 32
+        timings = response.body["timings"]
+        assert timings.get("draft_n", 0) > 0, timings
+        assert 0 < timings.get("draft_n_accepted", 0) <= timings["draft_n"]
+
 
 @pytest.mark.slow
 @pytest.mark.serial
