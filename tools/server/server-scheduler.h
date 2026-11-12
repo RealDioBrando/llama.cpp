@@ -87,6 +87,21 @@ struct server_scheduler_interface {
 
     // one iteration: build batch, llama_decode, sample, emit results
     virtual void update() = 0;
+
+    // Paged KV accounting (doc tag-kv-block-usage). Only the paged scheduler
+    // implements these; the defaults report "not supported" so non-paged
+    // servers answer /kv_stats and /tag_usage with an error.
+    virtual bool get_kv_stats(llama_paged_kv_cache_stats & /*out*/) { return false; }
+
+    // Renders the /tag_usage payload. `tag == 0` means the listing of every
+    // tag; `include_blocks` materializes the block id lists.
+    virtual bool get_tag_usage(uint64_t /*tag*/, bool /*include_blocks*/, json & /*out*/) {
+        return false;
+    }
+
+    // Install a paged prefix-cache eviction policy. Paged-only: the default
+    // report "not supported" so non-paged servers leave the policy untouched.
+    virtual bool set_evict_decision(llama_paged_evict_pick_cb /*cb*/, void * /*ud*/) { return false; }
 };
 
 // returns the paged scheduler when params.kv_paged is set, nullptr otherwise

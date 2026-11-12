@@ -33,6 +33,7 @@ set(LLAMA_CORE_SOURCES
     llama-linear-prefix-index.cpp
     llama-linear-state-cache.cpp
     llama-paged-cache-manager.cpp
+    llama-paged-tag-manager.cpp
     llama-paged-scheduler.cpp
     llama-paged-scheduler-impl.cpp
     llama-memory-hybrid-paged.cpp

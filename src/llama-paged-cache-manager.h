@@ -34,6 +34,18 @@ class llama_paged_cache_manager {
     void set_prefix_enabled(bool enabled);
     bool prefix_enabled() const;
 
+    // GPU eviction policy installed on both pools (full-attention and, when
+    // present, linear state). cb == nullptr restores the legacy FIFO path.
+    // Servers register once and the facade forwards to the two caches.
+    void set_evict_pick_cb(llama_paged_evict_pick_cb cb, void * ud);
+
+    // True when a GPU allocation in the current step failed only because the
+    // installed eviction picker refused (full or linear pool). The scheduler
+    // uses this to distinguish policy back-pressure from capacity exhaustion.
+    bool gpu_checkout_refused_by_policy() const;
+    // Clears the per-step refusal flag on both caches.
+    void reset_gpu_checkout_refusal();
+
     //
     // Prefix cache
     //
@@ -50,11 +62,19 @@ class llama_paged_cache_manager {
     // state block); "no reusable prefix" is success with n_past == 0.
     bool reserve_prefix_candidate(llama_sequence_group & group);
 
-    // Reserve KV blocks for `num_tokens` additional tokens.
+    // Admission / growth entry point.
+    //
+    // For a group that is not admitted yet (cache_reserved == false) this is
+    // the whole admission transaction: it reserves the linear ACTIVE state
+    // block and the prefix-cache block refs, then grows the full-attention
+    // block table for `num_tokens` additional tokens. Either everything is
+    // reserved or nothing is: on failure the group keeps holding no blocks
+    // and stays in the waiting queue (vLLM allocate_slots() == None).
+    //
+    // For an already admitted group (decode growth, fork tail block) the
+    // reservation is reused and only full-attention KV is grown; failure
+    // leaves the group untouched for the caller to preempt/swap.
     bool allocate_blocks(llama_sequence_group & group, int32_t num_tokens);
-
-    // Free one cached prefix block or demote/evict one cached checkpoint.
-    bool evict_cached_blocks();
 
     // Called after a decode step, once n_past has been updated.
     void register_tokens(llama_sequence_group & group);

@@ -1828,6 +1828,93 @@ extern "C" {
                                                        int32_t                        request_id,
                                                        struct llama_paged_seq_state * out_state);
 
+    //
+    // Tag -> KV block accounting (doc docs/kvcache-manager/tag-kv-block-usage.md)
+    //
+    // Requests may carry an optional owner tag, a uint64 identifier where 0
+    // means "no tag". The accounting covers only blocks that can be reused
+    // through the prefix cache:
+    //   full-attention: live, GPU-resident prefix-index blocks;
+    //   linear-attention: live GPU checkpoints.
+    // Partial tail blocks, ACTIVE linear states, CPU-pool blocks and swapped
+    // blocks are not counted. Shared references are reported as block ids but
+    // never counted, so sum(tag counts) <= used blocks of that pool.
+    //
+    // All queries must run on the scheduler / main loop thread.
+
+    struct llama_paged_kv_cache_block_stats {
+        uint64_t total_blocks;
+        uint64_t used_blocks;        /* in_use + cache-resident (free_blocks excluded) */
+        uint64_t free_blocks;        /* free and not cache-resident */
+        uint64_t cached_blocks;      /* free but cache-resident: evictable on allocation */
+        uint64_t allocatable_blocks; /* free_blocks + cached_blocks */
+    };
+
+    struct llama_paged_kv_cache_pool_stats {
+        struct llama_paged_kv_cache_block_stats full;
+        struct llama_paged_kv_cache_block_stats linear;
+    };
+
+    struct llama_paged_kv_cache_stats {
+        struct llama_paged_kv_cache_pool_stats npu;
+        struct llama_paged_kv_cache_pool_stats cpu;  /* reserved, all zero */
+    };
+
+    struct llama_paged_tag_pool_usage {
+        uint64_t full_blocks;    /* owner 的可复用 full block 数 */
+        uint64_t linear_blocks;  /* owner 的 GPU checkpoint 数 */
+    };
+
+    struct llama_paged_tag_block_usage {
+        struct llama_paged_tag_pool_usage npu;
+        struct llama_paged_tag_pool_usage cpu;  /* reserved, all zero */
+    };
+
+    // Attach an owner tag (uint64, 0 = no tag) to a queued request. Must be
+    // called before the request is first scheduled: returns false if the
+    // request is unknown or already holds KV blocks / a cache reservation.
+    LLAMA_API bool llama_paged_scheduler_set_request_tag(struct llama_paged_scheduler * sched,
+                                                         int32_t request_id, uint64_t tag);
+
+    // Per-tag usage. Unknown tags are reported as all-zero and return true.
+    LLAMA_API bool llama_paged_scheduler_get_tag_block_usage(struct llama_paged_scheduler * sched,
+                                                             uint64_t tag,
+                                                             struct llama_paged_tag_block_usage * out);
+
+    typedef void (*llama_paged_tag_usage_cb)(uint64_t tag,
+                                             const struct llama_paged_tag_block_usage * usage,
+                                             void * user_data);
+    LLAMA_API void llama_paged_scheduler_for_each_tag_block_usage(struct llama_paged_scheduler * sched,
+                                                                  llama_paged_tag_usage_cb cb,
+                                                                  void * user_data);
+
+    /* kind: 0 = full, 1 = linear; owned: 1 = 计入计数，0 = 仅共享引用
+     * tag == 0 时遍历所有 tag */
+    typedef void (*llama_paged_tag_block_cb)(uint64_t tag, int32_t kind, uint32_t block_id,
+                                             int32_t owned, void * user_data);
+    LLAMA_API bool llama_paged_scheduler_for_each_tag_block(struct llama_paged_scheduler * sched,
+                                                            uint64_t tag,
+                                                            llama_paged_tag_block_cb cb,
+                                                            void * user_data);
+
+    /* 单 tag 的 block id 明细，两段式：
+     *   1) 各 out 传 NULL：把所需长度写入 *n_*；
+     *   2) 传入数组、*n_* 传容量：足够则填充并返回 true；不足则写回所需长度并返回 false。
+     * id 按升序；unknown tag 长度为 0 并返回 true。full/linear id 空间独立。 */
+    LLAMA_API bool llama_paged_scheduler_get_tag_block_ids(
+        struct llama_paged_scheduler * sched,
+        uint64_t tag,
+        uint32_t * full_owned_out,   size_t * n_full_owned,
+        uint32_t * full_shared_out,  size_t * n_full_shared,
+        uint32_t * linear_owned_out, size_t * n_linear_owned);
+
+    // npu.full / npu.linear pool statistics. cpu.* is reserved and all zero.
+    // used   = in-use + cache-resident blocks (evictable prefix cache).
+    // free   = free and NOT cache-resident (the watermark is not subtracted).
+    // cached = free but cache-resident; allocatable = free + cached.
+    LLAMA_API bool llama_paged_scheduler_get_kv_cache_stats(struct llama_paged_scheduler * sched,
+                                                            struct llama_paged_kv_cache_stats * out);
+
     // Returns the current batch's paged routing metadata. Valid until the next
     // call to llama_paged_scheduler_prepare_batch on this scheduler. Do not free.
     LLAMA_API const struct llama_paged_batch_info * llama_paged_scheduler_get_batch_info(
@@ -1837,6 +1924,95 @@ extern "C" {
     LLAMA_API void llama_paged_scheduler_set_on_finish(struct llama_paged_scheduler * sched,
                                                        llama_paged_on_finish_cb       cb,
                                                        void *                         user_data);
+
+    //
+    // GPU eviction policy (doc docs/kvcache-manager/prefix-cache-evict-policy.md)
+    //
+
+    // GPU free-list node. Opaque in the C API: the pointer chain returned by
+    // llama_paged_free_block_next() is the real free queue (zero copy, no
+    // snapshot). All node pointers are only valid during the callback call.
+    typedef struct llama_paged_free_block llama_paged_free_block;
+
+    LLAMA_API const llama_paged_free_block * llama_paged_free_block_next(
+            const llama_paged_free_block * block);                 // NULL terminates
+    LLAMA_API uint32_t     llama_paged_free_block_id      (const llama_paged_free_block * block);
+    LLAMA_API int32_t      llama_paged_free_block_has_hash(const llama_paged_free_block * block);
+    LLAMA_API uint64_t     llama_paged_free_block_hash    (const llama_paged_free_block * block);
+    // Representative tag (lowest id of the block's set), kept for single-tag
+    // callers. Does not imply "first owner". 0 when untagged.
+    LLAMA_API uint64_t     llama_paged_free_block_tag     (const llama_paged_free_block * block);
+    // Full tag set of the node: every tag (uint64, 0 = none) that used the
+    // block while it stayed cache-resident, deduplicated. tag_at() enumerates
+    // them in ascending id order; tag_count() is 0 for untagged nodes.
+    LLAMA_API uint32_t     llama_paged_free_block_tag_count(const llama_paged_free_block * block);
+    LLAMA_API uint64_t     llama_paged_free_block_tag_at   (const llama_paged_free_block * block, uint32_t index);
+    // Exact tag membership (O(log k)). Tag 0 / unknown tags return 0; the
+    // query never mutates any state.
+    LLAMA_API int32_t      llama_paged_free_block_has_tag   (const llama_paged_free_block * block, uint64_t tag);
+
+    // Which GPU pool is asking. Full-attention and linear-state pools have
+    // independent block-id spaces, so the kind MUST be passed to the callback.
+    typedef enum llama_paged_pool_kind {
+        LLAMA_PAGED_POOL_FULL   = 0,   // full-attention KV pool
+        LLAMA_PAGED_POOL_LINEAR = 1,   // linear-state pool (GPU segment)
+    } llama_paged_pool_kind;
+
+    // Batch eviction picker (kv_paged only).
+    //
+    //   ud           user data registered with the setter below
+    //   pool         which GPU pool the head belongs to
+    //   n_needed     minimum number of cache-resident blocks that MUST be
+    //                sacrificed by this allocation (num_blocks - plain_free_blocks)
+    //   head         head of that pool's GPU free list, in queue order
+    //   out_ids      buffer filled by the callback, capacity out_capacity
+    //   out_capacity capacity of out_ids; >= n_needed, and may be larger so the
+    //                callback can deliberately sacrifice a bigger batch
+    //
+    // Traverse with llama_paged_free_block_next(), fill out_ids with the block ids
+    // to sacrifice in sacrifice order, and return the number of ids written.
+    //
+    // Return 0 means "no block may be sacrificed": if n_needed > 0 the allocation
+    // fails atomically and no block is touched (the request stays waiting / gets
+    // preempted). Legacy FIFO behaviour is obtained by NOT installing a callback
+    // (setter with cb == NULL), not by returning 0.
+    //
+    // Runs on the scheduler thread, inside allocation; must not call back into the
+    // scheduler / cache / block manager, and must not mutate the list.
+    typedef uint32_t (*llama_paged_evict_pick_cb)(
+            void *                         ud,
+            llama_paged_pool_kind          pool,
+            uint32_t                       n_needed,
+            const llama_paged_free_block * head,
+            uint32_t *                     out_ids,
+            uint32_t                       out_capacity);
+
+    // Default picker: walk the list and return the first n_needed cache-resident
+    // nodes in queue order ("earliest cached blocks first"). Note this is NOT
+    // byte-identical to legacy FIFO allocation when plain and cached blocks are
+    // interleaved; pass cb == NULL to the setter for exact legacy behaviour.
+    LLAMA_API uint32_t llama_paged_evict_pick_default(void *                         ud,
+                                                      llama_paged_pool_kind          pool,
+                                                      uint32_t                       n_needed,
+                                                      const llama_paged_free_block * head,
+                                                      uint32_t *                     out_ids,
+                                                      uint32_t                       out_capacity);
+
+    // Install an eviction policy on a live scheduler.
+    //
+    // `cb == NULL` restores the legacy FIFO policy. The callback is synchronously
+    // installed on both the full-attention and the linear-state GPU pools and
+    // affects only evictions from that point on (no cache state is rebuilt).
+    //
+    // Threading: must be called from the thread that drives the scheduler, before
+    // llama_paged_scheduler_warmup() / the first step(), or between two steps.
+    // The scheduler takes no lock, so concurrent use with a running step is UB.
+    //
+    // Returns false when `sched` is NULL.
+    LLAMA_API bool llama_paged_scheduler_set_evict_decision(
+            struct llama_paged_scheduler * sched,
+            llama_paged_evict_pick_cb      cb,
+            void *                         user_data);
 
     // Cancel a queued or in-flight request. The request is removed from the
     // scheduler, its blocks are released (CPU-pool blocks included) and the

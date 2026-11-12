@@ -40,7 +40,7 @@ json task_params::to_json(bool only_metrics) const {
     }
 
     if (only_metrics) {
-        return json {
+        json out = json {
             {"seed",                      sampling.seed},
             {"temperature",               sampling.temp},
             {"dynatemp_range",            sampling.dynatemp_range},
@@ -84,6 +84,10 @@ json task_params::to_json(bool only_metrics) const {
             {"backend_sampling",          sampling.backend_sampling},
             {"lora",                      lora},
         };
+        if (tag != 0) {
+            out["tag"] = tag;
+        }
+        return out;
     }
 
     auto grammar_triggers = json::array();
@@ -92,7 +96,7 @@ json task_params::to_json(bool only_metrics) const {
         grammar_triggers.push_back(ct.to_json());
     }
 
-    return json {
+    json out = json {
         {"seed",                      sampling.seed},
         {"temperature",               sampling.temp},
         {"dynatemp_range",            sampling.dynatemp_range},
@@ -143,6 +147,10 @@ json task_params::to_json(bool only_metrics) const {
         {"backend_sampling",          sampling.backend_sampling},
         {"lora",                      lora},
     };
+    if (tag != 0) {
+        out["tag"] = tag;
+    }
+    return out;
 }
 
 //
@@ -1512,6 +1520,32 @@ json server_task_result_error::to_json() {
 //
 json server_task_result_slots::to_json() {
     return slots_data;
+}
+
+json server_task_result_kv_stats::to_json() {
+    auto pool = [](const llama_paged_kv_cache_pool_stats & p) {
+        auto blocks = [](const llama_paged_kv_cache_block_stats & b) {
+            return json{
+                {"total_blocks",       b.total_blocks},
+                {"used_blocks",        b.used_blocks},
+                {"free_blocks",        b.free_blocks},
+                {"cached_blocks",      b.cached_blocks},
+                {"allocatable_blocks", b.allocatable_blocks},
+            };
+        };
+        return json{
+            {"full",   blocks(p.full)},
+            {"linear", blocks(p.linear)},
+        };
+    };
+    return json{
+        {"npu", pool(stats.npu)},
+        {"cpu", pool(stats.cpu)},
+    };
+}
+
+json server_task_result_tag_usage::to_json() {
+    return payload;
 }
 
 json server_task_result_metrics::to_json() {

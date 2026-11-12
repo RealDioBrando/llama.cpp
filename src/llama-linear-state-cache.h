@@ -7,7 +7,9 @@
 
 #include <map>
 #include <memory>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct llama_model;
@@ -49,9 +51,16 @@ public:
     bool has_active(llama_seq_id seq_id) const;
     bool is_active_on_gpu(llama_seq_id seq_id) const;
     // Allocate a zeroed ACTIVE state block on the GPU pool. Returns true if
-    // the sequence already had one.
-    bool ensure_active(llama_seq_id seq_id);
+    // the sequence already had one. `tag` (uint64, 0 = none) is recorded as
+    // the owner tag of the sequence and written to the ACTIVE state block too,
+    // so the block keeps the full history of tags that used it while
+    // cache-resident.
+    bool ensure_active(llama_seq_id seq_id, uint64_t tag = 0);
     bool release(llama_seq_id seq_id);
+
+    // Record the owner tag of a sequence without touching its ACTIVE block.
+    bool set_seq_tag(llama_seq_id seq_id, uint64_t tag);
+    uint64_t seq_tag(llama_seq_id seq_id) const;
 
     // Fork the state of `src` into `dst` (copy-on-fork, Q2).
     bool seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst);
@@ -81,7 +90,10 @@ public:
 
     // Copy the checkpoint for chain_hash into a fresh ACTIVE GPU block owned
     // by seq_id. Fails atomically when no GPU block can be obtained.
-    bool fork_checkpoint(uint64_t chain_hash, llama_seq_id seq_id);
+    // `tag` (uint64, 0 = none) is the request's owner tag: on failure the
+    // sequence state is gone, so a retry cannot recover it from seq_state;
+    // callers pass it explicitly.
+    bool fork_checkpoint(uint64_t chain_hash, llama_seq_id seq_id, uint64_t tag = 0);
 
     bool checkpoint_is_live(const llama_linear_prefix_entry & e) const;
 
@@ -110,18 +122,28 @@ public:
 
     uint32_t n_free_gpu_blocks() const;
     uint32_t n_free_cpu_blocks() const;
+    uint32_t n_allocatable_gpu_blocks() const;
+    uint32_t n_cached_gpu_blocks() const;
+    uint32_t get_num_gpu_blocks() const;
+    uint32_t get_num_cpu_blocks() const;
     bool     has_free_gpu_blocks(uint32_t n) const;
     bool     has_free_cpu_blocks(uint32_t n) const;
 
-    // GPU-cached checkpoints may be demoted to the CPU pool under GPU
-    // pressure; CACHED blocks may be evicted entirely. ACTIVE blocks are
-    // never touched.
-    bool demote_one_checkpoint();
-    // Evict one CACHED checkpoint. `placement` selects the pool: -1 = any,
-    // 0 = CPU pool only, 1 = GPU pool only. Callers that need a block from a
-    // specific pool must not fall back to the other one: evicting there frees
-    // nothing useful and throws away checkpoints that could still be forked.
-    bool evict_one_checkpoint(int placement = -1);
+    // GPU eviction policy used when an allocation must sacrifice cache-resident
+    // checkpoints (docs/kvcache-manager/prefix-cache-evict-policy.md).
+    // cb == nullptr restores the legacy FIFO path. The settings are kept on the
+    // cache object and re-installed whenever clear() rebuilds the block
+    // manager. Must be called from the scheduler thread (no locking).
+    void set_evict_pick_cb(llama_paged_evict_pick_cb cb, void * ud);
+
+    // True when a GPU checkout failed because the installed eviction picker
+    // refused to name enough victims. Cleared by reset_gpu_checkout_refusal()
+    // once per scheduling step.
+    bool gpu_checkout_refused_by_policy() const;
+    void reset_gpu_checkout_refusal();
+
+    // Cache-resident checkpoints are evicted lazily by checkout when the
+    // pool needs their block; ACTIVE blocks are never touched.
 
     //
     // Batch mapping
@@ -141,6 +163,14 @@ public:
     void clear();
     void set_prefix_enabled(bool v) { checkpoint_index.set_enabled(v); }
 
+    // Owner tag of a physical state block (empty when untagged).
+    uint64_t block_tag(uint32_t block_id) const;
+
+    // Tag aggregation: live, GPU-resident checkpoints filed under every tag in
+    // the block's tag set.
+    // ACTIVE state blocks and CPU checkpoints are never included.
+    void collect_tag_blocks(std::unordered_map<uint64_t, std::unordered_set<uint32_t>> & owned) const;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
 private:
@@ -148,17 +178,18 @@ private:
         uint32_t  block_id = 0;
         llama_pos pos      = -1;  // last processed token position
         uint32_t  rollback = 0;   // rollback plane selected for the next batch
+        uint64_t  tag      = 0;   // owner tag of the sequence (0 = none)
     };
 
     bool allocate_gpu_block(uint32_t & block_id);
     bool allocate_cpu_block(uint32_t & block_id);
     void release_block(uint32_t block_id);
 
-    bool demote_checkpoint(uint64_t chain_hash, llama_linear_prefix_entry e);
-    bool evict_checkpoint(uint64_t chain_hash, llama_linear_prefix_entry e);
+    // Checkout choke points: drop checkpoint-index entries for lazily evicted
+    // cache-resident state blocks.
+    std::vector<uint32_t> checkout_gpu_blocks(uint32_t n);
+    std::vector<uint32_t> checkout_cpu_blocks(uint32_t n);
 
-    // placement filter: -1 any, 0 CPU, 1 GPU
-    const llama_linear_prefix_entry * oldest_checkpoint(int placement) const;
     bool alloc_checkpoint_block(uint32_t & block_id);
 
     const uint32_t n_rs_seq;
@@ -168,6 +199,12 @@ private:
     const uint32_t n_active_reserve;
 
     llama_block_manager block_manager;
+
+    // Eviction policy registered through set_evict_pick_cb(). Kept here so
+    // clear() can re-install it after rebuilding the block manager; otherwise
+    // llama_memory_clear() would silently drop the policy.
+    llama_paged_evict_pick_cb evict_pick_cb_ = nullptr;
+    void *                    evict_pick_ud_ = nullptr;
 
     std::unique_ptr<llama_memory_recurrent> mem;
 

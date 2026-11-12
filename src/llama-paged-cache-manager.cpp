@@ -30,6 +30,25 @@ bool llama_paged_cache_manager::prefix_enabled() const {
     return full_cache->prefix_enabled();
 }
 
+void llama_paged_cache_manager::set_evict_pick_cb(llama_paged_evict_pick_cb cb, void * ud) {
+    full_cache->set_evict_pick_cb(cb, ud);
+    if (linear_cache) {
+        linear_cache->set_evict_pick_cb(cb, ud);
+    }
+}
+
+bool llama_paged_cache_manager::gpu_checkout_refused_by_policy() const {
+    return full_cache->gpu_checkout_refused_by_policy() ||
+           (linear_cache && linear_cache->gpu_checkout_refused_by_policy());
+}
+
+void llama_paged_cache_manager::reset_gpu_checkout_refusal() {
+    full_cache->reset_gpu_checkout_refusal();
+    if (linear_cache) {
+        linear_cache->reset_gpu_checkout_refusal();
+    }
+}
+
 uint64_t llama_paged_cache_manager::hash_block(uint64_t                         prev,
                                                const std::vector<llama_token> & tokens,
                                                uint32_t                         block_idx,
@@ -74,7 +93,6 @@ llama_prefix_candidate llama_paged_cache_manager::match_prefix_candidate(
             break;
         }
         c.block_ids.push_back(e->block_id);
-        c.generations.push_back(e->generation);
         c.hashes.push_back(h);
     }
 
@@ -120,7 +138,6 @@ llama_prefix_candidate llama_paged_cache_manager::match_prefix_candidate(
     }
 
     c.block_ids.resize(n_blocks);
-    c.generations.resize(n_blocks);
     c.hashes.resize(n_blocks);
     c.n_blocks  = n_blocks;
     c.reuse_pos = (llama_pos) n_blocks * block_size;
@@ -133,10 +150,9 @@ bool llama_paged_cache_manager::candidate_is_current(const llama_prefix_candidat
         return false;
     }
     for (uint32_t i = 0; i < c.n_blocks; ++i) {
-        const uint32_t id = c.block_ids[i];
-        if (full_cache->block_ref_count(id) == 0 ||
-            !full_cache->is_block_gpu(id) ||
-            full_cache->block_generation(id) != c.generations[i]) {
+        // ref_count == 0 is valid: the block is cache-resident in the free
+        // queue. Liveness is defined by the block still owning the hash.
+        if (!full_cache->prefix_block_is_live(c.block_ids[i], c.hashes[i])) {
             return false;
         }
     }
@@ -166,7 +182,7 @@ bool llama_paged_cache_manager::reserve_prefix_candidate(llama_sequence_group & 
         return true;
     }
 
-    if (linear_cache && !linear_cache->ensure_active(seq_id)) {
+    if (linear_cache && !linear_cache->ensure_active(seq_id, group.tag)) {
         LLAMA_LOG_WARN("%s: request %d cannot obtain an active state block\n", __func__, seq_id);
         return false;
     }
@@ -190,27 +206,24 @@ bool llama_paged_cache_manager::reserve_prefix_candidate(llama_sequence_group & 
     }
 
     // Copy the checkpoint into the active state block first: it can still
-    // fail on generation/eviction and must not leave block refs behind.
+    // fail on eviction and must not leave block refs behind.
     if (linear_cache && c.has_checkpoint) {
-        if (!linear_cache->fork_checkpoint(c.checkpoint_hash, seq_id)) {
+        if (!linear_cache->fork_checkpoint(c.checkpoint_hash, seq_id, group.tag)) {
             LLAMA_LOG_DEBUG("%s: request %d checkpoint became stale, rematching\n", __func__, seq_id);
             group.prefix_candidate = match_prefix_candidate(group.logical_seq);
             const llama_prefix_candidate c2 = group.prefix_candidate;
             if (!c2.valid || c2.n_blocks == 0 || !candidate_is_current(c2) ||
-                !linear_cache->fork_checkpoint(c2.checkpoint_hash, seq_id)) {
-                if (!linear_cache->ensure_active(seq_id)) {
+                !linear_cache->fork_checkpoint(c2.checkpoint_hash, seq_id, group.tag)) {
+                if (!linear_cache->ensure_active(seq_id, group.tag)) {
                     return false;
                 }
                 clear_prefix_for_full_prefill(group);
                 return true;
             }
             // fall through with the refreshed candidate
-            if (!full_cache->add_ref_blocks(c2.block_ids)) {
+            if (!full_cache->acquire_blocks(c2.block_ids, group.tag)) {
                 linear_cache->release(seq_id);
                 return false;
-            }
-            for (uint32_t i = 0; i < c2.n_blocks; ++i) {
-                full_cache->take_cached_ref(c2.hashes[i], c2.block_ids[i]);
             }
             group.block_table  = c2.block_ids;
             group.block_hashes = c2.hashes;
@@ -222,10 +235,10 @@ bool llama_paged_cache_manager::reserve_prefix_candidate(llama_sequence_group & 
         }
     }
 
-    if (!full_cache->add_ref_blocks(c.block_ids)) {
+    if (!full_cache->acquire_blocks(c.block_ids, group.tag)) {
         if (linear_cache) {
             linear_cache->release(seq_id);
-            linear_cache->ensure_active(seq_id);
+            linear_cache->ensure_active(seq_id, group.tag);
         }
         clear_prefix_for_full_prefill(group);
         group.cache_reserved = true;
@@ -234,11 +247,6 @@ bool llama_paged_cache_manager::reserve_prefix_candidate(llama_sequence_group & 
 
     group.block_table  = c.block_ids;
     group.block_hashes = c.hashes;
-    // The cache's extra reference on reused blocks now belongs to this
-    // request: the entries become non-evictable until it finishes.
-    for (uint32_t i = 0; i < c.n_blocks; ++i) {
-        full_cache->take_cached_ref(c.hashes[i], c.block_ids[i]);
-    }
     LLAMA_LOG_DEBUG("%s: request %d reuses %u cached block(s) (%d tokens)\n", __func__, seq_id, c.n_blocks,
                     (int) c.reuse_pos);
     group.n_past       = c.reuse_pos;
@@ -248,14 +256,30 @@ bool llama_paged_cache_manager::reserve_prefix_candidate(llama_sequence_group & 
 }
 
 bool llama_paged_cache_manager::allocate_blocks(llama_sequence_group & group, int32_t num_tokens) {
-    return full_cache->allocate(num_tokens, group);
-}
+    // One admission transaction. A group that has not been admitted yet gets
+    // its linear ACTIVE state block, prefix-cache refs and full-attention KV
+    // slots together: it either becomes fully runnable or keeps holding
+    // nothing. Callers only have to leave it in the waiting queue on failure
+    // (vLLM allocate_slots() == None semantics).
+    const bool newly_admitted = !group.cache_reserved;
+    if (newly_admitted && !reserve_prefix_candidate(group)) {
+        // The linear pool is exhausted. reserve_prefix_candidate() leaves no
+        // reservation behind on this path (ensure_active / fork_checkpoint are
+        // atomic), so there is nothing to roll back.
+        return false;
+    }
 
-bool llama_paged_cache_manager::evict_cached_blocks() {
-    // Only full-attention blocks can relieve full-attention capacity. State
-    // blocks use a separate pool and are demoted/evicted inside
-    // llama_linear_state_cache::ensure_active() when needed.
-    return full_cache->evict_cached_prefix_block();
+    if (!full_cache->allocate(num_tokens, group)) {
+        if (newly_admitted) {
+            // Undo exactly what this call reserved. A running group keeps its
+            // KV/linear state: its caller preempts or swaps it out instead.
+            release_request(group);
+            group.n_past   = 0;
+            group.n_prompt = group.n_prompt_total;
+        }
+        return false;
+    }
+    return true;
 }
 
 //
@@ -321,6 +345,11 @@ void llama_paged_cache_manager::truncate_sequence(llama_sequence_group & group, 
     if (n_keep_blocks < group.block_table.size()) {
         const llama_block_ids tail(group.block_table.begin() + n_keep_blocks, group.block_table.end());
         for (const uint32_t block_id : tail) {
+            // Speculative/draft blocks are normally unregistered, but never
+            // let a discarded block keep a valid prefix entry.
+            if (full_cache->block_ref_count(block_id) == 1) {
+                full_cache->invalidate_prefix_block(block_id);
+            }
             full_cache->release_block(block_id);
         }
         group.block_table.resize(n_keep_blocks);
@@ -398,7 +427,9 @@ bool llama_paged_cache_manager::swap_in(llama_sequence_group & group) {
 //
 
 void llama_paged_cache_manager::release_request(llama_sequence_group & group) {
-    full_cache->release_sequence(group);
+    // Releasing a block table never drops its prefix-index entries: blocks
+    // whose hash is still registered become cache-resident in the free queue.
+    full_cache->free_blocks(group);
     if (linear_cache) {
         linear_cache->release(group.request_id);
     }

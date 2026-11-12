@@ -132,6 +132,26 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
 
     // Setting up our block accountant
     block_manager.init(n_gpu_blocks, n_cpu_blocks, watermark);
+    // The pool kind is fixed by the owner; the callback is whatever was staged
+    // on the cache (a no-op when init() runs before the setter, as usual).
+    block_manager.set_pool_kind(LLAMA_PAGED_POOL_FULL);
+    block_manager.set_evict_pick_cb(evict_pick_cb_, evict_pick_ud_);
+}
+
+void llama_kv_cache_paged::set_evict_pick_cb(llama_paged_evict_pick_cb cb, void * ud) {
+    // Stored so clear() can re-install them after the block manager is rebuilt.
+    evict_pick_cb_ = cb;
+    evict_pick_ud_ = ud;
+    block_manager.set_pool_kind(LLAMA_PAGED_POOL_FULL);
+    block_manager.set_evict_pick_cb(cb, ud);
+}
+
+bool llama_kv_cache_paged::gpu_checkout_refused_by_policy() const {
+    return block_manager.gpu_checkout_refused_by_policy();
+}
+
+void llama_kv_cache_paged::reset_gpu_checkout_refusal() {
+    block_manager.reset_gpu_checkout_refusal();
 }
 
 bool llama_kv_cache_paged::allocate(int32_t num_tokens, llama_sequence_group & group) {
@@ -152,17 +172,45 @@ bool llama_kv_cache_paged::allocate(int32_t num_tokens, llama_sequence_group & g
         return false;
     }
 
-    llama_block_ids new_ids = block_manager.checkout_gpu_blocks(num_requested_blocks);
+    // Checkout may evict cache-resident prefix blocks; the wrapper drops their
+    // index entries before the blocks are handed out.
+    llama_block_ids new_ids = checkout_gpu_blocks(num_requested_blocks);
+    if (new_ids.size() != num_requested_blocks) {
+        if (new_ids.empty()) {
+            // An installed eviction policy may legitimately refuse to sacrifice
+            // cache-resident blocks (design §8.4): the request simply stays
+            // waiting, so this is expected back-pressure, not an error.
+            LLAMA_LOG_DEBUG("%s: GPU checkout refused %d block(s); request stays waiting.\n", __func__,
+                            num_requested_blocks);
+        } else {
+            LLAMA_LOG_ERROR("%s: checkout returned %zu of %d blocks.\n", __func__, new_ids.size(), num_requested_blocks);
+            block_manager.release_gpu_blocks(new_ids);
+        }
+        return false;
+    }
+    // Fresh allocations carry the owner tag of the requesting group. The tag
+    // is only an ownership record; the block enters the tag -> block mapping
+    // once it is filled and registered in the prefix index.
+    for (const uint32_t id : new_ids) {
+        block_manager.set_tag(id, group.tag);
+    }
     concat_block_ids(group.block_table, new_ids);
     LLAMA_LOG_DEBUG("%s: successfully allocated %d.\n", __func__, num_requested_blocks);
     return true;
 }
 
-void llama_kv_cache_paged::free_blocks(llama_sequence_group & group) {
-    free_blocks(group, {});
+llama_block_ids llama_kv_cache_paged::checkout_gpu_blocks(uint32_t num_blocks) {
+    std::vector<llama_block_manager::evicted_block> evicted;
+    llama_block_ids ids = block_manager.checkout_gpu_blocks(num_blocks, &evicted);
+    for (const auto & ev : evicted) {
+        // Identity-checked removal: a same-chain entry owned by another block
+        // must survive.
+        prefix_index.remove_if_block(ev.hash, ev.block_id);
+    }
+    return ids;
 }
 
-void llama_kv_cache_paged::free_blocks(llama_sequence_group & group, const llama_block_ids & keep) {
+void llama_kv_cache_paged::free_blocks(llama_sequence_group & group) {
     if (group.block_table.empty()) {
         return;
     }
@@ -171,9 +219,6 @@ void llama_kv_cache_paged::free_blocks(llama_sequence_group & group, const llama
     llama_block_ids blocks_to_free_cpu;
 
     for (uint32_t block_id : group.block_table) {
-        if (std::find(keep.begin(), keep.end(), block_id) != keep.end()) {
-            continue;
-        }
         if (block_manager.is_gpu(block_id)) {
             blocks_to_free_gpu.push_back(block_id);
         } else {
@@ -181,6 +226,7 @@ void llama_kv_cache_paged::free_blocks(llama_sequence_group & group, const llama
         }
     }
 
+    // Hash entries are intentionally kept for blocks that stay cache-resident.
     if (!blocks_to_free_gpu.empty()) {
         block_manager.release_gpu_blocks(blocks_to_free_gpu);
     }
@@ -237,6 +283,14 @@ uint32_t llama_kv_cache_paged::n_free_gpu_blocks() const {
 
 uint32_t llama_kv_cache_paged::n_free_cpu_blocks() const {
     return (uint32_t) block_manager.n_free_cpu_blocks();
+}
+
+uint32_t llama_kv_cache_paged::n_allocatable_gpu_blocks() const {
+    return (uint32_t) block_manager.n_allocatable_gpu_blocks();
+}
+
+uint32_t llama_kv_cache_paged::n_cached_gpu_blocks() const {
+    return (uint32_t) block_manager.n_cached_gpu_blocks();
 }
 
 void llama_kv_cache_paged::do_block_copy(const llama_block_ids & src_ids,
@@ -334,25 +388,41 @@ bool llama_kv_cache_paged::swap_in(llama_sequence_group & group) {
         return false;
     }
 
-    llama_block_ids new_ids = block_manager.checkout_gpu_blocks(n_new_ids);
+    llama_block_ids new_ids = checkout_gpu_blocks(n_new_ids);
+    if (new_ids.size() != n_new_ids) {
+        return false;
+    }
     llama_block_ids copy_dst(new_ids.begin(), new_ids.begin() + num_blocks);
     do_block_copy(group.block_table, copy_dst, /*to_gpu=*/true);
 
-    // Re-point the prefix index before the old blocks return to the pool.
-    // Only entries that still refer to this request's copy are moved; a
-    // same-chain entry owned by another request must not be hijacked.
+    // The restored GPU copies are private and unhashed. If the original
+    // cache-resident copy was evicted while the request was swapped out, try to
+    // re-register the restored full blocks so the chain stays reusable. If a
+    // live entry already exists for the hash (first-wins), this is a no-op.
     for (size_t i = 0; i < group.block_hashes.size() && i < num_blocks; ++i) {
-        const auto * e = prefix_index.find_hash(group.block_hashes[i]);
-        if (e && e->cached) {
-            // The entry is owned by the cache; keep it on the cache's copy.
-            continue;
+        if ((i + 1) * block_size > group.logical_seq.size()) {
+            break;
         }
-        prefix_index.update_block_id_if(group.block_hashes[i], group.block_table[i], new_ids[i],
-                                        block_manager.block_generation(new_ids[i]));
+        const uint64_t hash = group.block_hashes[i];
+        const auto *   e    = prefix_index.find_hash(hash);
+        if (e && prefix_block_is_live(e->block_id, hash)) {
+            continue;  // a live copy already owns this chain
+        }
+        register_prefix_block(hash, new_ids[i], group.request_id, (uint32_t) i,
+                              group.logical_seq[i * block_size],
+                              group.logical_seq[(i + 1) * block_size - 1]);
     }
 
     free_blocks(group);
     group.block_table = std::move(new_ids);
+
+    // The restored GPU copies are private and unhashed. Record the requesting
+    // tag so the block keeps the full set of tags that used it while it stays
+    // cache-resident. set_tag is allowed here: every restored block is owned
+    // by the group (ref_count > 0).
+    for (const uint32_t id : group.block_table) {
+        block_manager.set_tag(id, group.tag);
+    }
     return true;
 }
 
@@ -367,18 +437,16 @@ bool llama_kv_cache_paged::swap_out(llama_sequence_group & group) {
     }
 
     llama_block_ids new_ids = block_manager.checkout_cpu_blocks(num_blocks);
+    if (new_ids.size() != num_blocks) {
+        return false;
+    }
     do_block_copy(group.block_table, new_ids, /*to_gpu=*/false);
 
-    for (size_t i = 0; i < group.block_hashes.size() && i < num_blocks; ++i) {
-        const auto * e = prefix_index.find_hash(group.block_hashes[i]);
-        if (e && e->cached) {
-            // The entry is owned by the cache; keep it on the cache's copy.
-            continue;
-        }
-        prefix_index.update_block_id_if(group.block_hashes[i], group.block_table[i], new_ids[i],
-                                        block_manager.block_generation(new_ids[i]));
-    }
-
+    // The CPU copies are private and unhashed. Keeping the hash on the old GPU
+    // blocks is deliberate: if this group was their last holder they become
+    // cache-resident (ref_count == 0) and remain hittable; if they are shared,
+    // the hash stays with the live GPU copy. The index never points at a CPU
+    // block in this phase.
     free_blocks(group);
     group.block_table = new_ids;
     return true;
@@ -405,20 +473,59 @@ uint32_t llama_kv_cache_paged::get_num_gpu_blocks() const {
     return num_gpu_blocks;
 }
 
+uint32_t llama_kv_cache_paged::get_num_cpu_blocks() const {
+    return num_cpu_blocks;
+}
+
+uint64_t llama_kv_cache_paged::block_tag(uint32_t block_id) const {
+    return block_manager.tag(block_id);
+}
+
+void llama_kv_cache_paged::collect_tag_blocks(
+        std::unordered_map<uint64_t, std::unordered_set<uint32_t>> & owned,
+        std::unordered_set<uint32_t> *                               reusable_ids) const {
+    for (const auto & [hash, e] : prefix_index.entries()) {
+        (void) hash;
+        const uint32_t id = e.block_id;
+        // Same liveness filter the prefix matcher applies: GPU-resident and
+        // still owning the hash. ref_count == 0 is valid: that is a cache-
+        // resident block kept in the free queue.
+        if (!block_manager.is_gpu(id) ||
+            !block_manager.block_has_hash(id) ||
+            block_manager.block_hash(id) != e.hash) {
+            continue;
+        }
+        if (reusable_ids) {
+            reusable_ids->insert(id);
+        }
+        // Attribute the block to EVERY tag that used it while cache-resident.
+        // With the multi-tag model there is no owner/primary tag, and tag()
+        // would expose only one representative, silently dropping the others
+        // from the per-tag statistics.
+        const uint32_t n_tags = block_manager.tag_count(id);
+        for (uint32_t t = 0; t < n_tags; ++t) {
+            const uint64_t tag = block_manager.tag_at(id, t);
+            if (tag != 0) {
+                owned[tag].insert(id);
+            }
+        }
+    }
+}
+
 void llama_kv_cache_paged::concat_block_ids(llama_block_ids &       to_block_table,
                                             const llama_block_ids & from_block_table) {
     to_block_table.insert(to_block_table.end(), from_block_table.begin(), from_block_table.end());
 }
 
 bool llama_kv_cache_paged::share_blocks(llama_sequence_group & group, const llama_block_ids & src_ids) {
-    if (!add_ref_blocks(src_ids)) {
+    if (!add_ref_blocks(src_ids, group.tag)) {
         return false;
     }
     concat_block_ids(group.block_table, src_ids);
     return true;
 }
 
-bool llama_kv_cache_paged::add_ref_blocks(const llama_block_ids & ids) {
+bool llama_kv_cache_paged::add_ref_blocks(const llama_block_ids & ids, uint64_t tag) {
     llama_block_ids added;
     added.reserve(ids.size());
     for (const uint32_t id : ids) {
@@ -436,6 +543,43 @@ bool llama_kv_cache_paged::add_ref_blocks(const llama_block_ids & ids) {
         }
         added.push_back(id);
     }
+    // Tag only after the whole operation succeeded: on failure the caller gets
+    // its refs back and the blocks must not have picked up a phantom tag.
+    if (tag != 0) {
+        for (const uint32_t id : ids) {
+            block_manager.set_tag(id, tag);
+        }
+    }
+    return true;
+}
+
+bool llama_kv_cache_paged::acquire_blocks(const llama_block_ids & ids, uint64_t tag) {
+    llama_block_ids acquired;
+    acquired.reserve(ids.size());
+    for (const uint32_t id : ids) {
+        const bool ok = block_manager.block_ref_count(id) == 0 ? block_manager.touch_block(id)
+                                                               : block_manager.add_ref_block(id);
+        if (!ok) {
+            // All-or-nothing: undo the refs acquired so far. release_* keeps
+            // any hash entry, so cache residency is preserved.
+            for (auto it = acquired.rbegin(); it != acquired.rend(); ++it) {
+                if (block_manager.is_gpu(*it)) {
+                    block_manager.release_gpu_blocks({ *it });
+                } else {
+                    block_manager.release_cpu_blocks({ *it });
+                }
+            }
+            return false;
+        }
+        acquired.push_back(id);
+    }
+    // Second pass: record the requesting tag only once the whole acquisition
+    // succeeded, so an atomic failure leaves every tag set untouched.
+    if (tag != 0) {
+        for (const uint32_t id : ids) {
+            block_manager.set_tag(id, tag);
+        }
+    }
     return true;
 }
 
@@ -451,19 +595,16 @@ const llama_full_prefix_entry * llama_kv_cache_paged::find_prefix_block(uint64_t
                                                                         llama_token first_tok,
                                                                         llama_token last_tok) const {
     const auto * e = prefix_index.find(hash, first_tok, last_tok);
-    if (!e) {
-        return nullptr;
-    }
-    if (block_manager.block_ref_count(e->block_id) == 0) {
-        return nullptr;
-    }
-    if (!block_manager.is_gpu(e->block_id)) {
-        return nullptr;
-    }
-    if (block_manager.block_generation(e->block_id) != e->generation) {
+    if (!e || !prefix_block_is_live(e->block_id, e->hash)) {
         return nullptr;
     }
     return e;
+}
+
+bool llama_kv_cache_paged::prefix_block_is_live(uint32_t block_id, uint64_t hash) const {
+    return block_manager.is_gpu(block_id) &&
+           block_manager.block_has_hash(block_id) &&
+           block_manager.block_hash(block_id) == hash;
 }
 
 void llama_kv_cache_paged::register_prefix_block(uint64_t    hash,
@@ -472,113 +613,30 @@ void llama_kv_cache_paged::register_prefix_block(uint64_t    hash,
                                                  uint32_t    block_idx,
                                                  llama_token first_tok,
                                                  llama_token last_tok) {
-    // Re-registering the same chain must not orphan a cache-resident block
-    // that was kept alive by the previous entry.
-    const auto * old = prefix_index.find(hash, first_tok, last_tok);
-    const uint32_t old_id = old ? old->block_id : 0;
-    const bool old_cached = old && old->cached;
-
-    prefix_index.register_block(hash, block_id, block_manager.block_generation(block_id), owner_seq, block_idx,
-                                first_tok, last_tok);
-
-    if (old && old_id != block_id && old_cached &&
-        block_manager.block_ref_count(old_id) == 1 && block_manager.is_gpu(old_id)) {
-        release_block(old_id);
-    }
-}
-
-void llama_kv_cache_paged::release_sequence(llama_sequence_group & group) {
-    struct planned_hash {
-        uint64_t hash;
-        uint32_t block_id;
-        size_t   index;
-        bool     keep;
-    };
-
-    std::vector<planned_hash> plan;
-    llama_block_ids           keep;
-
-    for (size_t i = 0; i < group.block_hashes.size() && i < group.block_table.size(); ++i) {
-        const uint64_t h  = group.block_hashes[i];
-        const uint32_t id = group.block_table[i];
-
-        bool keep_block = block_manager.block_ref_count(id) == 1 && block_manager.is_gpu(id);
-        if (keep_block) {
-            // If another request already registered this chain for a different
-            // physical block, this copy is a redundant duplicate: release it
-            // rather than keeping an unindexed block checked out forever.
-            const auto * e = prefix_index.find_hash(h);
-            if (e && e->block_id != id) {
-                keep_block = false;
-            }
+    // First-wins: if another physical block already owns this chain, keep it.
+    // The duplicate copy stays unhashed and is reclaimed as a plain free block.
+    const auto * old = prefix_index.find_hash(hash);
+    if (old) {
+        if (prefix_block_is_live(old->block_id, hash)) {
+            return;
         }
-        plan.push_back({ h, id, i, keep_block });
-        if (keep_block) {
-            keep.push_back(id);
-        }
+        prefix_index.remove(hash);  // stale entry, replace it
     }
 
-    free_blocks(group, keep);
-
-    for (const planned_hash & p : plan) {
-        if (p.keep) {
-            const auto * e = prefix_index.find_hash(p.hash);
-            if (!e) {
-                // A sharer may have dropped the entry; re-register so the
-                // still-referenced block stays visible and reclaimable.
-                const size_t i = p.index;
-                if ((i + 1) * block_size <= group.logical_seq.size()) {
-                    prefix_index.register_block(p.hash, p.block_id, block_manager.block_generation(p.block_id),
-                                                group.request_id, (uint32_t) i,
-                                                group.logical_seq[i * block_size],
-                                                group.logical_seq[(i + 1) * block_size - 1]);
-                }
-                e = prefix_index.find_hash(p.hash);
-            }
-            if (e && e->block_id == p.block_id) {
-                prefix_index.set_cached_state(p.hash, true);
-            }
-        } else if (block_manager.block_ref_count(p.block_id) == 0) {
-            // Only drop the entry when the block actually returned to the
-            // pool. A block shared with another live request must stay
-            // indexed so it remains reachable when the last sharer finishes.
-            prefix_index.remove_if_block(p.hash, p.block_id);
-        }
+    if (block_manager.block_has_hash(block_id)) {
+        GGML_ASSERT(block_manager.block_hash(block_id) == hash && "block already owns another hash");
+    } else {
+        block_manager.set_block_hash(block_id, hash);
     }
+    prefix_index.register_block(hash, block_id, owner_seq, block_idx, first_tok, last_tok);
 }
 
-bool llama_kv_cache_paged::take_cached_ref(uint64_t hash, uint32_t block_id) {
-    const auto * e = prefix_index.find_hash(hash);
-    if (!e || e->block_id != block_id || !e->cached) {
-        return false;
+void llama_kv_cache_paged::invalidate_prefix_block(uint32_t block_id) {
+    if (!block_manager.block_has_hash(block_id)) {
+        return;
     }
-    // The caller has already added its own reference, so the block cannot
-    // disappear when the cache's reference is released here.
-    if (block_manager.block_ref_count(block_id) <= 1) {
-        return false;
-    }
-    prefix_index.set_cached_state(hash, false);
-    release_block(block_id);
-    return true;
-}
-
-bool llama_kv_cache_paged::evict_cached_prefix_block() {
-    uint64_t hash       = 0;
-    uint32_t block_id   = 0;
-    uint32_t generation = 0;
-    if (!prefix_index.pop_lru_cached(hash, block_id, generation)) {
-        return false;
-    }
-    if (block_manager.block_ref_count(block_id) > 0 &&
-        block_manager.block_generation(block_id) == generation) {
-        release_block(block_id);
-    }
-    LLAMA_LOG_DEBUG("%s: evicted cache-resident prefix block %u\n", __func__, block_id);
-    return true;
-}
-
-uint32_t llama_kv_cache_paged::block_generation(uint32_t block_id) const {
-    return block_manager.block_generation(block_id);
+    prefix_index.remove_if_block(block_manager.block_hash(block_id), block_id);
+    block_manager.clear_block_hash(block_id);
 }
 
 uint32_t llama_kv_cache_paged::block_ref_count(uint32_t block_id) const {
@@ -587,6 +645,14 @@ uint32_t llama_kv_cache_paged::block_ref_count(uint32_t block_id) const {
 
 bool llama_kv_cache_paged::is_block_gpu(uint32_t block_id) const {
     return block_manager.is_gpu(block_id);
+}
+
+bool llama_kv_cache_paged::block_has_hash(uint32_t block_id) const {
+    return block_manager.block_has_hash(block_id);
+}
+
+uint64_t llama_kv_cache_paged::block_hash(uint32_t block_id) const {
+    return block_manager.block_hash(block_id);
 }
 
 // llama_memory_i
@@ -674,6 +740,10 @@ void llama_kv_cache_paged::clear(bool data) {
 
     block_manager = llama_block_manager();
     block_manager.init(num_gpu_blocks, num_cpu_blocks, watermark);
+    // The fresh block manager lost the eviction policy: re-install it so that
+    // llama_memory_clear() does not silently disable it.
+    block_manager.set_pool_kind(LLAMA_PAGED_POOL_FULL);
+    block_manager.set_evict_pick_cb(evict_pick_cb_, evict_pick_ud_);
 
     if (data) {
         for (const auto * pool : { &k_gpu_layers, &v_gpu_layers, &k_cpu_layers, &v_cpu_layers }) {

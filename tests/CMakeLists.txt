@@ -302,6 +302,11 @@ llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 llama_build_and_test(test-paged-kv-e2e.cpp ARGS -m "${MODEL_DEST}" -ngl 99)
 set_tests_properties(test-paged-kv-e2e PROPERTIES FIXTURES_REQUIRED test-download-model)
+# Block-manager unit tests plus setter/lifecycle integration tests (real paged
+# cache + scheduler on the CPU backend) for the prefix-cache eviction policy
+# callback. No model is needed.
+llama_build_and_test(tag_kvcache_manger/test-paged-evict-policy.cpp)
+target_include_directories(test-paged-evict-policy PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 llama_build_and_test(test-arg-parser.cpp)
 llama_build_and_test(test-model-resolution.cpp)

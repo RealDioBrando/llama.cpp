@@ -128,6 +128,11 @@ struct server_context {
 
     // note: must be set before load_model() is called
     void set_state_callback(server_state_callback_t callback);
+
+    // Install a paged prefix-cache eviction policy. Paged scheduler only.
+    // Must be called on the main loop thread, outside update().
+    // Returns false when there is no paged scheduler.
+    bool set_paged_evict_decision(llama_paged_evict_pick_cb cb, void * user_data);
 };
 
 
@@ -150,6 +155,9 @@ struct server_routes {
     server_http_context::handler_t get_metrics;
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
+    // paged KV block statistics and per-tag usage (--kv-paged only)
+    server_http_context::handler_t get_kv_stats;
+    server_http_context::handler_t get_tag_usage;
     server_http_context::handler_t get_props;
     server_http_context::handler_t post_props;
     server_http_context::handler_t post_infill;

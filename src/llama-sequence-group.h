@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <string>
 #include <vector>
 
 enum class llama_sequence_group_status {
@@ -42,7 +43,6 @@ struct llama_prefix_candidate {
     uint64_t  checkpoint_hash = 0;
 
     std::vector<uint32_t> block_ids;    // [n_blocks]
-    std::vector<uint32_t> generations;  // [n_blocks] KV block generations
     std::vector<uint64_t> hashes;       // [n_blocks] chain hashes
 };
 
@@ -56,6 +56,11 @@ struct llama_sequence_group {
     // Request priority: smaller values are served first, default 0.
     // Read-only after queue_request().
     int32_t priority = 0;
+    // Optional owner tag (uint64) supplied by the caller (see
+    // llama_paged_scheduler_set_request_tag). 0 means "no tag". Blocks first
+    // allocated by this group become owned by the tag; it is inherited by
+    // forked children.
+    uint64_t tag = 0;
     // Monotonic enqueue sequence assigned by the scheduler in queue_request().
     // Only used to break ties between equal (priority, t_arrival_time).
     uint64_t arrival_seq = 0;

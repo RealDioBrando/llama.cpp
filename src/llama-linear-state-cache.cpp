@@ -38,6 +38,10 @@ llama_linear_state_cache::llama_linear_state_cache(const llama_model & model,
             &pool);
 
     block_manager.init(n_gpu_blocks, n_cpu_blocks, /*watermark=*/ 0.0f);
+    // The pool kind is fixed by the owner here (init happens in the ctor);
+    // the callback is whatever was staged on the cache, usually nullptr.
+    block_manager.set_pool_kind(LLAMA_PAGED_POOL_LINEAR);
+    block_manager.set_evict_pick_cb(evict_pick_cb_, evict_pick_ud_);
 
     LLAMA_LOG_INFO("%s: linear state cache: %u GPU blocks, %u CPU blocks, %u planes\n", __func__,
                    n_gpu_blocks, n_cpu_blocks, 1 + n_rs_seq);
@@ -64,13 +68,26 @@ void llama_linear_state_cache::release_block(uint32_t block_id) {
     }
 }
 
-bool llama_linear_state_cache::allocate_gpu_block(uint32_t & block_id) {
-    while (!block_manager.has_free_gpu_blocks(1)) {
-        if (!demote_one_checkpoint() && !evict_one_checkpoint(/*placement=*/1)) {
-            return false;
-        }
+std::vector<uint32_t> llama_linear_state_cache::checkout_gpu_blocks(uint32_t n) {
+    std::vector<llama_block_manager::evicted_block> evicted;
+    std::vector<uint32_t> ids = block_manager.checkout_gpu_blocks(n, &evicted);
+    for (const auto & ev : evicted) {
+        checkpoint_index.remove_if_block(ev.hash, ev.block_id);
     }
-    const auto ids = block_manager.checkout_gpu_blocks(1);
+    return ids;
+}
+
+std::vector<uint32_t> llama_linear_state_cache::checkout_cpu_blocks(uint32_t n) {
+    std::vector<llama_block_manager::evicted_block> evicted;
+    std::vector<uint32_t> ids = block_manager.checkout_cpu_blocks(n, &evicted);
+    for (const auto & ev : evicted) {
+        checkpoint_index.remove_if_block(ev.hash, ev.block_id);
+    }
+    return ids;
+}
+
+bool llama_linear_state_cache::allocate_gpu_block(uint32_t & block_id) {
+    const auto ids = checkout_gpu_blocks(1);
     if (ids.empty()) {
         return false;
     }
@@ -79,12 +96,7 @@ bool llama_linear_state_cache::allocate_gpu_block(uint32_t & block_id) {
 }
 
 bool llama_linear_state_cache::allocate_cpu_block(uint32_t & block_id) {
-    while (!block_manager.has_free_cpu_blocks(1)) {
-        if (!evict_one_checkpoint(/*placement=*/0)) {
-            return false;
-        }
-    }
-    const auto ids = block_manager.checkout_cpu_blocks(1);
+    const auto ids = checkout_cpu_blocks(1);
     if (ids.empty()) {
         return false;
     }
@@ -93,102 +105,43 @@ bool llama_linear_state_cache::allocate_cpu_block(uint32_t & block_id) {
 }
 
 bool llama_linear_state_cache::alloc_checkpoint_block(uint32_t & block_id) {
+    // Checkpoints live in the free queue too, so a plain checkout is enough:
+    // a cached checkpoint is evicted lazily when the queue head is a
+    // checkpoint.
     if (block_manager.has_free_gpu_blocks(1)) {
-        block_id = block_manager.checkout_gpu_blocks(1).front();
-        return true;
+        const auto ids = checkout_gpu_blocks(1);
+        if (!ids.empty()) {
+            block_id = ids.front();
+            return true;
+        }
     }
     if (block_manager.has_free_cpu_blocks(1)) {
-        block_id = block_manager.checkout_cpu_blocks(1).front();
-        return true;
-    }
-    // A checkpoint may land in either pool. Prefer evicting a GPU checkpoint
-    // (its data is still hot), then fall back to the CPU pool.
-    if (evict_one_checkpoint(/*placement=*/1)) {
-        return alloc_checkpoint_block(block_id);
-    }
-    if (evict_one_checkpoint(/*placement=*/0)) {
-        return alloc_checkpoint_block(block_id);
+        const auto ids = checkout_cpu_blocks(1);
+        if (!ids.empty()) {
+            block_id = ids.front();
+            return true;
+        }
     }
     return false;
-}
-
-const llama_linear_prefix_entry * llama_linear_state_cache::oldest_checkpoint(int placement) const {
-    const llama_linear_prefix_entry * victim = nullptr;
-    for (const auto & [hash, e] : checkpoint_index.entries()) {
-        GGML_UNUSED(hash);
-        const bool gpu = block_manager.is_gpu(e.block_id);
-        if (placement == 1 && !gpu) {
-            continue;
-        }
-        if (placement == 0 && gpu) {
-            continue;
-        }
-        if (!victim || e.last_used < victim->last_used) {
-            victim = &e;
-        }
-    }
-    return victim;
-}
-
-bool llama_linear_state_cache::evict_checkpoint(uint64_t chain_hash, llama_linear_prefix_entry e) {
-    if (!checkpoint_index.remove(chain_hash)) {
-        return false;
-    }
-    // invalidate_block is redundant after remove, but keeps the invariant if
-    // two hash chains ever alias the same block
-    checkpoint_index.invalidate_block(e.block_id);
-    release_block(e.block_id);
-    LLAMA_LOG_DEBUG("%s: evicted checkpoint block %u (pos %d)\n", __func__, e.block_id, (int) e.pos);
-    return true;
-}
-
-bool llama_linear_state_cache::evict_one_checkpoint(int placement) {
-    const llama_linear_prefix_entry * victim = oldest_checkpoint(placement);
-    if (!victim) {
-        return false;
-    }
-    return evict_checkpoint(victim->chain_hash, *victim);
-}
-
-bool llama_linear_state_cache::demote_checkpoint(uint64_t chain_hash, llama_linear_prefix_entry e) {
-    GGML_ASSERT(block_manager.is_gpu(e.block_id));
-
-    uint32_t cpu_id = 0;
-    if (!block_manager.has_free_cpu_blocks(1)) {
-        // No CPU room to demote into: evicting still frees a GPU block.
-        return evict_checkpoint(chain_hash, e);
-    }
-    const auto ids = block_manager.checkout_cpu_blocks(1);
-    if (ids.empty()) {
-        return false;
-    }
-    cpu_id = ids.front();
-
-    mem->copy_state_block(e.block_id, /*src_gpu=*/true, cpu_id - n_gpu_blocks, /*dst_gpu=*/false);
-    release_block(e.block_id);
-
-    if (!checkpoint_index.insert(chain_hash, cpu_id, block_manager.block_generation(cpu_id), e.pos)) {
-        release_block(cpu_id);
-        return false;
-    }
-    LLAMA_LOG_DEBUG("%s: demoted checkpoint block %u to CPU block %u\n", __func__, e.block_id, cpu_id);
-    return true;
-}
-
-bool llama_linear_state_cache::demote_one_checkpoint() {
-    const llama_linear_prefix_entry * victim = oldest_checkpoint(1);
-    if (!victim) {
-        return false;
-    }
-    return demote_checkpoint(victim->chain_hash, *victim);
 }
 
 //
 // active state
 //
 
-bool llama_linear_state_cache::ensure_active(llama_seq_id seq_id) {
+bool llama_linear_state_cache::ensure_active(llama_seq_id seq_id, uint64_t tag) {
     if (seqs.count(seq_id)) {
+        // The tag is an ownership annotation only; an existing ACTIVE state
+        // block is never re-tagged (it is not reusable anyway). Repair a
+        // missing annotation when the caller supplies one: a failed checkpoint
+        // fork may have dropped it on an earlier attempt. Keep the block's tag
+        // set consistent, but never tag a CPU-resident (swapped) block.
+        if (tag != 0 && seqs[seq_id].tag == 0) {
+            seqs[seq_id].tag = tag;
+            if (block_manager.is_gpu(seqs[seq_id].block_id)) {
+                block_manager.set_tag(seqs[seq_id].block_id, tag);
+            }
+        }
         return true;
     }
 
@@ -199,12 +152,34 @@ bool llama_linear_state_cache::ensure_active(llama_seq_id seq_id) {
     }
     mem->zero_state_block(block_id, /*gpu=*/true);
 
+    // Record the owner tag on the physical block. The ACTIVE block is not
+    // reusable, but the tag is part of the block's tag set until the block
+    // loses its cache identity (see prefix-cache-evict-policy.md 2.3).
+    if (tag != 0) {
+        block_manager.set_tag(block_id, tag);
+    }
+
     seq_state st;
     st.block_id = block_id;
     st.pos      = -1;
     st.rollback = 0;
+    st.tag      = tag;
     seqs[seq_id] = st;
     return true;
+}
+
+bool llama_linear_state_cache::set_seq_tag(llama_seq_id seq_id, uint64_t tag) {
+    const auto it = seqs.find(seq_id);
+    if (it == seqs.end()) {
+        return false;
+    }
+    it->second.tag = tag;
+    return true;
+}
+
+uint64_t llama_linear_state_cache::seq_tag(llama_seq_id seq_id) const {
+    const auto it = seqs.find(seq_id);
+    return it == seqs.end() ? 0 : it->second.tag;
 }
 
 bool llama_linear_state_cache::release(llama_seq_id seq_id) {
@@ -244,6 +219,11 @@ bool llama_linear_state_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_
     st.block_id = dst_id;
     st.pos      = src->second.pos;
     st.rollback = 0;
+    st.tag      = src->second.tag;  // fork inherits the owner tag
+    // The fresh ACTIVE block carries the same tag as ensure_active() does.
+    if (st.tag != 0) {
+        block_manager.set_tag(dst_id, st.tag);
+    }
     seqs[seq_id_dst] = st;
     return true;
 }
@@ -353,8 +333,11 @@ llama_pos llama_linear_state_cache::seq_pos_max(llama_seq_id seq_id) const {
 //
 
 bool llama_linear_state_cache::checkpoint_is_live(const llama_linear_prefix_entry & e) const {
-    return block_manager.block_ref_count(e.block_id) > 0 &&
-           block_manager.block_generation(e.block_id) == e.generation;
+    // A checkpoint may be cache-resident (ref_count == 0, in the free queue);
+    // liveness is "the block still owns this chain hash". Checkout clears the
+    // hash before the block is reused.
+    return block_manager.block_has_hash(e.block_id) &&
+           block_manager.block_hash(e.block_id) == e.chain_hash;
 }
 
 bool llama_linear_state_cache::has_live_checkpoint(uint64_t chain_hash) const {
@@ -393,15 +376,33 @@ bool llama_linear_state_cache::create_checkpoint(llama_seq_id seq_id, uint64_t c
     const uint32_t dst_local = ckpt_gpu ? ckpt_id : ckpt_id - n_gpu_blocks;
     mem->copy_state_block(it->second.block_id, /*src_gpu=*/true, dst_local, ckpt_gpu);
 
-    const auto * old = checkpoint_index.find(chain_hash);
-    const bool   has_old = old != nullptr;
-    const uint32_t old_block = has_old ? old->block_id : 0;
-
-    checkpoint_index.insert(chain_hash, ckpt_id, block_manager.block_generation(ckpt_id), pos);
-    if (has_old) {
-        checkpoint_index.invalidate_block(old_block);
-        release_block(old_block);
+    // Only GPU checkpoints are reusable and therefore visible in the tag ->
+    // block mapping. CPU checkpoints stay untagged. set_tag() unions the tag
+    // into the block's set; there is no primary/first tag (tag() only returns
+    // one representative).
+    if (ckpt_gpu) {
+        block_manager.set_tag(ckpt_id, it->second.tag);
     }
+    block_manager.set_block_hash(ckpt_id, chain_hash);
+
+    uint32_t old_block = 0;
+    checkpoint_index.insert(chain_hash, ckpt_id, pos, &old_block);
+    if (old_block != 0 && old_block != ckpt_id) {
+        checkpoint_index.invalidate_block(old_block);
+        if (block_manager.block_has_hash(old_block) &&
+            block_manager.block_hash(old_block) == chain_hash) {
+            // The replaced checkpoint loses its cache identity: dropping the
+            // hash also clears its accumulated tag set.
+            block_manager.clear_block_hash(old_block);
+        }
+        if (block_manager.block_ref_count(old_block) > 0) {
+            release_block(old_block);
+        }
+    }
+
+    // The checkpoint is read-only and lives in the free queue like any other
+    // cache-resident block; a fork touches it before copying.
+    release_block(ckpt_id);
 
     LLAMA_LOG_DEBUG("%s: checkpoint for seq %d at pos %d -> block %u (%s)\n", __func__, seq_id, (int) pos,
                     ckpt_id, ckpt_gpu ? "GPU" : "CPU");
@@ -413,17 +414,27 @@ const llama_linear_prefix_entry * llama_linear_state_cache::find_checkpoint(
     return checkpoint_index.find_deepest(chain_hashes, max_blocks);
 }
 
-bool llama_linear_state_cache::fork_checkpoint(uint64_t chain_hash, llama_seq_id seq_id) {
+bool llama_linear_state_cache::fork_checkpoint(uint64_t chain_hash, llama_seq_id seq_id,
+                                               uint64_t tag) {
     const auto * e = checkpoint_index.find(chain_hash);
     if (!e || !checkpoint_is_live(*e)) {
         return false;
     }
 
-    // The allocation below may demote or evict a checkpoint, possibly this
-    // one, so remember the physical source and revalidate it afterwards.
     const uint32_t src_block = e->block_id;
-    const uint32_t src_gen   = e->generation;
     const llama_pos pos      = e->pos;
+
+    // Pin the source: checkpoints are free-queue residents, so allocating the
+    // destination below could otherwise evict the very checkpoint we copy.
+    if (!block_manager.touch_block(src_block)) {
+        return false;
+    }
+    auto unpin = [&]() { release_block(src_block); };
+
+    // The active state block is replaced below. The request tag is taken from
+    // the caller when given: a failed attempt releases the seq_state, so a
+    // retry would otherwise lose it.
+    const uint64_t owner_tag = tag != 0 ? tag : seq_tag(seq_id);
 
     // Replace any stale active block for this sequence.
     if (seqs.count(seq_id)) {
@@ -432,12 +443,14 @@ bool llama_linear_state_cache::fork_checkpoint(uint64_t chain_hash, llama_seq_id
 
     uint32_t active_id = 0;
     if (!allocate_gpu_block(active_id)) {
+        unpin();
         return false;
     }
 
     e = checkpoint_index.find(chain_hash);
-    if (!e || e->block_id != src_block || e->generation != src_gen || !checkpoint_is_live(*e)) {
+    if (!e || e->block_id != src_block || !checkpoint_is_live(*e)) {
         release_block(active_id);
+        unpin();
         return false;
     }
 
@@ -451,8 +464,24 @@ bool llama_linear_state_cache::fork_checkpoint(uint64_t chain_hash, llama_seq_id
     // last processed token position (boundary - 1).
     st.pos      = pos > 0 ? pos - 1 : -1;
     st.rollback = 0;
+    st.tag      = owner_tag;
     seqs[seq_id] = st;
+
+    // The request now owns both physical blocks: the restored ACTIVE block and
+    // the source checkpoint, which stays cache-resident and may be forked
+    // again. Record the owner tag on the block's tag set (not just in
+    // seq_state) so an eviction policy can see every tag that used it.
+    if (owner_tag != 0) {
+        block_manager.set_tag(active_id, owner_tag);
+        // CPU checkpoints stay untagged, exactly like create_checkpoint():
+        // only GPU-resident checkpoints participate in the tag -> block map.
+        if (block_manager.is_gpu(src_block)) {
+            block_manager.add_tag(src_block, owner_tag);
+        }
+    }
     checkpoint_index.touch(chain_hash);
+
+    unpin();
     return true;
 }
 
@@ -465,8 +494,9 @@ bool llama_linear_state_cache::can_swap_out(llama_seq_id seq_id) const {
     if (it == seqs.end() || !block_manager.is_gpu(it->second.block_id)) {
         return true;
     }
-    // A free CPU block, or an evictable CPU checkpoint that frees one.
-    return block_manager.n_free_cpu_blocks() > 0 || oldest_checkpoint(/*placement=*/0) != nullptr;
+    // A free CPU block, or a cache-resident CPU checkpoint that checkout can
+    // evict lazily.
+    return block_manager.n_allocatable_cpu_blocks() > 0;
 }
 
 bool llama_linear_state_cache::can_swap_in(llama_seq_id seq_id) const {
@@ -474,7 +504,7 @@ bool llama_linear_state_cache::can_swap_in(llama_seq_id seq_id) const {
     if (it == seqs.end() || block_manager.is_gpu(it->second.block_id)) {
         return true;
     }
-    return block_manager.n_free_gpu_blocks() > 0 || oldest_checkpoint(/*placement=*/1) != nullptr;
+    return block_manager.n_allocatable_gpu_blocks() > 0;
 }
 
 bool llama_linear_state_cache::swap_out(llama_seq_id seq_id) {
@@ -502,6 +532,10 @@ bool llama_linear_state_cache::swap_in(llama_seq_id seq_id) {
         return false;
     }
     mem->copy_state_block(it->second.block_id - n_gpu_blocks, /*src_gpu=*/false, gpu_id, /*dst_gpu=*/true);
+    // Keep the ACTIVE block's tag consistent with ensure_active()/seq_cp.
+    if (it->second.tag != 0) {
+        block_manager.set_tag(gpu_id, it->second.tag);
+    }
     release_block(it->second.block_id);
     it->second.block_id = gpu_id;
     return true;
@@ -517,6 +551,61 @@ uint32_t llama_linear_state_cache::n_free_gpu_blocks() const {
 
 uint32_t llama_linear_state_cache::n_free_cpu_blocks() const {
     return (uint32_t) block_manager.n_free_cpu_blocks();
+}
+
+uint32_t llama_linear_state_cache::n_allocatable_gpu_blocks() const {
+    return (uint32_t) block_manager.n_allocatable_gpu_blocks();
+}
+
+uint32_t llama_linear_state_cache::n_cached_gpu_blocks() const {
+    return (uint32_t) block_manager.n_cached_gpu_blocks();
+}
+
+uint32_t llama_linear_state_cache::get_num_gpu_blocks() const {
+    return n_gpu_blocks;
+}
+
+uint32_t llama_linear_state_cache::get_num_cpu_blocks() const {
+    return n_cpu_blocks;
+}
+
+uint64_t llama_linear_state_cache::block_tag(uint32_t block_id) const {
+    return block_manager.tag(block_id);
+}
+
+void llama_linear_state_cache::set_evict_pick_cb(llama_paged_evict_pick_cb cb, void * ud) {
+    // Stored so clear() can re-install them after the block manager is rebuilt.
+    evict_pick_cb_ = cb;
+    evict_pick_ud_ = ud;
+    block_manager.set_pool_kind(LLAMA_PAGED_POOL_LINEAR);
+    block_manager.set_evict_pick_cb(cb, ud);
+}
+
+bool llama_linear_state_cache::gpu_checkout_refused_by_policy() const {
+    return block_manager.gpu_checkout_refused_by_policy();
+}
+
+void llama_linear_state_cache::reset_gpu_checkout_refusal() {
+    block_manager.reset_gpu_checkout_refusal();
+}
+
+void llama_linear_state_cache::collect_tag_blocks(
+        std::unordered_map<uint64_t, std::unordered_set<uint32_t>> & owned) const {
+    for (const auto & [chain_hash, e] : checkpoint_index.entries()) {
+        (void) chain_hash;
+        if (!checkpoint_is_live(e) || !block_manager.is_gpu(e.block_id)) {
+            continue;
+        }
+        // Attribute the checkpoint to every tag in its set: tag() is only a
+        // representative, not an owner.
+        const uint32_t n_tags = block_manager.tag_count(e.block_id);
+        for (uint32_t t = 0; t < n_tags; ++t) {
+            const uint64_t tag = block_manager.tag_at(e.block_id, t);
+            if (tag != 0) {
+                owned[tag].insert(e.block_id);
+            }
+        }
+    }
 }
 
 bool llama_linear_state_cache::has_free_gpu_blocks(uint32_t n) const {
@@ -607,14 +696,16 @@ void llama_linear_state_cache::clear() {
     }
     seqs.clear();
 
-    for (const auto & [hash, e] : checkpoint_index.entries()) {
-        GGML_UNUSED(hash);
-        release_block(e.block_id);
-    }
+    // Checkpoints are cache-resident (ref_count == 0) and live in the free
+    // queue; rebuilding the block manager discards them without a release.
     checkpoint_index.clear();
 
     block_manager = llama_block_manager();
     block_manager.init(n_gpu_blocks, n_cpu_blocks, /*watermark=*/ 0.0f);
+    // The fresh block manager lost the eviction policy: re-install it so that
+    // llama_memory_clear() does not silently disable it.
+    block_manager.set_pool_kind(LLAMA_PAGED_POOL_LINEAR);
+    block_manager.set_evict_pick_cb(evict_pick_cb_, evict_pick_ud_);
 
     rollback_to_reset.clear();
 

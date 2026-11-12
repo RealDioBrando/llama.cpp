@@ -27,6 +27,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    // paged KV block stats (/kv_stats) and per-tag usage (/tag_usage)
+    SERVER_TASK_TYPE_KV_STATS,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -91,6 +93,10 @@ struct task_params {
     // realtime control (SERVER_TASK_TYPE_CONTROL)
     std::string        control_action;
     std::string        control_cmpl_id;
+
+    // Owner tag (uint64) for the paged KV block accounting (--kv-paged only).
+    // 0 means the request's blocks belong to no tag.
+    uint64_t           tag = 0;
 
     // per-request parameters for chat parsing
     common_chat_parser_params chat_parser_params;
@@ -178,6 +184,11 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::map<int, float> set_lora; // mapping adapter ID -> scale
+
+    // used by SERVER_TASK_TYPE_KV_STATS
+    bool        kv_stats_pools    = false; // true: pool stats (/kv_stats), false: tag usage (/tag_usage)
+    uint64_t    kv_tag            = 0;     // 0 = every tag
+    bool        kv_include_blocks = false; // materialize block id lists
 
     server_task() = default;
 
@@ -535,6 +546,22 @@ struct server_task_result_slot_save_load : server_task_result {
 
 struct server_task_result_slot_erase : server_task_result {
     size_t n_erased;
+
+    virtual json to_json() override;
+};
+
+// used by /kv_stats (paged scheduler only)
+struct server_task_result_kv_stats : server_task_result {
+    llama_paged_kv_cache_stats stats = {};
+
+    virtual json to_json() override;
+};
+
+// used by /tag_usage (paged scheduler only). `payload` is the fully rendered
+// response body: {"tags":...} for the listing, {"tag":...,"npu":...,"cpu":...,
+// "blocks":...} for a single tag.
+struct server_task_result_tag_usage : server_task_result {
+    json payload = json::object();
 
     virtual json to_json() override;
 };

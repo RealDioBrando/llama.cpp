@@ -4,7 +4,6 @@
 
 bool llama_linear_prefix_index::insert(uint64_t  chain_hash,
                                        uint32_t  block_id,
-                                       uint32_t  generation,
                                        llama_pos pos,
                                        uint32_t * old_block_id) {
     if (old_block_id) {
@@ -21,7 +20,6 @@ bool llama_linear_prefix_index::insert(uint64_t  chain_hash,
     llama_linear_prefix_entry e;
     e.chain_hash = chain_hash;
     e.block_id   = block_id;
-    e.generation = generation;
     e.pos        = pos;
     e.last_used  = ++use_seq_;
     entries_[chain_hash] = e;
@@ -49,6 +47,15 @@ bool llama_linear_prefix_index::remove(uint64_t chain_hash) {
     return entries_.erase(chain_hash) > 0;
 }
 
+bool llama_linear_prefix_index::remove_if_block(uint64_t chain_hash, uint32_t block_id) {
+    const auto it = entries_.find(chain_hash);
+    if (it == entries_.end() || it->second.block_id != block_id) {
+        return false;
+    }
+    entries_.erase(it);
+    return true;
+}
+
 void llama_linear_prefix_index::invalidate_block(uint32_t block_id) {
     for (auto it = entries_.begin(); it != entries_.end();) {
         if (it->second.block_id == block_id) {
@@ -59,7 +66,7 @@ void llama_linear_prefix_index::invalidate_block(uint32_t block_id) {
     }
 }
 
-bool llama_linear_prefix_index::pop_lru(uint64_t & chain_hash, uint32_t & block_id, uint32_t & generation) {
+bool llama_linear_prefix_index::pop_lru(uint64_t & chain_hash, uint32_t & block_id) {
     const llama_linear_prefix_entry * victim = nullptr;
     for (const auto & [h, e] : entries_) {
         if (!victim || e.last_used < victim->last_used) {
@@ -71,7 +78,6 @@ bool llama_linear_prefix_index::pop_lru(uint64_t & chain_hash, uint32_t & block_
     }
     chain_hash = victim->chain_hash;
     block_id   = victim->block_id;
-    generation = victim->generation;
     entries_.erase(chain_hash);
     return true;
 }

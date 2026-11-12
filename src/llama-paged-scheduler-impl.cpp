@@ -27,10 +27,22 @@ llama_paged_scheduler_impl::llama_paged_scheduler_impl(uint32_t               n_
     llama_linear_state_cache * linear = hybrid_memory ? hybrid_memory->get_linear_mem() : nullptr;
     cache_manager = std::make_unique<llama_paged_cache_manager>(kv_manager, linear, block_sz, prefix_cache_enabled,
                                                                 ckpt_interval, ckpt_base);
+    tag_manager = std::make_unique<llama_paged_tag_manager>(*kv_manager, linear);
 }
 
 bool llama_paged_scheduler_impl::check_deadlock(uint32_t n_candidates, uint32_t n_swapped, uint32_t n_waiting) const {
     if (n_candidates == 0 && (n_swapped > 0 || n_waiting > 0)) {
+        if (cache_manager->gpu_checkout_refused_by_policy()) {
+            // An eviction policy legitimately refused to sacrifice blocks this
+            // step (design §8.4). The request simply stays queued: report no
+            // deadlock so an external controller can switch the policy between
+            // steps; the caller's no-progress timeout remains the last resort.
+            LLAMA_LOG_DEBUG(
+                "%s: no candidate this step: the eviction policy refused to sacrifice cache-resident blocks "
+                "(%d swapped, %d waiting).\n",
+                __func__, n_swapped, n_waiting);
+            return false;
+        }
         LLAMA_LOG_ERROR(
             "%s: Scheduler deadlock detected. "
             "%d sequence(s) are swapped out and %d are waiting, "
@@ -98,6 +110,10 @@ int32_t llama_paged_scheduler_impl::prefill_chunk_tokens(const llama_sequence_gr
 llama_scheduler_status llama_paged_scheduler_impl::step(llama_batch & batch) {
     // Free previous inference batches
     clear_batch(batch);
+
+    // The refusal flag accumulates over this step's allocation attempts and is
+    // consumed by check_deadlock() below.
+    cache_manager->reset_gpu_checkout_refusal();
 
     llama_sequence_group_raw_list candidates;
     int32_t row_budget = n_batch;
@@ -351,8 +367,9 @@ void llama_paged_scheduler_impl::finish(llama_sequence_group & group) {
     } else {
         LLAMA_LOG_DEBUG("%s: Request: %d generated %d tokens.\n", __func__, group.request_id, group.n_decoded);
     }
-    // Registered prefix blocks stay cache-resident (ref stays 1) until
-    // evicted under allocation pressure; the linear active state is released.
+    // Released blocks return to the free queue with their hash retained: they
+    // stay cache-resident (ref_count == 0) until a checkout evicts them. The
+    // linear active state is released here.
     cache_manager->release_request(group);
 }
 
@@ -476,10 +493,10 @@ void llama_paged_scheduler_impl::process_running_list(llama_sequence_group_raw_l
             LLAMA_LOG_DEBUG("%s: (running_pending) request_id=%d: requires a new block to decode.\n", __func__,
                             group->request_id);
             bool success = cache_manager->allocate_blocks(*group, rows);  // decode phase
-            while (!success && cache_manager->evict_cached_blocks()) {
-                success = cache_manager->allocate_blocks(*group, rows);
-            }
             if (!success) {
+                // Allocation evicts cache-resident prefix blocks lazily. A
+                // failure now means the pool cannot satisfy the request even
+                // after eviction, so fall through to request preemption.
                 if (running.size() > 1) {
                     llama_sequence_group_ptr victim = evict();
                     if (victim) {
@@ -572,11 +589,8 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
     llama_sequence_group * group = waiting->peek();
     GGML_ASSERT(group && "the waiting group is nullptr.");
 
-    // The cache may have grown since this request was queued.
-    if (!cache_manager->reserve_prefix_candidate(*group)) {
-        return;
-    }
-
+    // Budget gate first: do not take any reservation for a step that cannot
+    // run the request anyway. While waiting, n_prompt == n_prompt_total.
     const int32_t chunk_tokens = std::min<int32_t>((int32_t) group->n_prompt, row_budget);
     if (chunk_tokens <= 0) {
         // Do not leave a WAITING request holding refs / an active state block.
@@ -586,18 +600,15 @@ void llama_paged_scheduler_impl::process_waiting_list(llama_sequence_group_raw_l
         return;  // token budget exhausted for this step
     }
 
-    // Reserve the full prompt plus one decode slot; only chunk_tokens run now.
-    bool success = cache_manager->allocate_blocks(*group, 1);
-    while (!success && cache_manager->evict_cached_blocks()) {
-        success = cache_manager->allocate_blocks(*group, 1);
-    }
-    if (!success) {
+    // Admission transaction: linear ACTIVE state block + prefix refs + full
+    // KV slots succeed or fail together. On failure the reservation was rolled
+    // back inside the manager, so the request simply stays at the head of the
+    // waiting queue (vLLM allocate_slots() semantics; no partial scheduling).
+    // `1` reserves the full prompt plus one decode slot: allocate() adds
+    // n_past + n_prompt internally and only `chunk_tokens` rows run now.
+    if (!cache_manager->allocate_blocks(*group, 1)) {
         // Strict head-of-queue semantics (matches vLLM): do not skip an
-        // inadmissible head to serve later requests. Drop the reservation so
-        // a waiting request never holds block refs or an active state block.
-        cache_manager->release_request(*group);
-        group->n_past   = 0;
-        group->n_prompt = group->n_prompt_total;
+        // inadmissible head to serve later requests.
         LLAMA_LOG_DEBUG("%s: head request_id=%d (prio=%d) is inadmissible, stop scheduling waiting this step\n",
                         __func__, group->request_id, group->priority);
         return;
@@ -964,6 +975,11 @@ void llama_paged_scheduler_impl::set_on_finish(llama_paged_on_finish_cb cb, void
     on_finish_user_data = user_data;
 }
 
+void llama_paged_scheduler_impl::set_evict_decision(llama_paged_evict_pick_cb cb, void * user_data) {
+    GGML_ASSERT(cache_manager && "cache_manager is nullptr.");
+    cache_manager->set_evict_pick_cb(cb, user_data);
+}
+
 llama_sequence_group_ptr llama_paged_scheduler_impl::take_from_list(llama_sequence_group_list & list,
                                                                     int32_t                     request_id) {
     for (auto it = list.begin(); it != list.end(); ++it) {
@@ -1053,8 +1069,10 @@ bool llama_paged_scheduler_impl::fork_request(int32_t src_id, int32_t dst_id) {
     child.cache_reserved   = true;
     child.status = llama_sequence_group_status::PENDING;
 
-    if (!cache_manager->full()->add_ref_blocks(child.block_table)) {
-        cache_manager->full()->free_blocks(child);
+    // The parent may be running (blocks live) or finished (blocks are
+    // cache-resident in the free queue). acquire_blocks handles both and is
+    // all-or-nothing, so no compensating free is needed on failure.
+    if (!cache_manager->full()->acquire_blocks(child.block_table, child.tag)) {
         LLAMA_LOG_ERROR("%s: failed to share blocks for dst request %d.\n", __func__, dst_id);
         return false;
     }
@@ -1082,6 +1100,11 @@ bool llama_paged_scheduler_impl::fork_request(int32_t src_id, int32_t dst_id) {
         cache_manager->full()->free_blocks(child);
         LLAMA_LOG_ERROR("%s: failed to fork linear state for dst request %d.\n", __func__, dst_id);
         return false;
+    }
+    if (cache_manager->linear()) {
+        // the owner tag is inherited by the child (llama_sequence_group copy),
+        // but seq_cp builds a fresh seq_state that must be annotated again
+        cache_manager->linear()->set_seq_tag(dst_id, child.tag);
     }
 
     child.status = llama_sequence_group_status::RUNNING;
@@ -1156,4 +1179,85 @@ llama_sequence_group * llama_paged_scheduler_impl::get_group_from_id(int32_t req
 
 const llama_paged_batch_info * llama_paged_scheduler_impl::get_curr_batch_info() const {
     return &curr_info;
+}
+
+//
+// tag accounting
+//
+
+bool llama_paged_scheduler_impl::set_request_tag(int32_t request_id, uint64_t tag) {
+    GGML_ASSERT(cache_manager && "cache_manager is nullptr.");
+
+    auto it = id_to_group.find(request_id);
+    if (it == id_to_group.end() || it->second == nullptr) {
+        LLAMA_LOG_WARN("%s: request %d is not outstanding, tag %llu ignored.\n", __func__, request_id,
+                       (unsigned long long) tag);
+        return false;
+    }
+    llama_sequence_group & group = *it->second;
+
+    // Blocks may already carry tags, and a cache reservation may have
+    // pinned a linear state block. Tagging after the first schedule step would
+    // make the accounting depend on timing, so it is rejected.
+    if (group.cache_reserved || !group.block_table.empty()) {
+        LLAMA_LOG_WARN("%s: request %d already holds KV blocks, tag %llu rejected.\n", __func__, request_id,
+                       (unsigned long long) tag);
+        return false;
+    }
+
+    group.tag = tag;
+    if (auto * linear = cache_manager->linear()) {
+        // Annotate the already-created ACTIVE state. The ACTIVE block itself
+        // was tagged when ensure_active() allocated it (and is tagged again on
+        // seq_cp/swap_in); it still never enters owned/linear accounting
+        // because collect_tag_blocks() only visits live GPU checkpoints.
+        linear->set_seq_tag(request_id, tag);
+    }
+    return true;
+}
+
+llama_paged_tag_manager::snapshot llama_paged_scheduler_impl::materialize_tag_blocks() const {
+    if (tag_manager == nullptr) {
+        return {};
+    }
+
+    // The scheduler contributes the only state the tag manager cannot see on
+    // its own: the live requests' (tag, block_table) pairs.
+    std::vector<llama_paged_tag_manager::request_ref> requests;
+    requests.reserve(id_to_group.size());
+    for (const auto & [request_id, group] : id_to_group) {
+        GGML_UNUSED(request_id);
+        if (group == nullptr || group->tag == 0) {
+            continue;
+        }
+        requests.push_back({ &group->tag, &group->block_table });
+    }
+    return tag_manager->materialize(requests);
+}
+
+void llama_paged_scheduler_impl::all_tag_block_usage(std::map<uint64_t, llama_paged_tag_usage> & out) const {
+    llama_paged_tag_manager::all_usage(materialize_tag_blocks(), out);
+}
+
+bool llama_paged_scheduler_impl::tag_block_usage(uint64_t tag, llama_paged_tag_usage & out) const {
+    // unknown tags are reported as all-zero, not as an error
+    out = llama_paged_tag_manager::usage(materialize_tag_blocks(), tag);
+    return true;
+}
+
+bool llama_paged_scheduler_impl::tag_blocks(uint64_t tag,
+                                            std::vector<uint32_t> & full_owned,
+                                            std::vector<uint32_t> & full_shared,
+                                            std::vector<uint32_t> & linear_owned) const {
+    llama_paged_tag_manager::block_ids(materialize_tag_blocks(), tag, full_owned, full_shared, linear_owned);
+    return true;
+}
+
+void llama_paged_scheduler_impl::for_each_tag_block(const uint64_t * tag,
+                                                    const llama_paged_tag_manager::block_cb & cb) const {
+    llama_paged_tag_manager::for_each_block(materialize_tag_blocks(), tag, cb);
+}
+
+void llama_paged_scheduler_impl::kv_cache_block_stats(llama_paged_pool_stats & out) const {
+    out = tag_manager ? tag_manager->block_stats() : llama_paged_pool_stats{};
 }

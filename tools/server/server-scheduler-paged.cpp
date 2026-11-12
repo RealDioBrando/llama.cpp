@@ -7,8 +7,13 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
+#include <map>
+#include <string>
 #include <thread>
+#include <vector>
 
 static bool paged_task_supported(const server_task & task) {
     // chat templates are applied in the HTTP layer and arrive here as
@@ -96,6 +101,52 @@ bool server_scheduler_paged::init() {
 
     cancelled.assign(port.slot_pool().size(), 0);
 
+    // Test/grayscale hook: LLAMA_SERVER_PAGED_EVICT_PROTECT_TAGS=1,42
+    // protects every cache-resident block carrying one of these uint64 tags
+    // from eviction. Unset or empty keeps the legacy FIFO policy. Install
+    // before warmup so the policy also applies to warmup allocations.
+    const char * env_protect = getenv("LLAMA_SERVER_PAGED_EVICT_PROTECT_TAGS");
+    if (env_protect != nullptr && env_protect[0] != '\0') {
+        std::string tags_str(env_protect);
+        size_t start = 0;
+        while (start <= tags_str.size()) {
+            size_t end = tags_str.find(',', start);
+            if (end == std::string::npos) {
+                end = tags_str.size();
+            }
+            std::string tag = tags_str.substr(start, end - start);
+            const size_t first = tag.find_first_not_of(" \t\r\n");
+            const size_t last  = tag.find_last_not_of(" \t\r\n");
+            if (first != std::string::npos) {
+                tag = tag.substr(first, last - first + 1);
+                errno = 0;
+                char * tag_end = nullptr;
+                const unsigned long long value = strtoull(tag.c_str(), &tag_end, 10);
+                if (errno == 0 && tag_end != tag.c_str() && *tag_end == '\0' && value != 0) {
+                    evict_protect_tags.insert((uint64_t) value);
+                } else {
+                    SRV_WRN("ignoring invalid protected tag '%s' (expected a non-zero uint64)\n", tag.c_str());
+                }
+            }
+            if (end == tags_str.size()) {
+                break;
+            }
+            start = end + 1;
+        }
+
+        if (!evict_protect_tags.empty()) {
+            std::string joined;
+            for (const uint64_t tag : evict_protect_tags) {
+                if (!joined.empty()) {
+                    joined += ",";
+                }
+                joined += std::to_string(tag);
+            }
+            llama_paged_scheduler_set_evict_decision(sched, evict_pick_protect_tags, this);
+            SRV_INF("paged eviction policy: protecting prefix-cache tags [%s]\n", joined.c_str());
+        }
+    }
+
     llama_paged_scheduler_set_on_finish(sched, on_finish_thunk, this);
 
     if (!llama_paged_scheduler_warmup(sched, ctx)) {
@@ -108,6 +159,44 @@ bool server_scheduler_paged::init() {
 
     SRV_INF("%s", "paged scheduler initialized\n");
     return true;
+}
+
+bool server_scheduler_paged::set_evict_decision(llama_paged_evict_pick_cb cb, void * user_data) {
+    if (sched == nullptr) {
+        return false;
+    }
+    return llama_paged_scheduler_set_evict_decision(sched, cb, user_data);
+}
+
+uint32_t server_scheduler_paged::evict_pick_protect_tags(void * ud, llama_paged_pool_kind /*pool*/,
+                                                         uint32_t n_needed, const llama_paged_free_block * head,
+                                                         uint32_t * out_ids, uint32_t out_capacity) {
+    const auto & protected_tags = static_cast<server_scheduler_paged *>(ud)->evict_protect_tags;
+
+    if (head == nullptr || out_ids == nullptr || out_capacity == 0 || n_needed == 0) {
+        return 0;
+    }
+
+    const uint32_t n_max = std::min(n_needed, out_capacity);
+    uint32_t       n     = 0;
+    for (const llama_paged_free_block * it = head; it != nullptr && n < n_max;
+         it = llama_paged_free_block_next(it)) {
+        // plain blocks are not cache-resident, nothing to protect
+        if (!llama_paged_free_block_has_hash(it)) {
+            continue;
+        }
+        bool protected_block = false;
+        for (const uint64_t tag : protected_tags) {
+            if (llama_paged_free_block_has_tag(it, tag)) {
+                protected_block = true;
+                break;
+            }
+        }
+        if (!protected_block) {
+            out_ids[n++] = llama_paged_free_block_id(it);
+        }
+    }
+    return n;
 }
 
 server_slot * server_scheduler_paged::pick_idle_slot() {
@@ -187,6 +276,13 @@ bool server_scheduler_paged::launch(server_task && task) {
             port.send_error(s, "failed to queue the request in the paged scheduler", ERROR_TYPE_SERVER);
             s.release();
             return true;
+        }
+        // The tag must be attached before the request is first scheduled,
+        // i.e. before any KV block is allocated (doc tag-kv-block-usage).
+        if (s.task->params.tag != 0 &&
+            !llama_paged_scheduler_set_request_tag(sched, s.id, s.task->params.tag)) {
+            SLT_WRN(s, "tag %llu was rejected by the paged scheduler\n",
+                    (unsigned long long) s.task->params.tag);
         }
         return true;
     };
@@ -723,6 +819,11 @@ bool server_scheduler_paged::launch_multimodal(server_task && task) {
         s.release();
         return true;
     }
+    if (s.task->params.tag != 0 &&
+        !llama_paged_scheduler_set_request_tag(sched, s.id, s.task->params.tag)) {
+        SLT_WRN(s, "tag %llu was rejected by the paged scheduler\n",
+                (unsigned long long) s.task->params.tag);
+    }
 
     // overlap the first media chunk's encode with the first scheduler steps
     start_mm_prefetch(s);
@@ -995,6 +1096,164 @@ bool server_scheduler_paged::verify_slot(server_slot & slot, int32_t off, int32_
         port.send_final_response(slot);
     }
     return keep_generating;
+}
+
+bool server_scheduler_paged::get_kv_stats(llama_paged_kv_cache_stats & out) {
+    if (sched == nullptr) {
+        return false;
+    }
+    return llama_paged_scheduler_get_kv_cache_stats(sched, &out);
+}
+
+namespace {
+
+json tag_usage_to_json(const llama_paged_tag_block_usage & usage) {
+    auto pool = [](const llama_paged_tag_pool_usage & p) {
+        return json{
+            {"full_blocks",   p.full_blocks},
+            {"linear_blocks", p.linear_blocks},
+        };
+    };
+    return json{
+        {"npu", pool(usage.npu)},
+        {"cpu", pool(usage.cpu)},
+    };
+}
+
+struct tag_block_ids {
+    std::vector<uint32_t> full_owned;
+    std::vector<uint32_t> full_shared;
+    std::vector<uint32_t> linear_owned;
+
+    json blocks_json() const {
+        auto to_array = [](const std::vector<uint32_t> & ids) {
+            json arr = json::array();
+            for (const uint32_t id : ids) {
+                arr.push_back(id);
+            }
+            return arr;
+        };
+        return json{
+            {"full",   {{"owned", to_array(full_owned)}, {"shared", to_array(full_shared)}}},
+            {"linear", {{"owned", to_array(linear_owned)}, {"shared", json::array()}}},
+        };
+    }
+
+    llama_paged_tag_block_usage usage() const {
+        llama_paged_tag_block_usage out = {};
+        out.npu.full_blocks   = full_owned.size();
+        out.npu.linear_blocks = linear_owned.size();
+        return out;
+    }
+};
+
+static tag_block_ids fetch_tag_block_ids(llama_paged_scheduler * sched, uint64_t tag) {
+    tag_block_ids ids;
+
+    // phase 1: required lengths (all output arrays NULL)
+    size_t n_full_owned   = 0;
+    size_t n_full_shared  = 0;
+    size_t n_linear_owned = 0;
+    llama_paged_scheduler_get_tag_block_ids(sched, tag, nullptr, &n_full_owned, nullptr, &n_full_shared,
+                                            nullptr, &n_linear_owned);
+    ids.full_owned.resize(n_full_owned);
+    ids.full_shared.resize(n_full_shared);
+    ids.linear_owned.resize(n_linear_owned);
+
+    // phase 2: fill. Retry when the materialization grew between the phases.
+    // Empty vectors must still pass a non-NULL pointer: the API treats NULL as
+    // "report the required length only", which would otherwise let an empty
+    // phase-1 list resize to N zeros and stop the retry loop.
+    static uint32_t empty_out = 0;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        size_t c_full_owned   = ids.full_owned.size();
+        size_t c_full_shared  = ids.full_shared.size();
+        size_t c_linear_owned = ids.linear_owned.size();
+        const bool ok = llama_paged_scheduler_get_tag_block_ids(
+                sched, tag,
+                ids.full_owned.empty()   ? &empty_out : ids.full_owned.data(),   &c_full_owned,
+                ids.full_shared.empty()  ? &empty_out : ids.full_shared.data(),  &c_full_shared,
+                ids.linear_owned.empty() ? &empty_out : ids.linear_owned.data(), &c_linear_owned);
+        ids.full_owned.resize(c_full_owned);
+        ids.full_shared.resize(c_full_shared);
+        ids.linear_owned.resize(c_linear_owned);
+        if (ok) {
+            break;
+        }
+    }
+    return ids;
+}
+
+struct tag_block_collector {
+    std::map<uint64_t, tag_block_ids> tags;
+};
+
+void collect_tag_block(uint64_t tag, int32_t kind, uint32_t block_id, int32_t owned, void * user_data) {
+    auto * c = static_cast<tag_block_collector *>(user_data);
+    tag_block_ids & ids = c->tags[tag];
+    if (kind == 0) {
+        (owned ? ids.full_owned : ids.full_shared).push_back(block_id);
+    } else {
+        ids.linear_owned.push_back(block_id);
+    }
+}
+
+struct tag_usage_collector {
+    std::map<uint64_t, llama_paged_tag_block_usage> tags;
+};
+
+void collect_tag_usage(uint64_t tag, const llama_paged_tag_block_usage * usage, void * user_data) {
+    auto * c = static_cast<tag_usage_collector *>(user_data);
+    c->tags[tag] = *usage;
+}
+
+} // namespace
+
+bool server_scheduler_paged::get_tag_usage(uint64_t tag, bool include_blocks, json & out) {
+    if (sched == nullptr) {
+        return false;
+    }
+
+    if (tag != 0) {
+        if (include_blocks) {
+            // one materialization gives both the ids and their counts
+            const tag_block_ids ids = fetch_tag_block_ids(sched, tag);
+            out = tag_usage_to_json(ids.usage());
+            out["tag"]    = tag;
+            out["blocks"] = ids.blocks_json();
+            return true;
+        }
+
+        llama_paged_tag_block_usage usage = {};
+        if (!llama_paged_scheduler_get_tag_block_usage(sched, tag, &usage)) {
+            return false;
+        }
+        out = tag_usage_to_json(usage);
+        out["tag"] = tag;
+        return true;
+    }
+
+    // Listing: one materialization for the whole table. With ?blocks=1 the
+    // counts are derived from the same id lists, so count == len(owned)
+    // holds even if the scheduler advanced between two queries.
+    json tags = json::object();
+    if (include_blocks) {
+        tag_block_collector c;
+        llama_paged_scheduler_for_each_tag_block(sched, 0, collect_tag_block, &c);
+        for (const auto & [tag_id, ids] : c.tags) {
+            json entry = tag_usage_to_json(ids.usage());
+            entry["blocks"] = ids.blocks_json();
+            tags[std::to_string(tag_id)] = entry;
+        }
+    } else {
+        tag_usage_collector c;
+        llama_paged_scheduler_for_each_tag_block_usage(sched, collect_tag_usage, &c);
+        for (const auto & [tag_id, usage] : c.tags) {
+            tags[std::to_string(tag_id)] = tag_usage_to_json(usage);
+        }
+    }
+    out = json{{"tags", tags}};
+    return true;
 }
 
 std::unique_ptr<server_scheduler_interface> server_scheduler_create(server_context_port & port) {

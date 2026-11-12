@@ -4,6 +4,7 @@
 #include "llama-paged-scheduler-impl.h"
 
 #include <algorithm>
+#include <map>
 #include <vector>
 
 struct llama_paged_scheduler {
@@ -318,6 +319,40 @@ LLAMA_API void llama_paged_scheduler_set_on_finish(struct llama_paged_scheduler 
     sched->impl.set_on_finish(cb, user_data);
 }
 
+LLAMA_API bool llama_paged_scheduler_set_evict_decision(struct llama_paged_scheduler * sched,
+                                                        llama_paged_evict_pick_cb      cb,
+                                                        void *                         user_data) {
+    if (!sched) {
+        return false;
+    }
+    sched->impl.set_evict_decision(cb, user_data);
+    return true;
+}
+
+LLAMA_API uint32_t llama_paged_evict_pick_default(void *                         ud,
+                                                  llama_paged_pool_kind          pool,
+                                                  uint32_t                       n_needed,
+                                                  const llama_paged_free_block * head,
+                                                  uint32_t *                     out_ids,
+                                                  uint32_t                       out_capacity) {
+    (void) ud;
+    (void) pool;
+    if (head == nullptr || out_ids == nullptr || out_capacity == 0 || n_needed == 0) {
+        return 0;
+    }
+
+    const uint32_t n_max = std::min(n_needed, out_capacity);
+    uint32_t       n     = 0;
+    for (const llama_paged_free_block * it = head; it != nullptr && n < n_max;
+         it = llama_paged_free_block_next(it)) {
+        if (!llama_paged_free_block_has_hash(it)) {
+            continue;
+        }
+        out_ids[n++] = llama_paged_free_block_id(it);
+    }
+    return n;
+}
+
 LLAMA_API bool llama_paged_scheduler_get_seq_state(struct llama_paged_scheduler * sched,
                                                    int32_t                        request_id,
                                                    struct llama_paged_seq_state * out_state) {
@@ -381,4 +416,134 @@ LLAMA_API int32_t llama_paged_scheduler_max_request_id(const struct llama_paged_
         return 0;
     }
     return sched->impl.max_request_id();
+}
+
+//
+// tag -> KV block accounting
+//
+
+static void fill_tag_block_usage(const llama_paged_tag_usage & usage, struct llama_paged_tag_block_usage * out) {
+    out->npu.full_blocks   = usage.full_blocks;
+    out->npu.linear_blocks = usage.linear_blocks;
+    out->cpu.full_blocks   = 0;
+    out->cpu.linear_blocks = 0;
+}
+
+static void fill_block_stats(const llama_paged_block_stats & in, struct llama_paged_kv_cache_block_stats * out) {
+    out->total_blocks       = in.total_blocks;
+    out->used_blocks        = in.used_blocks;
+    out->free_blocks        = in.free_blocks;
+    out->cached_blocks      = in.cached_blocks;
+    out->allocatable_blocks = in.allocatable_blocks;
+}
+
+LLAMA_API bool llama_paged_scheduler_set_request_tag(struct llama_paged_scheduler * sched,
+                                                     int32_t                        request_id,
+                                                     uint64_t                       tag) {
+    if (!sched) {
+        return false;
+    }
+    return sched->impl.set_request_tag(request_id, tag);
+}
+
+LLAMA_API bool llama_paged_scheduler_get_tag_block_usage(struct llama_paged_scheduler *          sched,
+                                                         uint64_t                                tag,
+                                                         struct llama_paged_tag_block_usage *    out) {
+    if (!sched || !out) {
+        return false;
+    }
+    llama_paged_tag_usage usage;
+    sched->impl.tag_block_usage(tag, usage);
+    fill_tag_block_usage(usage, out);
+    return true;
+}
+
+LLAMA_API void llama_paged_scheduler_for_each_tag_block_usage(struct llama_paged_scheduler * sched,
+                                                              llama_paged_tag_usage_cb       cb,
+                                                              void *                         user_data) {
+    if (!sched || !cb) {
+        return;
+    }
+    std::map<uint64_t, llama_paged_tag_usage> all;
+    sched->impl.all_tag_block_usage(all);
+    for (const auto & [tag, usage] : all) {
+        struct llama_paged_tag_block_usage out;
+        fill_tag_block_usage(usage, &out);
+        cb(tag, &out, user_data);
+    }
+}
+
+LLAMA_API bool llama_paged_scheduler_for_each_tag_block(struct llama_paged_scheduler * sched,
+                                                        uint64_t                       tag,
+                                                        llama_paged_tag_block_cb       cb,
+                                                        void *                         user_data) {
+    if (!sched || !cb) {
+        return false;
+    }
+
+    // tag 0 = visit every tag.
+    const uint64_t * tag_ptr = tag != 0 ? &tag : nullptr;
+
+    sched->impl.for_each_tag_block(tag_ptr, [&](uint64_t t, int32_t kind, uint32_t block_id, bool owned) {
+        cb(t, kind, block_id, owned ? 1 : 0, user_data);
+    });
+    return true;
+}
+
+// Copies one id list according to the two-phase contract: a NULL array only
+// reports the required length; a non-NULL array must have enough capacity.
+// The required length is always written back, so callers can retry.
+static bool copy_tag_ids(const std::vector<uint32_t> & src, uint32_t * out, size_t * n) {
+    if (n == nullptr) {
+        return true;
+    }
+    const size_t required = src.size();
+    if (out == nullptr) {
+        *n = required;
+        return true;
+    }
+    const size_t capacity = *n;
+    *n = required;
+    if (capacity < required) {
+        return false;
+    }
+    std::copy(src.begin(), src.end(), out);
+    return true;
+}
+
+LLAMA_API bool llama_paged_scheduler_get_tag_block_ids(
+        struct llama_paged_scheduler * sched,
+        uint64_t                       tag,
+        uint32_t *                     full_owned_out,   size_t * n_full_owned,
+        uint32_t *                     full_shared_out,  size_t * n_full_shared,
+        uint32_t *                     linear_owned_out, size_t * n_linear_owned) {
+    if (!sched) {
+        return false;
+    }
+
+    std::vector<uint32_t> full_owned;
+    std::vector<uint32_t> full_shared;
+    std::vector<uint32_t> linear_owned;
+    sched->impl.tag_blocks(tag, full_owned, full_shared, linear_owned);
+
+    bool ok = true;
+    ok = copy_tag_ids(full_owned,   full_owned_out,   n_full_owned)   && ok;
+    ok = copy_tag_ids(full_shared,  full_shared_out,  n_full_shared)  && ok;
+    ok = copy_tag_ids(linear_owned, linear_owned_out, n_linear_owned) && ok;
+    return ok;
+}
+
+LLAMA_API bool llama_paged_scheduler_get_kv_cache_stats(struct llama_paged_scheduler *        sched,
+                                                        struct llama_paged_kv_cache_stats *    out) {
+    if (!sched || !out) {
+        return false;
+    }
+    llama_paged_pool_stats stats;
+    sched->impl.kv_cache_block_stats(stats);
+
+    fill_block_stats(stats.full,   &out->npu.full);
+    fill_block_stats(stats.linear, &out->npu.linear);
+    out->cpu.full   = {0, 0, 0};
+    out->cpu.linear = {0, 0, 0};
+    return true;
 }
