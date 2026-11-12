@@ -52,16 +52,16 @@ class llama_kv_cache_paged : public llama_memory_i {
 
     // Prefix cache support: share already populated blocks by reference.
     bool share_blocks(llama_sequence_group & group, const llama_block_ids & src_ids);
-    // `tag` (when non-empty) is recorded on every block in the list once the
+    // `tag` (when non-zero) is recorded on every block in the list once the
     // whole operation succeeds. A block keeps every tag that used it while it
     // stayed cache-resident; clearing happens only on cache-identity loss.
-    bool add_ref_blocks(const llama_block_ids & ids, const std::string & tag = "");
+    bool add_ref_blocks(const llama_block_ids & ids, uint64_t tag = 0);
     // Acquire refs for a block list whose blocks may be either live or
     // cache-resident (ref_count == 0). Cache-resident blocks are taken out of
     // the free queue. All-or-nothing; on failure every acquired ref is undone.
     // Tags are added in a second pass, only after the whole acquisition
     // succeeded.
-    bool acquire_blocks(const llama_block_ids & ids, const std::string & tag = "");
+    bool acquire_blocks(const llama_block_ids & ids, uint64_t tag = 0);
     uint32_t block_ref_count(uint32_t block_id) const;
     bool is_block_gpu(uint32_t block_id) const;
     bool block_has_hash(uint32_t block_id) const;
@@ -116,14 +116,14 @@ class llama_kv_cache_paged : public llama_memory_i {
     uint32_t get_num_cpu_blocks() const;
     uint32_t get_n_seq_max() const { return n_seq_max; }
 
-    // Owner tag of a physical block (empty when untagged).
-    const std::string & block_tag(uint32_t block_id) const;
+    // Owner tag of a physical block (0 when untagged).
+    uint64_t block_tag(uint32_t block_id) const;
 
     // Tag aggregation (query-time materialization, doc tag-kv-block-usage):
     // walks the live, GPU-resident prefix entries and files each block under
     // every tag in its tag set. `reusable_ids`, when set, receives every live
     // GPU-resident prefix block id regardless of whether it carries a tag.
-    void collect_tag_blocks(std::unordered_map<std::string, std::unordered_set<uint32_t>> & owned,
+    void collect_tag_blocks(std::unordered_map<uint64_t, std::unordered_set<uint32_t>> & owned,
                             std::unordered_set<uint32_t> * reusable_ids = nullptr) const;
 
     //

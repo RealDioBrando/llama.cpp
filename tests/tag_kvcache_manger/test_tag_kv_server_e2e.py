@@ -5,7 +5,7 @@
 # at the public service surface:
 #
 #   POST /completion | /v1/completions | /v1/chat/completions  with "tag"
-#   GET  /tag_usage            [&tag=<name>] [&blocks=1]
+#   GET  /tag_usage            [&tag=<uint64>] [&blocks=1]
 #   GET  /kv_stats
 #   GET  /slots                (params.tag visibility)
 #
@@ -57,6 +57,15 @@ MODEL = (
     or os.environ.get("PAGED_TEST_MODEL")
     or "/home/qwen35-2b-f16.gguf"
 )
+
+# Numeric owner tags used by the tests (0 = no tag).
+TAG_TENANT_A   = 1001
+TAG_OWNER1     = 1002
+TAG_BORROWER1  = 1003
+TAG_OAI_CMPL   = 1004
+TAG_OAI_CHAT   = 1005
+TAG_SLOT       = 1006
+TAG_UNKNOWN    = 999999
 
 # ~110 tokens with the Qwen tokenizer: comfortably past 6 blocks (96 tokens)
 # so at least one checkpoint on the default lattice (block 4 = 64 tokens)
@@ -352,7 +361,7 @@ def test_kv_stats_initial_consistency(paged_server):
 
 
 def test_tag_counts_owned_reusable_blocks(paged_server):
-    tag = "tenantA"
+    tag = TAG_TENANT_A
     completion(paged_server, tag=tag, n_predict=2)
 
     usage = tag_usage(paged_server, tag)
@@ -378,7 +387,7 @@ def test_tag_linear_gpu_checkpoint(paged_server):
     if stats["npu"]["linear"]["total_blocks"] == 0:
         pytest.skip("model has no linear-attention layers")
 
-    usage = tag_usage(paged_server, "tenantA")
+    usage = tag_usage(paged_server, TAG_TENANT_A)
     linear = usage["blocks"]["linear"]["owned"]
     assert_sorted_ids(linear)
     assert usage["npu"]["linear_blocks"] >= 1
@@ -389,8 +398,8 @@ def test_tag_linear_gpu_checkpoint(paged_server):
 
 
 def test_unknown_tag_is_zero(paged_server):
-    usage = tag_usage(paged_server, "no-such-tag")
-    assert_usage_shape(usage, "no-such-tag")
+    usage = tag_usage(paged_server, TAG_UNKNOWN)
+    assert_usage_shape(usage, TAG_UNKNOWN)
     assert usage["npu"]["full_blocks"] == 0
     assert usage["npu"]["linear_blocks"] == 0
     assert usage["blocks"]["full"]["owned"] == []
@@ -401,17 +410,17 @@ def test_unknown_tag_is_zero(paged_server):
 def test_tag_listing_and_blocks_flag(paged_server):
     listing = tag_listing(paged_server)
     assert "tags" in listing
-    assert "tenantA" in listing["tags"]
+    assert str(TAG_TENANT_A) in listing["tags"]
 
-    entry = listing["tags"]["tenantA"]
+    entry = listing["tags"][str(TAG_TENANT_A)]
     assert set(entry) == {"npu", "cpu"}
     assert "blocks" not in entry, "the listing must not carry ids unless ?blocks=1"
 
     listing_blocks = tag_listing(paged_server, blocks=True)
-    entry_blocks = listing_blocks["tags"]["tenantA"]
+    entry_blocks = listing_blocks["tags"][str(TAG_TENANT_A)]
     assert "blocks" in entry_blocks
 
-    single = tag_usage(paged_server, "tenantA")
+    single = tag_usage(paged_server, TAG_TENANT_A)
     assert entry_blocks["blocks"] == single["blocks"]
     assert entry_blocks["npu"] == single["npu"]
 
@@ -424,8 +433,8 @@ def test_tag_listing_and_blocks_flag(paged_server):
 
 
 def test_shared_prefix_is_counted_for_both_tags(paged_server):
-    owner_tag = "owner1"
-    borrower_tag = "borrower1"
+    owner_tag = TAG_OWNER1
+    borrower_tag = TAG_BORROWER1
 
     # the owner runs to completion first, leaving reusable blocks and a
     # checkpoint (block 4 on the default lattice) behind
@@ -495,8 +504,8 @@ def test_shared_prefix_is_counted_for_both_tags(paged_server):
 
 
 def test_oai_endpoints_accept_tag(paged_server):
-    cmpl_tag = "oai-cmpl"
-    chat_tag = "oai-chat"
+    cmpl_tag = TAG_OAI_CMPL
+    chat_tag = TAG_OAI_CHAT
     r = paged_server.post("/v1/completions", {
         "prompt": OAI_PROMPT,
         "max_tokens": 2,
@@ -521,7 +530,7 @@ def test_oai_endpoints_accept_tag(paged_server):
 
 
 def test_slots_expose_request_tag(paged_server):
-    tag = "slot-tag"
+    tag = TAG_SLOT
     result = {}
 
     def run():
@@ -550,16 +559,22 @@ def test_slots_expose_request_tag(paged_server):
         raise result["error"]
 
 
-def test_tag_longer_than_128_is_rejected(paged_server):
+def test_non_uint64_tag_is_rejected(paged_server):
+    # A string tag is no longer accepted: the tag is a uint64 identifier.
     r = paged_server.post("/completion", {
         "prompt": "hello",
         "n_predict": 1,
-        "tag": "x" * 129,
+        "tag": "not-a-number",
     })
     assert r.status_code == 400, r.text
     body = r.json()
     assert body["error"]["type"] == "invalid_request_error"
-    assert "128" in body["error"]["message"]
+    assert "tag" in body["error"]["message"].lower()
+
+    # The /tag_usage query parameter must also parse as uint64.
+    r = paged_server.get("/tag_usage", params={"tag": "not-a-number"})
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["type"] == "invalid_request_error"
 
 
 def test_kv_stats_consistency_after_activity(paged_server):
@@ -573,6 +588,6 @@ def test_non_paged_server_reports_not_supported(default_server):
     assert r.status_code == 501, r.text
     assert r.json()["error"]["type"] == "not_supported_error"
 
-    r = default_server.get("/tag_usage", params={"tag": "x"})
+    r = default_server.get("/tag_usage", params={"tag": "1"})
     assert r.status_code == 501, r.text
     assert r.json()["error"]["type"] == "not_supported_error"

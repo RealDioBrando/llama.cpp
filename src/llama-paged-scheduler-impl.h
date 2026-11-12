@@ -58,26 +58,26 @@ class llama_paged_scheduler_impl {
     // scheduler thread; nothing here takes a lock.
     //
 
-    // Attach an owner tag to a not-yet-admitted request. Returns false when
-    // the request is unknown or already holds blocks / a cache reservation
-    // (tagging after the first schedule step is rejected).
-    bool set_request_tag(int32_t request_id, const std::string & tag);
+    // Attach an owner tag (uint64, 0 = none) to a not-yet-admitted request.
+    // Returns false when the request is unknown or already holds blocks / a
+    // cache reservation (tagging after the first schedule step is rejected).
+    bool set_request_tag(int32_t request_id, uint64_t tag);
 
     // Per-tag usage derived from owned blocks only. Tags that merely share
     // someone else's blocks appear with zero counts.
-    void all_tag_block_usage(std::map<std::string, llama_paged_tag_usage> & out) const;
-    bool tag_block_usage(const std::string & tag, llama_paged_tag_usage & out) const;
+    void all_tag_block_usage(std::map<uint64_t, llama_paged_tag_usage> & out) const;
+    bool tag_block_usage(uint64_t tag, llama_paged_tag_usage & out) const;
 
     // Block id detail for one tag. Ids are sorted ascending and the two id
     // spaces (full / linear) are independent.
-    bool tag_blocks(const std::string & tag,
+    bool tag_blocks(uint64_t tag,
                     std::vector<uint32_t> & full_owned,
                     std::vector<uint32_t> & full_shared,
                     std::vector<uint32_t> & linear_owned) const;
 
     // Visit (tag, kind, block_id, owned) for one tag or all tags when `tag`
     // is nullptr. kind: 0 = full, 1 = linear.
-    void for_each_tag_block(const std::string * tag, const llama_paged_tag_manager::block_cb & cb) const;
+    void for_each_tag_block(const uint64_t * tag, const llama_paged_tag_manager::block_cb & cb) const;
 
     void kv_cache_block_stats(llama_paged_pool_stats & out) const;
 

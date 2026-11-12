@@ -51,15 +51,16 @@ public:
     bool has_active(llama_seq_id seq_id) const;
     bool is_active_on_gpu(llama_seq_id seq_id) const;
     // Allocate a zeroed ACTIVE state block on the GPU pool. Returns true if
-    // the sequence already had one. `tag` is recorded as the owner tag of the
-    // sequence and written to the ACTIVE state block too, so the block keeps
-    // the full history of tags that used it while cache-resident.
-    bool ensure_active(llama_seq_id seq_id, const std::string & tag = "");
+    // the sequence already had one. `tag` (uint64, 0 = none) is recorded as
+    // the owner tag of the sequence and written to the ACTIVE state block too,
+    // so the block keeps the full history of tags that used it while
+    // cache-resident.
+    bool ensure_active(llama_seq_id seq_id, uint64_t tag = 0);
     bool release(llama_seq_id seq_id);
 
     // Record the owner tag of a sequence without touching its ACTIVE block.
-    bool set_seq_tag(llama_seq_id seq_id, const std::string & tag);
-    const std::string & seq_tag(llama_seq_id seq_id) const;
+    bool set_seq_tag(llama_seq_id seq_id, uint64_t tag);
+    uint64_t seq_tag(llama_seq_id seq_id) const;
 
     // Fork the state of `src` into `dst` (copy-on-fork, Q2).
     bool seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst);
@@ -89,9 +90,10 @@ public:
 
     // Copy the checkpoint for chain_hash into a fresh ACTIVE GPU block owned
     // by seq_id. Fails atomically when no GPU block can be obtained.
-    // `tag` is the request's owner tag: on failure the sequence state is gone,
-    // so a retry cannot recover it from seq_state; callers pass it explicitly.
-    bool fork_checkpoint(uint64_t chain_hash, llama_seq_id seq_id, const std::string & tag = "");
+    // `tag` (uint64, 0 = none) is the request's owner tag: on failure the
+    // sequence state is gone, so a retry cannot recover it from seq_state;
+    // callers pass it explicitly.
+    bool fork_checkpoint(uint64_t chain_hash, llama_seq_id seq_id, uint64_t tag = 0);
 
     bool checkpoint_is_live(const llama_linear_prefix_entry & e) const;
 
@@ -162,12 +164,12 @@ public:
     void set_prefix_enabled(bool v) { checkpoint_index.set_enabled(v); }
 
     // Owner tag of a physical state block (empty when untagged).
-    const std::string & block_tag(uint32_t block_id) const;
+    uint64_t block_tag(uint32_t block_id) const;
 
     // Tag aggregation: live, GPU-resident checkpoints filed under every tag in
     // the block's tag set.
     // ACTIVE state blocks and CPU checkpoints are never included.
-    void collect_tag_blocks(std::unordered_map<std::string, std::unordered_set<uint32_t>> & owned) const;
+    void collect_tag_blocks(std::unordered_map<uint64_t, std::unordered_set<uint32_t>> & owned) const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
@@ -176,7 +178,7 @@ private:
         uint32_t  block_id = 0;
         llama_pos pos      = -1;  // last processed token position
         uint32_t  rollback = 0;   // rollback plane selected for the next batch
-        std::string tag;          // owner tag of the sequence
+        uint64_t  tag      = 0;   // owner tag of the sequence (0 = none)
     };
 
     bool allocate_gpu_block(uint32_t & block_id);

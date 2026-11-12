@@ -477,13 +477,13 @@ uint32_t llama_kv_cache_paged::get_num_cpu_blocks() const {
     return num_cpu_blocks;
 }
 
-const std::string & llama_kv_cache_paged::block_tag(uint32_t block_id) const {
+uint64_t llama_kv_cache_paged::block_tag(uint32_t block_id) const {
     return block_manager.tag(block_id);
 }
 
 void llama_kv_cache_paged::collect_tag_blocks(
-        std::unordered_map<std::string, std::unordered_set<uint32_t>> & owned,
-        std::unordered_set<uint32_t> *                                  reusable_ids) const {
+        std::unordered_map<uint64_t, std::unordered_set<uint32_t>> & owned,
+        std::unordered_set<uint32_t> *                               reusable_ids) const {
     for (const auto & [hash, e] : prefix_index.entries()) {
         (void) hash;
         const uint32_t id = e.block_id;
@@ -504,8 +504,8 @@ void llama_kv_cache_paged::collect_tag_blocks(
         // from the per-tag statistics.
         const uint32_t n_tags = block_manager.tag_count(id);
         for (uint32_t t = 0; t < n_tags; ++t) {
-            const char * tag = block_manager.tag_at(id, t);
-            if (tag != nullptr) {
+            const uint64_t tag = block_manager.tag_at(id, t);
+            if (tag != 0) {
                 owned[tag].insert(id);
             }
         }
@@ -525,7 +525,7 @@ bool llama_kv_cache_paged::share_blocks(llama_sequence_group & group, const llam
     return true;
 }
 
-bool llama_kv_cache_paged::add_ref_blocks(const llama_block_ids & ids, const std::string & tag) {
+bool llama_kv_cache_paged::add_ref_blocks(const llama_block_ids & ids, uint64_t tag) {
     llama_block_ids added;
     added.reserve(ids.size());
     for (const uint32_t id : ids) {
@@ -545,7 +545,7 @@ bool llama_kv_cache_paged::add_ref_blocks(const llama_block_ids & ids, const std
     }
     // Tag only after the whole operation succeeded: on failure the caller gets
     // its refs back and the blocks must not have picked up a phantom tag.
-    if (!tag.empty()) {
+    if (tag != 0) {
         for (const uint32_t id : ids) {
             block_manager.set_tag(id, tag);
         }
@@ -553,7 +553,7 @@ bool llama_kv_cache_paged::add_ref_blocks(const llama_block_ids & ids, const std
     return true;
 }
 
-bool llama_kv_cache_paged::acquire_blocks(const llama_block_ids & ids, const std::string & tag) {
+bool llama_kv_cache_paged::acquire_blocks(const llama_block_ids & ids, uint64_t tag) {
     llama_block_ids acquired;
     acquired.reserve(ids.size());
     for (const uint32_t id : ids) {
@@ -575,7 +575,7 @@ bool llama_kv_cache_paged::acquire_blocks(const llama_block_ids & ids, const std
     }
     // Second pass: record the requesting tag only once the whole acquisition
     // succeeded, so an atomic failure leaves every tag set untouched.
-    if (!tag.empty()) {
+    if (tag != 0) {
         for (const uint32_t id : ids) {
             block_manager.set_tag(id, tag);
         }

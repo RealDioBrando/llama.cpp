@@ -23,7 +23,7 @@ class server_scheduler_paged final : public server_scheduler_interface {
     void cancel(int64_t id_task) override;
     void update() override;
     bool get_kv_stats(llama_paged_kv_cache_stats & out) override;
-    bool get_tag_usage(const std::string & tag, bool include_blocks, json & out) override;
+    bool get_tag_usage(uint64_t tag, bool include_blocks, json & out) override;
     bool set_evict_decision(llama_paged_evict_pick_cb cb, void * user_data) override;
 
   private:
@@ -75,9 +75,10 @@ class server_scheduler_paged final : public server_scheduler_interface {
 
     llama_paged_scheduler * sched = nullptr;
 
-    // protected tags of the built-in eviction policy. Owned here (not by the
-    // scheduler) so they outlive it; the callback user data is `this`.
-    std::set<std::string> evict_protect_tags;
+    // protected tags (uint64 ids) of the built-in eviction policy. Owned here
+    // (not by the scheduler) so they outlive it; the callback user data is
+    // `this`.
+    std::set<uint64_t> evict_protect_tags;
 
     // owned and recycled by llama_paged_scheduler_prepare_batch
     llama_batch paged_batch = {};

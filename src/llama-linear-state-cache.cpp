@@ -129,14 +129,14 @@ bool llama_linear_state_cache::alloc_checkpoint_block(uint32_t & block_id) {
 // active state
 //
 
-bool llama_linear_state_cache::ensure_active(llama_seq_id seq_id, const std::string & tag) {
+bool llama_linear_state_cache::ensure_active(llama_seq_id seq_id, uint64_t tag) {
     if (seqs.count(seq_id)) {
         // The tag is an ownership annotation only; an existing ACTIVE state
-        // block is never re-tagged (it is not reusable anyway). Repair an
-        // empty annotation when the caller supplies one: a failed checkpoint
+        // block is never re-tagged (it is not reusable anyway). Repair a
+        // missing annotation when the caller supplies one: a failed checkpoint
         // fork may have dropped it on an earlier attempt. Keep the block's tag
         // set consistent, but never tag a CPU-resident (swapped) block.
-        if (!tag.empty() && seqs[seq_id].tag.empty()) {
+        if (tag != 0 && seqs[seq_id].tag == 0) {
             seqs[seq_id].tag = tag;
             if (block_manager.is_gpu(seqs[seq_id].block_id)) {
                 block_manager.set_tag(seqs[seq_id].block_id, tag);
@@ -155,7 +155,7 @@ bool llama_linear_state_cache::ensure_active(llama_seq_id seq_id, const std::str
     // Record the owner tag on the physical block. The ACTIVE block is not
     // reusable, but the tag is part of the block's tag set until the block
     // loses its cache identity (see prefix-cache-evict-policy.md 2.3).
-    if (!tag.empty()) {
+    if (tag != 0) {
         block_manager.set_tag(block_id, tag);
     }
 
@@ -168,7 +168,7 @@ bool llama_linear_state_cache::ensure_active(llama_seq_id seq_id, const std::str
     return true;
 }
 
-bool llama_linear_state_cache::set_seq_tag(llama_seq_id seq_id, const std::string & tag) {
+bool llama_linear_state_cache::set_seq_tag(llama_seq_id seq_id, uint64_t tag) {
     const auto it = seqs.find(seq_id);
     if (it == seqs.end()) {
         return false;
@@ -177,10 +177,9 @@ bool llama_linear_state_cache::set_seq_tag(llama_seq_id seq_id, const std::strin
     return true;
 }
 
-const std::string & llama_linear_state_cache::seq_tag(llama_seq_id seq_id) const {
-    static const std::string empty;
+uint64_t llama_linear_state_cache::seq_tag(llama_seq_id seq_id) const {
     const auto it = seqs.find(seq_id);
-    return it == seqs.end() ? empty : it->second.tag;
+    return it == seqs.end() ? 0 : it->second.tag;
 }
 
 bool llama_linear_state_cache::release(llama_seq_id seq_id) {
@@ -222,7 +221,7 @@ bool llama_linear_state_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_
     st.rollback = 0;
     st.tag      = src->second.tag;  // fork inherits the owner tag
     // The fresh ACTIVE block carries the same tag as ensure_active() does.
-    if (!st.tag.empty()) {
+    if (st.tag != 0) {
         block_manager.set_tag(dst_id, st.tag);
     }
     seqs[seq_id_dst] = st;
@@ -416,7 +415,7 @@ const llama_linear_prefix_entry * llama_linear_state_cache::find_checkpoint(
 }
 
 bool llama_linear_state_cache::fork_checkpoint(uint64_t chain_hash, llama_seq_id seq_id,
-                                               const std::string & tag) {
+                                               uint64_t tag) {
     const auto * e = checkpoint_index.find(chain_hash);
     if (!e || !checkpoint_is_live(*e)) {
         return false;
@@ -435,7 +434,7 @@ bool llama_linear_state_cache::fork_checkpoint(uint64_t chain_hash, llama_seq_id
     // The active state block is replaced below. The request tag is taken from
     // the caller when given: a failed attempt releases the seq_state, so a
     // retry would otherwise lose it.
-    const std::string owner_tag = !tag.empty() ? tag : seq_tag(seq_id);
+    const uint64_t owner_tag = tag != 0 ? tag : seq_tag(seq_id);
 
     // Replace any stale active block for this sequence.
     if (seqs.count(seq_id)) {
@@ -472,7 +471,7 @@ bool llama_linear_state_cache::fork_checkpoint(uint64_t chain_hash, llama_seq_id
     // the source checkpoint, which stays cache-resident and may be forked
     // again. Record the owner tag on the block's tag set (not just in
     // seq_state) so an eviction policy can see every tag that used it.
-    if (!owner_tag.empty()) {
+    if (owner_tag != 0) {
         block_manager.set_tag(active_id, owner_tag);
         // CPU checkpoints stay untagged, exactly like create_checkpoint():
         // only GPU-resident checkpoints participate in the tag -> block map.
@@ -534,7 +533,7 @@ bool llama_linear_state_cache::swap_in(llama_seq_id seq_id) {
     }
     mem->copy_state_block(it->second.block_id - n_gpu_blocks, /*src_gpu=*/false, gpu_id, /*dst_gpu=*/true);
     // Keep the ACTIVE block's tag consistent with ensure_active()/seq_cp.
-    if (!it->second.tag.empty()) {
+    if (it->second.tag != 0) {
         block_manager.set_tag(gpu_id, it->second.tag);
     }
     release_block(it->second.block_id);
@@ -570,7 +569,7 @@ uint32_t llama_linear_state_cache::get_num_cpu_blocks() const {
     return n_cpu_blocks;
 }
 
-const std::string & llama_linear_state_cache::block_tag(uint32_t block_id) const {
+uint64_t llama_linear_state_cache::block_tag(uint32_t block_id) const {
     return block_manager.tag(block_id);
 }
 
@@ -591,7 +590,7 @@ void llama_linear_state_cache::reset_gpu_checkout_refusal() {
 }
 
 void llama_linear_state_cache::collect_tag_blocks(
-        std::unordered_map<std::string, std::unordered_set<uint32_t>> & owned) const {
+        std::unordered_map<uint64_t, std::unordered_set<uint32_t>> & owned) const {
     for (const auto & [chain_hash, e] : checkpoint_index.entries()) {
         (void) chain_hash;
         if (!checkpoint_is_live(e) || !block_manager.is_gpu(e.block_id)) {
@@ -601,8 +600,8 @@ void llama_linear_state_cache::collect_tag_blocks(
         // representative, not an owner.
         const uint32_t n_tags = block_manager.tag_count(e.block_id);
         for (uint32_t t = 0; t < n_tags; ++t) {
-            const char * tag = block_manager.tag_at(e.block_id, t);
-            if (tag != nullptr) {
+            const uint64_t tag = block_manager.tag_at(e.block_id, t);
+            if (tag != 0) {
                 owned[tag].insert(e.block_id);
             }
         }

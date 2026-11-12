@@ -439,21 +439,21 @@ static void fill_block_stats(const llama_paged_block_stats & in, struct llama_pa
 
 LLAMA_API bool llama_paged_scheduler_set_request_tag(struct llama_paged_scheduler * sched,
                                                      int32_t                        request_id,
-                                                     const char *                   tag) {
+                                                     uint64_t                       tag) {
     if (!sched) {
         return false;
     }
-    return sched->impl.set_request_tag(request_id, tag != nullptr ? tag : "");
+    return sched->impl.set_request_tag(request_id, tag);
 }
 
 LLAMA_API bool llama_paged_scheduler_get_tag_block_usage(struct llama_paged_scheduler *          sched,
-                                                         const char *                            tag,
+                                                         uint64_t                                tag,
                                                          struct llama_paged_tag_block_usage *    out) {
     if (!sched || !out) {
         return false;
     }
     llama_paged_tag_usage usage;
-    sched->impl.tag_block_usage(tag != nullptr ? tag : "", usage);
+    sched->impl.tag_block_usage(tag, usage);
     fill_tag_block_usage(usage, out);
     return true;
 }
@@ -464,33 +464,28 @@ LLAMA_API void llama_paged_scheduler_for_each_tag_block_usage(struct llama_paged
     if (!sched || !cb) {
         return;
     }
-    std::map<std::string, llama_paged_tag_usage> all;
+    std::map<uint64_t, llama_paged_tag_usage> all;
     sched->impl.all_tag_block_usage(all);
     for (const auto & [tag, usage] : all) {
         struct llama_paged_tag_block_usage out;
         fill_tag_block_usage(usage, &out);
-        cb(tag.c_str(), &out, user_data);
+        cb(tag, &out, user_data);
     }
 }
 
 LLAMA_API bool llama_paged_scheduler_for_each_tag_block(struct llama_paged_scheduler * sched,
-                                                        const char *                   tag,
+                                                        uint64_t                       tag,
                                                         llama_paged_tag_block_cb       cb,
                                                         void *                         user_data) {
     if (!sched || !cb) {
         return false;
     }
 
-    // NULL tag = visit every tag. The string must outlive the iteration.
-    std::string tag_storage;
-    const std::string * tag_ptr = nullptr;
-    if (tag != nullptr) {
-        tag_storage = tag;
-        tag_ptr     = &tag_storage;
-    }
+    // tag 0 = visit every tag.
+    const uint64_t * tag_ptr = tag != 0 ? &tag : nullptr;
 
-    sched->impl.for_each_tag_block(tag_ptr, [&](const std::string & t, int32_t kind, uint32_t block_id, bool owned) {
-        cb(t.c_str(), kind, block_id, owned ? 1 : 0, user_data);
+    sched->impl.for_each_tag_block(tag_ptr, [&](uint64_t t, int32_t kind, uint32_t block_id, bool owned) {
+        cb(t, kind, block_id, owned ? 1 : 0, user_data);
     });
     return true;
 }
@@ -518,7 +513,7 @@ static bool copy_tag_ids(const std::vector<uint32_t> & src, uint32_t * out, size
 
 LLAMA_API bool llama_paged_scheduler_get_tag_block_ids(
         struct llama_paged_scheduler * sched,
-        const char *                   tag,
+        uint64_t                       tag,
         uint32_t *                     full_owned_out,   size_t * n_full_owned,
         uint32_t *                     full_shared_out,  size_t * n_full_shared,
         uint32_t *                     linear_owned_out, size_t * n_linear_owned) {
@@ -529,7 +524,7 @@ LLAMA_API bool llama_paged_scheduler_get_tag_block_ids(
     std::vector<uint32_t> full_owned;
     std::vector<uint32_t> full_shared;
     std::vector<uint32_t> linear_owned;
-    sched->impl.tag_blocks(tag != nullptr ? tag : "", full_owned, full_shared, linear_owned);
+    sched->impl.tag_blocks(tag, full_owned, full_shared, linear_owned);
 
     bool ok = true;
     ok = copy_tag_ids(full_owned,   full_owned_out,   n_full_owned)   && ok;

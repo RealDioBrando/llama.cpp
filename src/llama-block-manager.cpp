@@ -520,14 +520,14 @@ void llama_block_manager::clear_tags(physical_block & b) {
     b.tags.clear();
 }
 
-void llama_block_manager::add_tag(uint32_t id, const std::string & tag) {
+void llama_block_manager::add_tag(uint32_t id, uint64_t tag) {
     physical_block * b = block_at(id);
     if (!b) {
         LLAMA_LOG_WARN("%s: tag write on invalid block %u\n", __func__, id);
         return;
     }
-    if (tag.empty()) {
-        return;   // empty tags are never recorded
+    if (tag == 0) {
+        return;   // 0 means "no tag"
     }
     if (!b->is_gpu) {
         // The CPU pool is out of scope: it is being refactored and never takes
@@ -537,19 +537,23 @@ void llama_block_manager::add_tag(uint32_t id, const std::string & tag) {
     if (b->ref_count == 0 && !b->has_hash) {
         // Tagging a plain free block would leak the owner into a future
         // checkout. Cache-resident free blocks keep their tags instead.
-        LLAMA_LOG_WARN("%s: tag '%s' rejected on free block %u\n", __func__, tag.c_str(), id);
+        LLAMA_LOG_WARN("%s: tag %llu rejected on free block %u\n", __func__,
+                       (unsigned long long) tag, id);
         return;
     }
     b->tags.insert(tag);
 }
 
-void llama_block_manager::set_tag(uint32_t id, const std::string & tag) {
+void llama_block_manager::set_tag(uint32_t id, uint64_t tag) {
     // Multi-tag semantics: set_tag never replaces the accumulated set; it only
     // adds to it.
     add_tag(id, tag);
 }
 
-bool llama_block_manager::has_tag(uint32_t id, const std::string & tag) const {
+bool llama_block_manager::has_tag(uint32_t id, uint64_t tag) const {
+    if (tag == 0) {
+        return false;
+    }
     const physical_block * b = block_at(id);
     if (!b) {
         return false;
@@ -562,21 +566,20 @@ uint32_t llama_block_manager::tag_count(uint32_t id) const {
     return b ? (uint32_t) b->tags.size() : 0;
 }
 
-const char * llama_block_manager::tag_at(uint32_t id, uint32_t index) const {
+uint64_t llama_block_manager::tag_at(uint32_t id, uint32_t index) const {
     const physical_block * b = block_at(id);
     if (!b || index >= b->tags.size()) {
-        return nullptr;
+        return 0;
     }
     auto it = b->tags.begin();
     std::advance(it, index);
-    return it->c_str();
+    return *it;
 }
 
-const std::string & llama_block_manager::tag(uint32_t id) const {
-    static const std::string empty;
+uint64_t llama_block_manager::tag(uint32_t id) const {
     const physical_block * b = block_at(id);
     if (!b || b->tags.empty()) {
-        return empty;
+        return 0;
     }
     return *b->tags.begin();
 }
@@ -605,31 +608,28 @@ uint64_t llama_paged_free_block_hash(const llama_paged_free_block * block) {
     return block != nullptr ? block->hash : 0;
 }
 
-const char * llama_paged_free_block_tag(const llama_paged_free_block * block) {
-    if (block == nullptr) {
-        return nullptr;
+uint64_t llama_paged_free_block_tag(const llama_paged_free_block * block) {
+    if (block == nullptr || block->tags.empty()) {
+        return 0;   // 0 = untagged
     }
-    if (block->tags.empty()) {
-        return nullptr;   // matches the public contract: NULL when untagged
-    }
-    return block->tags.begin()->c_str();
+    return *block->tags.begin();
 }
 
 uint32_t llama_paged_free_block_tag_count(const llama_paged_free_block * block) {
     return block != nullptr ? (uint32_t) block->tags.size() : 0;
 }
 
-const char * llama_paged_free_block_tag_at(const llama_paged_free_block * block, uint32_t index) {
+uint64_t llama_paged_free_block_tag_at(const llama_paged_free_block * block, uint32_t index) {
     if (block == nullptr || index >= block->tags.size()) {
-        return nullptr;
+        return 0;
     }
     auto it = block->tags.begin();
     std::advance(it, index);
-    return it->c_str();
+    return *it;
 }
 
-int32_t llama_paged_free_block_has_tag(const llama_paged_free_block * block, const char * tag) {
-    if (block == nullptr || tag == nullptr) {
+int32_t llama_paged_free_block_has_tag(const llama_paged_free_block * block, uint64_t tag) {
+    if (block == nullptr || tag == 0) {
         return 0;
     }
     return block->tags.find(tag) != block->tags.end() ? 1 : 0;

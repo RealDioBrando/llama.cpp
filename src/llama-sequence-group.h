@@ -56,10 +56,11 @@ struct llama_sequence_group {
     // Request priority: smaller values are served first, default 0.
     // Read-only after queue_request().
     int32_t priority = 0;
-    // Optional owner tag supplied by the caller (see
-    // llama_paged_scheduler_set_request_tag). Blocks first allocated by this
-    // group become owned by the tag; it is inherited by forked children.
-    std::string tag;
+    // Optional owner tag (uint64) supplied by the caller (see
+    // llama_paged_scheduler_set_request_tag). 0 means "no tag". Blocks first
+    // allocated by this group become owned by the tag; it is inherited by
+    // forked children.
+    uint64_t tag = 0;
     // Monotonic enqueue sequence assigned by the scheduler in queue_request().
     // Only used to break ties between equal (priority, t_arrival_time).
     uint64_t arrival_seq = 0;

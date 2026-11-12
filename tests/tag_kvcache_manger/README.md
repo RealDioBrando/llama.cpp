@@ -18,10 +18,10 @@
 
 | 接口 | 说明 |
 | --- | --- |
-| `POST /completion`、`POST /v1/completions`、`POST /v1/chat/completions` | 请求体可带 `tag`（≤128 字符）；paged 模式下在首次调度前写入 owner tag |
+| `POST /completion`、`POST /v1/completions`、`POST /v1/chat/completions` | 请求体可带 `tag`（JSON 整数，uint64，0 = 无 tag）；paged 模式下在首次调度前写入 owner tag |
 | `GET /kv_stats` | `npu.full` / `npu.linear` 两块池的 `total/used/free`；`cpu.*` 恒为 0 |
 | `GET /tag_usage` | 全量 tag 计数（默认不带 id 列表） |
-| `GET /tag_usage?tag=T` | 单 tag 计数 + `blocks`（默认带 id） |
+| `GET /tag_usage?tag=<uint64>` | 单 tag 计数 + `blocks`（默认带 id） |
 | `GET /tag_usage?blocks=1` | 全量列表附带每个 tag 的 id 列表 |
 | `GET /slots` | 处理中的请求在 `params.tag` 暴露 tag |
 
@@ -37,7 +37,7 @@
 | `test_shared_prefix_is_counted_for_both_tags` | 命中方复用的块同时出现在自己和 owner 的 `owned` 里；正常路径 `shared` 为空（tag 已并入集合）；owner 归属保持不变 |
 | `test_oai_endpoints_accept_tag` | `/v1/completions`、`/v1/chat/completions` 的 tag 生效 |
 | `test_slots_expose_request_tag` | `/slots` 的 `params.tag` 可见 |
-| `test_tag_longer_than_128_is_rejected` | 129 字符 tag 返回 400 `invalid_request_error` |
+| `test_non_uint64_tag_is_rejected` | 字符串 tag / 非数字 `?tag=` 返回 400 `invalid_request_error` |
 | `test_kv_stats_consistency_after_activity` | 活动后池统计仍自洽 |
 | `test_non_paged_server_reports_not_supported` | 非 `--kv-paged` 服务返回 501 `not_supported_error` |
 
@@ -98,7 +98,7 @@ python3 -m pytest -v tests/tag_kvcache_manger/test_tag_kv_server_e2e.py
 ## 驱逐策略 e2e
 
 `test_paged_evict_policy_e2e.py` 通过环境变量
-`LLAMA_SERVER_PAGED_EVICT_PROTECT_TAGS=keep` 安装内置的 tag 保护策略：
+`LLAMA_SERVER_PAGED_EVICT_PROTECT_TAGS=1` 安装内置的 tag 保护策略：
 
 1. 用 tag `keep` 发送长 prompt，生成可复用 prefix；
 2. 用多个不同 tag 的请求填满小块池，强制淘汰；

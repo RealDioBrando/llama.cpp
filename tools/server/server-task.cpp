@@ -84,7 +84,7 @@ json task_params::to_json(bool only_metrics) const {
             {"backend_sampling",          sampling.backend_sampling},
             {"lora",                      lora},
         };
-        if (!tag.empty()) {
+        if (tag != 0) {
             out["tag"] = tag;
         }
         return out;
@@ -147,7 +147,7 @@ json task_params::to_json(bool only_metrics) const {
         {"backend_sampling",          sampling.backend_sampling},
         {"lora",                      lora},
     };
-    if (!tag.empty()) {
+    if (tag != 0) {
         out["tag"] = tag;
     }
     return out;

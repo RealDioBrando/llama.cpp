@@ -24,10 +24,10 @@ llama_paged_tag_manager::snapshot llama_paged_tag_manager::materialize(
     // shared: references held by tagged requests to reusable blocks that they
     // do not own. Derived from the live block tables, never counted.
     for (const request_ref & req : requests) {
-        if (req.tag == nullptr || req.tag->empty() || req.block_table == nullptr) {
+        if (req.tag == nullptr || *req.tag == 0 || req.block_table == nullptr) {
             continue;
         }
-        const std::string & tag = *req.tag;
+        const uint64_t tag = *req.tag;
         const auto owned_it = s.owned_full.find(tag);
         for (const uint32_t block_id : *req.block_table) {
             if (reusable_full.count(block_id) == 0) {
@@ -42,7 +42,7 @@ llama_paged_tag_manager::snapshot llama_paged_tag_manager::materialize(
     return s;
 }
 
-llama_paged_tag_usage llama_paged_tag_manager::usage(const snapshot & s, const std::string & tag) {
+llama_paged_tag_usage llama_paged_tag_manager::usage(const snapshot & s, uint64_t tag) {
     llama_paged_tag_usage out;
     if (const auto it = s.owned_full.find(tag); it != s.owned_full.end()) {
         out.full_blocks = it->second.size();
@@ -54,9 +54,9 @@ llama_paged_tag_usage llama_paged_tag_manager::usage(const snapshot & s, const s
 }
 
 void llama_paged_tag_manager::all_usage(const snapshot & s,
-                                        std::map<std::string, llama_paged_tag_usage> & out) {
+                                        std::map<uint64_t, llama_paged_tag_usage> & out) {
     out.clear();
-    auto touch = [&out](const std::string & tag) -> llama_paged_tag_usage & {
+    auto touch = [&out](uint64_t tag) -> llama_paged_tag_usage & {
         return out[tag];
     };
     for (const auto & [tag, ids] : s.owned_full) {
@@ -71,7 +71,7 @@ void llama_paged_tag_manager::all_usage(const snapshot & s,
     }
 }
 
-void llama_paged_tag_manager::block_ids(const snapshot & s, const std::string & tag,
+void llama_paged_tag_manager::block_ids(const snapshot & s, uint64_t tag,
                                         std::vector<uint32_t> & full_owned,
                                         std::vector<uint32_t> & full_shared,
                                         std::vector<uint32_t> & linear_owned) {
@@ -94,10 +94,10 @@ void llama_paged_tag_manager::block_ids(const snapshot & s, const std::string & 
     std::sort(linear_owned.begin(), linear_owned.end());
 }
 
-void llama_paged_tag_manager::for_each_block(const snapshot & s, const std::string * tag, const block_cb & cb) {
-    auto emit = [&](const std::string & t,
-                    const std::unordered_map<std::string, std::unordered_set<uint32_t>> & owned,
-                    const std::unordered_map<std::string, std::unordered_set<uint32_t>> * shared,
+void llama_paged_tag_manager::for_each_block(const snapshot & s, const uint64_t * tag, const block_cb & cb) {
+    auto emit = [&](uint64_t t,
+                    const std::unordered_map<uint64_t, std::unordered_set<uint32_t>> & owned,
+                    const std::unordered_map<uint64_t, std::unordered_set<uint32_t>> * shared,
                     int32_t kind) {
         if (const auto it = owned.find(t); it != owned.end()) {
             std::vector<uint32_t> ids(it->second.begin(), it->second.end());
@@ -118,7 +118,7 @@ void llama_paged_tag_manager::for_each_block(const snapshot & s, const std::stri
     };
 
     // ordered union of every materialized tag (or just the requested one)
-    std::map<std::string, int> tags;
+    std::map<uint64_t, int> tags;
     if (tag != nullptr) {
         tags[*tag] = 0;
     } else {

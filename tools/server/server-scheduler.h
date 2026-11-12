@@ -93,9 +93,9 @@ struct server_scheduler_interface {
     // servers answer /kv_stats and /tag_usage with an error.
     virtual bool get_kv_stats(llama_paged_kv_cache_stats & /*out*/) { return false; }
 
-    // Renders the /tag_usage payload. `tag` empty means the listing of every
+    // Renders the /tag_usage payload. `tag == 0` means the listing of every
     // tag; `include_blocks` materializes the block id lists.
-    virtual bool get_tag_usage(const std::string & /*tag*/, bool /*include_blocks*/, json & /*out*/) {
+    virtual bool get_tag_usage(uint64_t /*tag*/, bool /*include_blocks*/, json & /*out*/) {
         return false;
     }
 

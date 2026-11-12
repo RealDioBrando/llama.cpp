@@ -94,9 +94,9 @@ struct task_params {
     std::string        control_action;
     std::string        control_cmpl_id;
 
-    // Owner tag for the paged KV block accounting (--kv-paged only). Empty
-    // means the request's blocks belong to no tag. Max 128 characters.
-    std::string        tag;
+    // Owner tag (uint64) for the paged KV block accounting (--kv-paged only).
+    // 0 means the request's blocks belong to no tag.
+    uint64_t           tag = 0;
 
     // per-request parameters for chat parsing
     common_chat_parser_params chat_parser_params;
@@ -187,7 +187,7 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_KV_STATS
     bool        kv_stats_pools    = false; // true: pool stats (/kv_stats), false: tag usage (/tag_usage)
-    std::string kv_tag;                    // empty = every tag
+    uint64_t    kv_tag            = 0;     // 0 = every tag
     bool        kv_include_blocks = false; // materialize block id lists
 
     server_task() = default;

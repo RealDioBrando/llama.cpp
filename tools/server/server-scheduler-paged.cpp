@@ -7,6 +7,7 @@
 #include "sampling.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -100,10 +101,10 @@ bool server_scheduler_paged::init() {
 
     cancelled.assign(port.slot_pool().size(), 0);
 
-    // Test/grayscale hook: LLAMA_SERVER_PAGED_EVICT_PROTECT_TAGS=keep,tenantA
-    // protects every cache-resident block carrying one of these tags from
-    // eviction. Unset or empty keeps the legacy FIFO policy. Install before
-    // warmup so the policy also applies to warmup allocations.
+    // Test/grayscale hook: LLAMA_SERVER_PAGED_EVICT_PROTECT_TAGS=1,42
+    // protects every cache-resident block carrying one of these uint64 tags
+    // from eviction. Unset or empty keeps the legacy FIFO policy. Install
+    // before warmup so the policy also applies to warmup allocations.
     const char * env_protect = getenv("LLAMA_SERVER_PAGED_EVICT_PROTECT_TAGS");
     if (env_protect != nullptr && env_protect[0] != '\0') {
         std::string tags_str(env_protect);
@@ -118,7 +119,14 @@ bool server_scheduler_paged::init() {
             const size_t last  = tag.find_last_not_of(" \t\r\n");
             if (first != std::string::npos) {
                 tag = tag.substr(first, last - first + 1);
-                evict_protect_tags.insert(tag);
+                errno = 0;
+                char * tag_end = nullptr;
+                const unsigned long long value = strtoull(tag.c_str(), &tag_end, 10);
+                if (errno == 0 && tag_end != tag.c_str() && *tag_end == '\0' && value != 0) {
+                    evict_protect_tags.insert((uint64_t) value);
+                } else {
+                    SRV_WRN("ignoring invalid protected tag '%s' (expected a non-zero uint64)\n", tag.c_str());
+                }
             }
             if (end == tags_str.size()) {
                 break;
@@ -128,11 +136,11 @@ bool server_scheduler_paged::init() {
 
         if (!evict_protect_tags.empty()) {
             std::string joined;
-            for (const std::string & tag : evict_protect_tags) {
+            for (const uint64_t tag : evict_protect_tags) {
                 if (!joined.empty()) {
                     joined += ",";
                 }
-                joined += tag;
+                joined += std::to_string(tag);
             }
             llama_paged_scheduler_set_evict_decision(sched, evict_pick_protect_tags, this);
             SRV_INF("paged eviction policy: protecting prefix-cache tags [%s]\n", joined.c_str());
@@ -178,8 +186,8 @@ uint32_t server_scheduler_paged::evict_pick_protect_tags(void * ud, llama_paged_
             continue;
         }
         bool protected_block = false;
-        for (const std::string & tag : protected_tags) {
-            if (llama_paged_free_block_has_tag(it, tag.c_str())) {
+        for (const uint64_t tag : protected_tags) {
+            if (llama_paged_free_block_has_tag(it, tag)) {
                 protected_block = true;
                 break;
             }
@@ -271,9 +279,10 @@ bool server_scheduler_paged::launch(server_task && task) {
         }
         // The tag must be attached before the request is first scheduled,
         // i.e. before any KV block is allocated (doc tag-kv-block-usage).
-        if (!s.task->params.tag.empty() &&
-            !llama_paged_scheduler_set_request_tag(sched, s.id, s.task->params.tag.c_str())) {
-            SLT_WRN(s, "tag '%s' was rejected by the paged scheduler\n", s.task->params.tag.c_str());
+        if (s.task->params.tag != 0 &&
+            !llama_paged_scheduler_set_request_tag(sched, s.id, s.task->params.tag)) {
+            SLT_WRN(s, "tag %llu was rejected by the paged scheduler\n",
+                    (unsigned long long) s.task->params.tag);
         }
         return true;
     };
@@ -810,9 +819,10 @@ bool server_scheduler_paged::launch_multimodal(server_task && task) {
         s.release();
         return true;
     }
-    if (!s.task->params.tag.empty() &&
-        !llama_paged_scheduler_set_request_tag(sched, s.id, s.task->params.tag.c_str())) {
-        SLT_WRN(s, "tag '%s' was rejected by the paged scheduler\n", s.task->params.tag.c_str());
+    if (s.task->params.tag != 0 &&
+        !llama_paged_scheduler_set_request_tag(sched, s.id, s.task->params.tag)) {
+        SLT_WRN(s, "tag %llu was rejected by the paged scheduler\n",
+                (unsigned long long) s.task->params.tag);
     }
 
     // overlap the first media chunk's encode with the first scheduler steps
@@ -1137,14 +1147,14 @@ struct tag_block_ids {
     }
 };
 
-static tag_block_ids fetch_tag_block_ids(llama_paged_scheduler * sched, const std::string & tag) {
+static tag_block_ids fetch_tag_block_ids(llama_paged_scheduler * sched, uint64_t tag) {
     tag_block_ids ids;
 
     // phase 1: required lengths (all output arrays NULL)
     size_t n_full_owned   = 0;
     size_t n_full_shared  = 0;
     size_t n_linear_owned = 0;
-    llama_paged_scheduler_get_tag_block_ids(sched, tag.c_str(), nullptr, &n_full_owned, nullptr, &n_full_shared,
+    llama_paged_scheduler_get_tag_block_ids(sched, tag, nullptr, &n_full_owned, nullptr, &n_full_shared,
                                             nullptr, &n_linear_owned);
     ids.full_owned.resize(n_full_owned);
     ids.full_shared.resize(n_full_shared);
@@ -1160,7 +1170,7 @@ static tag_block_ids fetch_tag_block_ids(llama_paged_scheduler * sched, const st
         size_t c_full_shared  = ids.full_shared.size();
         size_t c_linear_owned = ids.linear_owned.size();
         const bool ok = llama_paged_scheduler_get_tag_block_ids(
-                sched, tag.c_str(),
+                sched, tag,
                 ids.full_owned.empty()   ? &empty_out : ids.full_owned.data(),   &c_full_owned,
                 ids.full_shared.empty()  ? &empty_out : ids.full_shared.data(),  &c_full_shared,
                 ids.linear_owned.empty() ? &empty_out : ids.linear_owned.data(), &c_linear_owned);
@@ -1175,10 +1185,10 @@ static tag_block_ids fetch_tag_block_ids(llama_paged_scheduler * sched, const st
 }
 
 struct tag_block_collector {
-    std::map<std::string, tag_block_ids> tags;
+    std::map<uint64_t, tag_block_ids> tags;
 };
 
-void collect_tag_block(const char * tag, int32_t kind, uint32_t block_id, int32_t owned, void * user_data) {
+void collect_tag_block(uint64_t tag, int32_t kind, uint32_t block_id, int32_t owned, void * user_data) {
     auto * c = static_cast<tag_block_collector *>(user_data);
     tag_block_ids & ids = c->tags[tag];
     if (kind == 0) {
@@ -1189,22 +1199,22 @@ void collect_tag_block(const char * tag, int32_t kind, uint32_t block_id, int32_
 }
 
 struct tag_usage_collector {
-    std::map<std::string, llama_paged_tag_block_usage> tags;
+    std::map<uint64_t, llama_paged_tag_block_usage> tags;
 };
 
-void collect_tag_usage(const char * tag, const llama_paged_tag_block_usage * usage, void * user_data) {
+void collect_tag_usage(uint64_t tag, const llama_paged_tag_block_usage * usage, void * user_data) {
     auto * c = static_cast<tag_usage_collector *>(user_data);
     c->tags[tag] = *usage;
 }
 
 } // namespace
 
-bool server_scheduler_paged::get_tag_usage(const std::string & tag, bool include_blocks, json & out) {
+bool server_scheduler_paged::get_tag_usage(uint64_t tag, bool include_blocks, json & out) {
     if (sched == nullptr) {
         return false;
     }
 
-    if (!tag.empty()) {
+    if (tag != 0) {
         if (include_blocks) {
             // one materialization gives both the ids and their counts
             const tag_block_ids ids = fetch_tag_block_ids(sched, tag);
@@ -1215,7 +1225,7 @@ bool server_scheduler_paged::get_tag_usage(const std::string & tag, bool include
         }
 
         llama_paged_tag_block_usage usage = {};
-        if (!llama_paged_scheduler_get_tag_block_usage(sched, tag.c_str(), &usage)) {
+        if (!llama_paged_scheduler_get_tag_block_usage(sched, tag, &usage)) {
             return false;
         }
         out = tag_usage_to_json(usage);
@@ -1229,17 +1239,17 @@ bool server_scheduler_paged::get_tag_usage(const std::string & tag, bool include
     json tags = json::object();
     if (include_blocks) {
         tag_block_collector c;
-        llama_paged_scheduler_for_each_tag_block(sched, nullptr, collect_tag_block, &c);
-        for (const auto & [tag_name, ids] : c.tags) {
+        llama_paged_scheduler_for_each_tag_block(sched, 0, collect_tag_block, &c);
+        for (const auto & [tag_id, ids] : c.tags) {
             json entry = tag_usage_to_json(ids.usage());
             entry["blocks"] = ids.blocks_json();
-            tags[tag_name]  = entry;
+            tags[std::to_string(tag_id)] = entry;
         }
     } else {
         tag_usage_collector c;
         llama_paged_scheduler_for_each_tag_block_usage(sched, collect_tag_usage, &c);
-        for (const auto & [tag_name, usage] : c.tags) {
-            tags[tag_name] = tag_usage_to_json(usage);
+        for (const auto & [tag_id, usage] : c.tags) {
+            tags[std::to_string(tag_id)] = tag_usage_to_json(usage);
         }
     }
     out = json{{"tags", tags}};

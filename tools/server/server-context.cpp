@@ -4403,8 +4403,22 @@ void server_routes::init_routes() {
     this->get_tag_usage = [this](const server_http_req & req) {
         auto res = create_response();
 
-        const std::string tag    = req.get_param("tag");
-        const std::string blocks = req.get_param("blocks");
+        const std::string tag_param = req.get_param("tag");
+        const std::string blocks    = req.get_param("blocks");
+
+        uint64_t tag = 0;  // 0 = list every tag
+        if (!tag_param.empty()) {
+            if (tag_param[0] == '-') {
+                res->error(format_error_response("Invalid tag: expected a uint64", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            try {
+                tag = std::stoull(tag_param);
+            } catch (const std::exception &) {
+                res->error(format_error_response("Invalid tag: expected a uint64", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
 
         {
             server_task task(SERVER_TASK_TYPE_KV_STATS);
@@ -4412,8 +4426,8 @@ void server_routes::init_routes() {
             task.kv_tag            = tag;
             // a single-tag query carries the block ids by default; the full
             // listing only when ?blocks=1 is given
-            task.kv_include_blocks = tag.empty() ? (!blocks.empty() && blocks != "0")
-                                                 : (blocks.empty() || blocks != "0");
+            task.kv_include_blocks = tag == 0 ? (!blocks.empty() && blocks != "0")
+                                              : (blocks.empty() || blocks != "0");
             res->rd.post_task(std::move(task), true); // high-priority task
         }
 

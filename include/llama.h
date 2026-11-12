@@ -1831,8 +1831,9 @@ extern "C" {
     //
     // Tag -> KV block accounting (doc docs/kvcache-manager/tag-kv-block-usage.md)
     //
-    // Requests may carry an optional owner tag. The accounting covers only
-    // blocks that can be reused through the prefix cache:
+    // Requests may carry an optional owner tag, a uint64 identifier where 0
+    // means "no tag". The accounting covers only blocks that can be reused
+    // through the prefix cache:
     //   full-attention: live, GPU-resident prefix-index blocks;
     //   linear-attention: live GPU checkpoints.
     // Partial tail blocks, ACTIVE linear states, CPU-pool blocks and swapped
@@ -1869,18 +1870,18 @@ extern "C" {
         struct llama_paged_tag_pool_usage cpu;  /* reserved, all zero */
     };
 
-    // Attach an owner tag to a queued request. Must be called before the
-    // request is first scheduled: returns false if the request is unknown or
-    // already holds KV blocks / a cache reservation.
+    // Attach an owner tag (uint64, 0 = no tag) to a queued request. Must be
+    // called before the request is first scheduled: returns false if the
+    // request is unknown or already holds KV blocks / a cache reservation.
     LLAMA_API bool llama_paged_scheduler_set_request_tag(struct llama_paged_scheduler * sched,
-                                                         int32_t request_id, const char * tag);
+                                                         int32_t request_id, uint64_t tag);
 
     // Per-tag usage. Unknown tags are reported as all-zero and return true.
     LLAMA_API bool llama_paged_scheduler_get_tag_block_usage(struct llama_paged_scheduler * sched,
-                                                             const char * tag,
+                                                             uint64_t tag,
                                                              struct llama_paged_tag_block_usage * out);
 
-    typedef void (*llama_paged_tag_usage_cb)(const char * tag,
+    typedef void (*llama_paged_tag_usage_cb)(uint64_t tag,
                                              const struct llama_paged_tag_block_usage * usage,
                                              void * user_data);
     LLAMA_API void llama_paged_scheduler_for_each_tag_block_usage(struct llama_paged_scheduler * sched,
@@ -1888,11 +1889,11 @@ extern "C" {
                                                                   void * user_data);
 
     /* kind: 0 = full, 1 = linear; owned: 1 = 计入计数，0 = 仅共享引用
-     * tag 为 NULL 时遍历所有 tag */
-    typedef void (*llama_paged_tag_block_cb)(const char * tag, int32_t kind, uint32_t block_id,
+     * tag == 0 时遍历所有 tag */
+    typedef void (*llama_paged_tag_block_cb)(uint64_t tag, int32_t kind, uint32_t block_id,
                                              int32_t owned, void * user_data);
     LLAMA_API bool llama_paged_scheduler_for_each_tag_block(struct llama_paged_scheduler * sched,
-                                                            const char * tag,
+                                                            uint64_t tag,
                                                             llama_paged_tag_block_cb cb,
                                                             void * user_data);
 
@@ -1902,7 +1903,7 @@ extern "C" {
      * id 按升序；unknown tag 长度为 0 并返回 true。full/linear id 空间独立。 */
     LLAMA_API bool llama_paged_scheduler_get_tag_block_ids(
         struct llama_paged_scheduler * sched,
-        const char * tag,
+        uint64_t tag,
         uint32_t * full_owned_out,   size_t * n_full_owned,
         uint32_t * full_shared_out,  size_t * n_full_shared,
         uint32_t * linear_owned_out, size_t * n_linear_owned);
@@ -1938,17 +1939,17 @@ extern "C" {
     LLAMA_API uint32_t     llama_paged_free_block_id      (const llama_paged_free_block * block);
     LLAMA_API int32_t      llama_paged_free_block_has_hash(const llama_paged_free_block * block);
     LLAMA_API uint64_t     llama_paged_free_block_hash    (const llama_paged_free_block * block);
-    // Representative tag (lexicographically first of the block's set), kept
-    // for single-tag callers. Does not imply "first owner". NULL when untagged.
-    LLAMA_API const char * llama_paged_free_block_tag     (const llama_paged_free_block * block);
-    // Full tag set of the node: every tag that used the block while it stayed
-    // cache-resident, deduplicated. tag_at() enumerates them in lexicographic
-    // order; tag_count() is 0 for untagged nodes.
+    // Representative tag (lowest id of the block's set), kept for single-tag
+    // callers. Does not imply "first owner". 0 when untagged.
+    LLAMA_API uint64_t     llama_paged_free_block_tag     (const llama_paged_free_block * block);
+    // Full tag set of the node: every tag (uint64, 0 = none) that used the
+    // block while it stayed cache-resident, deduplicated. tag_at() enumerates
+    // them in ascending id order; tag_count() is 0 for untagged nodes.
     LLAMA_API uint32_t     llama_paged_free_block_tag_count(const llama_paged_free_block * block);
-    LLAMA_API const char * llama_paged_free_block_tag_at   (const llama_paged_free_block * block, uint32_t index);
-    // Exact tag membership (O(log k) string comparison). An unknown tag
-    // returns 0; the query never mutates any state.
-    LLAMA_API int32_t      llama_paged_free_block_has_tag   (const llama_paged_free_block * block, const char * tag);
+    LLAMA_API uint64_t     llama_paged_free_block_tag_at   (const llama_paged_free_block * block, uint32_t index);
+    // Exact tag membership (O(log k)). Tag 0 / unknown tags return 0; the
+    // query never mutates any state.
+    LLAMA_API int32_t      llama_paged_free_block_has_tag   (const llama_paged_free_block * block, uint64_t tag);
 
     // Which GPU pool is asking. Full-attention and linear-state pools have
     // independent block-id spaces, so the kind MUST be passed to the callback.

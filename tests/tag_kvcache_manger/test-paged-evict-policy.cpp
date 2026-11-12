@@ -35,6 +35,25 @@
 
 static int g_failures = 0;
 
+// Numeric tag identifiers used by the tests (0 = "no tag"). The numeric
+// ordering is chosen so the representative-tag assertions stay meaningful.
+static constexpr uint64_t TAG_MULTI_EARLY   = 0x1000;
+static constexpr uint64_t TAG_MULTI_WRITTEN = 0x1001;
+static constexpr uint64_t TAG_MULTI_ABSENT  = 0x1002;
+static constexpr uint64_t TAG_OWNER         = 0x2000;
+static constexpr uint64_t TAG_GONE          = 0x2001;
+static constexpr uint64_t TAG_PLAIN         = 0x2002;
+static constexpr uint64_t TAG_C_EARLY       = 0x3000;
+static constexpr uint64_t TAG_C_LATE        = 0x3001;
+static constexpr uint64_t TAG_C_UNKNOWN     = 0x3002;
+static constexpr uint64_t TAG_KEEP          = 0x4000;
+static constexpr uint64_t TAG_SEED          = 0x4001;
+static constexpr uint64_t TAG_HEAD          = 0x4002;
+static constexpr uint64_t TAG_REUSE_A       = 0x5000;
+static constexpr uint64_t TAG_REUSE_B       = 0x5001;
+static constexpr uint64_t TAG_REUSE_C       = 0x5002;
+static constexpr uint64_t TAG_SWAP_A        = 0x5003;
+
 #define CHECK(cond)                                                          \
     do {                                                                     \
         if (!(cond)) {                                                       \
@@ -130,16 +149,17 @@ static uint32_t pick_fixed_cb(void * ud, llama_paged_pool_kind pool, uint32_t n_
     return n;
 }
 
-// Skips cache-resident nodes tagged `ud` (e.g. "keep") and returns the first
-// n_needed of the rest, walking the real free list through the C accessors.
-// Selected hashes are recorded to exercise llama_paged_free_block_hash().
+// Skips cache-resident nodes tagged with the uint64 stored at `ud` and returns
+// the first n_needed of the rest, walking the real free list through the C
+// accessors. Selected hashes are recorded to exercise
+// llama_paged_free_block_hash().
 static std::vector<uint64_t> g_picked_hashes;
 
 static uint32_t pick_skip_tag_cb(void * ud, llama_paged_pool_kind pool, uint32_t n_needed,
                                  const llama_paged_free_block * head, uint32_t * out_ids,
                                  uint32_t out_capacity) {
     (void) pool;
-    const char * skip = (const char *) ud;
+    const uint64_t skip = ud != nullptr ? *static_cast<const uint64_t *>(ud) : 0;
 
     uint32_t n = 0;
     for (const llama_paged_free_block * it = head;
@@ -149,7 +169,7 @@ static uint32_t pick_skip_tag_cb(void * ud, llama_paged_pool_kind pool, uint32_t
         }
         // Membership lookup (the legacy tag() accessor returns only one
         // representative tag, so it must not be used for "skip tag X").
-        if (skip != nullptr && llama_paged_free_block_has_tag(it, skip)) {
+        if (skip != 0 && llama_paged_free_block_has_tag(it, skip)) {
             continue;
         }
         out_ids[n++] = llama_paged_free_block_id(it);
@@ -187,29 +207,29 @@ static void test_multi_tag_set() {
     bm.init(4, 0, 0.0f);
     bm.set_block_hash(0, 0xB000);
 
-    // Write the lexicographically LATER tag first, so the representative tag
+    // Write the higher tag id first, so the representative tag (lowest id)
     // differs from the tag written first to the block.
-    bm.set_tag(0, "multi-tag-written-first");
-    bm.add_tag(0, "multi-tag-interning-early");
+    bm.set_tag(0, TAG_MULTI_WRITTEN);
+    bm.add_tag(0, TAG_MULTI_EARLY);
 
     CHECK_EQ(bm.tag_count(0), 2u);
-    CHECK(bm.has_tag(0, "multi-tag-interning-early"));
-    CHECK(bm.has_tag(0, "multi-tag-written-first"));
-    CHECK(!bm.has_tag(0, "multi-tag-absent"));
-    // Representative = lexicographically first, NOT the tag written first.
-    CHECK(bm.tag(0) == "multi-tag-interning-early");
+    CHECK(bm.has_tag(0, TAG_MULTI_EARLY));
+    CHECK(bm.has_tag(0, TAG_MULTI_WRITTEN));
+    CHECK(!bm.has_tag(0, TAG_MULTI_ABSENT));
+    // Representative = lowest id, NOT the tag written first.
+    CHECK_EQ(bm.tag(0), TAG_MULTI_EARLY);
 
-    // tag_at() enumerates in lexicographic order.
-    CHECK(std::strcmp(bm.tag_at(0, 0), "multi-tag-interning-early") == 0);
-    CHECK(std::strcmp(bm.tag_at(0, 1), "multi-tag-written-first") == 0);
-    CHECK(bm.tag_at(0, 2) == nullptr);
+    // tag_at() enumerates in ascending id order.
+    CHECK_EQ(bm.tag_at(0, 0), TAG_MULTI_EARLY);
+    CHECK_EQ(bm.tag_at(0, 1), TAG_MULTI_WRITTEN);
+    CHECK_EQ(bm.tag_at(0, 2), 0u);
 }
 
 static void test_tags_survive_cache_resident_release() {
     llama_block_manager bm;
     bm.init(4, 0, 0.0f);
     bm.set_block_hash(0, 0xB100);
-    bm.set_tag(0, "owner");
+    bm.set_tag(0, TAG_OWNER);
 
     CHECK(bm.touch_block(0));
     bm.release_gpu_blocks({ 0 });          // ref -> 0, hash kept
@@ -217,28 +237,28 @@ static void test_tags_survive_cache_resident_release() {
     CHECK(bm.block_has_hash(0));
     CHECK_EQ(bm.block_ref_count(0), 0u);
     CHECK_EQ(bm.tag_count(0), 1u);
-    CHECK(bm.has_tag(0, "owner"));
+    CHECK(bm.has_tag(0, TAG_OWNER));
 }
 
 static void test_tags_cleared_on_eviction() {
     llama_block_manager bm;
     bm.init(4, 0, 0.0f);
     bm.set_block_hash(0, 0xB200);
-    bm.set_tag(0, "gone");
+    bm.set_tag(0, TAG_GONE);
 
     const auto ids = bm.checkout_gpu_blocks(1);   // legacy path evicts block 0
     CHECK_EQ(ids.size(), 1u);
     CHECK_EQ(ids[0], 0u);
     CHECK(!bm.block_has_hash(0));
     CHECK_EQ(bm.tag_count(0), 0u);
-    CHECK(bm.tag(0).empty());
+    CHECK_EQ(bm.tag(0), 0u);
 }
 
 static void test_tags_cleared_on_clear_hash() {
     llama_block_manager bm;
     bm.init(4, 0, 0.0f);
     bm.set_block_hash(0, 0xB300);
-    bm.set_tag(0, "gone");
+    bm.set_tag(0, TAG_GONE);
 
     bm.clear_block_hash(0);
     CHECK_EQ(bm.tag_count(0), 0u);
@@ -257,13 +277,13 @@ static void test_tags_cleared_on_release_to_plain() {
         return;
     }
     const uint32_t id = ids[0];
-    bm.set_tag(id, "plain-release-tag");
+    bm.set_tag(id, TAG_PLAIN);
     CHECK_EQ(bm.tag_count(id), 1u);
 
     bm.release_gpu_blocks({ id });                // ref -> 0, !has_hash
     CHECK_EQ(bm.block_ref_count(id), 0u);
     CHECK_EQ(bm.tag_count(id), 0u);
-    CHECK(bm.tag(id).empty());
+    CHECK_EQ(bm.tag(id), 0u);
 
     // A later checkout starts with an empty tag set (the freed block went back
     // to the queue tail, so drain both blocks and check all of them).
@@ -275,19 +295,19 @@ static void test_tags_cleared_on_release_to_plain() {
 }
 
 // Exercise every public C accessor from inside a picker callback, where node
-// pointers are valid. Also checks the NULL sentinel for untagged nodes and
-// that has_tag() is a pure read-only query.
+// pointers are valid. Also checks the 0 sentinel for untagged nodes and that
+// has_tag() is a pure read-only query.
 struct accessor_probe {
     int         nodes     = 0;
     uint32_t    tagged_id = 0;
     uint32_t    untagged_id = 0;
     uint32_t    tagged_count = 0;
-    std::string at0;
-    std::string at1;
-    std::string rep;
-    int         has_early_str = -1;
+    uint64_t    at0 = 0;
+    uint64_t    at1 = 0;
+    uint64_t    rep = 0;
+    int         has_early = -1;
     int         has_unknown   = -1;
-    int         untagged_tag_is_null = -1;
+    int         untagged_tag_is_zero = -1;
 
     // Victim: the untagged node, i.e. the documented fallback victim.
     uint32_t    victim_id = 0;
@@ -305,20 +325,17 @@ static uint32_t pick_inspect_accessors_cb(void * ud, llama_paged_pool_kind pool,
         if (n_tags != 0) {
             p->tagged_id    = id;
             p->tagged_count = n_tags;
-            const char * a  = llama_paged_free_block_tag_at(it, 0);
-            const char * b  = llama_paged_free_block_tag_at(it, 1);
-            const char * r  = llama_paged_free_block_tag(it);
-            p->at0 = a != nullptr ? a : "";
-            p->at1 = b != nullptr ? b : "";
-            p->rep = r != nullptr ? r : "<null>";
-            p->has_early_str = llama_paged_free_block_has_tag(it, "c-accessor-early");
-            p->has_unknown   = llama_paged_free_block_has_tag(it, "c-accessor-never-written");
+            p->at0 = llama_paged_free_block_tag_at(it, 0);
+            p->at1 = llama_paged_free_block_tag_at(it, 1);
+            p->rep = llama_paged_free_block_tag(it);
+            p->has_early = llama_paged_free_block_has_tag(it, TAG_C_EARLY);
+            p->has_unknown   = llama_paged_free_block_has_tag(it, TAG_C_UNKNOWN);
             if (p->victim_id == 0) {
                 p->victim_id = id;   // fall back to a tagged block if needed
             }
         } else {
             p->untagged_id           = id;
-            p->untagged_tag_is_null  = llama_paged_free_block_tag(it) == nullptr ? 1 : 0;
+            p->untagged_tag_is_zero  = llama_paged_free_block_tag(it) == 0 ? 1 : 0;
             p->victim_id             = id;   // prefer the untagged fallback victim
         }
     }
@@ -335,23 +352,23 @@ static void test_c_free_block_accessors() {
     bm.set_block_hash(0, 0xF000);
     bm.set_block_hash(1, 0xF001);
 
-    // Both tags are written to block 0; tag() reports the lexicographically
-    // first one, not necessarily the tag written first.
+    // Both tags are written to block 0; tag() reports the lowest id, not
+    // necessarily the tag written first.
     accessor_probe probe;
-    bm.set_tag(0, "c-accessor-late");
-    bm.add_tag(0, "c-accessor-early");
+    bm.set_tag(0, TAG_C_LATE);
+    bm.add_tag(0, TAG_C_EARLY);
 
     bm.set_evict_pick_cb(pick_inspect_accessors_cb, &probe);
     const auto ids = bm.checkout_gpu_blocks(1);   // sacrifices the untagged node 1
 
     CHECK_EQ(probe.nodes, 2);
     CHECK_EQ(probe.tagged_count, 2u);
-    CHECK(probe.at0 == "c-accessor-early");
-    CHECK(probe.at1 == "c-accessor-late");
-    CHECK(probe.rep == "c-accessor-early");       // representative
-    CHECK_EQ(probe.has_early_str, 1);
+    CHECK_EQ(probe.at0, TAG_C_EARLY);
+    CHECK_EQ(probe.at1, TAG_C_LATE);
+    CHECK_EQ(probe.rep, TAG_C_EARLY);             // representative
+    CHECK_EQ(probe.has_early, 1);
     CHECK_EQ(probe.has_unknown, 0);
-    CHECK_EQ(probe.untagged_tag_is_null, 1);      // NULL sentinel, not ""
+    CHECK_EQ(probe.untagged_tag_is_zero, 1);      // 0 = untagged
     CHECK_EQ(ids.size(), 1u);
     if (!ids.empty()) {
         CHECK_EQ(ids[0], probe.untagged_id);
@@ -419,10 +436,10 @@ static uint32_t pick_overflow_cb(void * ud, llama_paged_pool_kind pool, uint32_t
 // Turns every GPU free block into a cache-resident one (free queue order is
 // preserved, so node ids appear at the queue head in ascending order).
 static void hash_all_free(llama_block_manager & bm, uint32_t n_gpu, uint64_t base,
-                          const char * tag) {
+                          uint64_t tag) {
     for (uint32_t id = 0; id < n_gpu; ++id) {
         bm.set_block_hash(id, base + id);
-        if (tag != nullptr) {
+        if (tag != 0) {
             bm.set_tag(id, tag);
         }
     }
@@ -456,7 +473,7 @@ static void test_legacy_path() {
 static void test_callback_returns_zero() {
     llama_block_manager bm;
     bm.init(8, 0, 0.0f);
-    hash_all_free(bm, 8, 0x1000, "seed");
+    hash_all_free(bm, 8, 0x1000, TAG_SEED);
 
     CHECK_EQ(bm.n_plain_free_gpu_blocks(), 0u);
     CHECK_EQ(bm.n_free_gpu_blocks(), 0u);
@@ -490,7 +507,7 @@ static void test_callback_returns_zero() {
 static void test_selective_victims() {
     llama_block_manager bm;
     bm.init(8, 0, 0.0f);
-    hash_all_free(bm, 8, 0x2000, "seed");
+    hash_all_free(bm, 8, 0x2000, TAG_SEED);
 
     reset_cb({ 2, 5 });
     bm.set_evict_pick_cb(pick_fixed_cb, nullptr);
@@ -512,14 +529,14 @@ static void test_selective_victims() {
     CHECK(!bm.block_has_hash(5));
     CHECK_EQ(bm.block_ref_count(2), 1u);
     CHECK_EQ(bm.block_ref_count(5), 1u);
-    CHECK(bm.tag(2).empty());
+    CHECK_EQ(bm.tag(2), 0u);
 
     // Unselected cache-resident blocks keep hash + tag and stay free.
     for (const uint32_t id : { 0u, 1u, 3u, 4u, 6u, 7u }) {
         CHECK(bm.block_has_hash(id));
         CHECK_EQ(bm.block_ref_count(id), 0u);
     }
-    CHECK(bm.tag(0) == "seed");
+    CHECK_EQ(bm.tag(0), TAG_SEED);
 
     CHECK_EQ(bm.n_cached_gpu_blocks(), 6u);
     CHECK_EQ(bm.n_free_gpu_blocks(), 0u);
@@ -530,12 +547,13 @@ static void test_selective_victims() {
 static void test_tag_based_picker() {
     llama_block_manager bm;
     bm.init(8, 0, 0.0f);
-    hash_all_free(bm, 8, 0xA000, "seed");
-    bm.set_tag(0, "keep");
-    bm.set_tag(1, "keep");
+    hash_all_free(bm, 8, 0xA000, TAG_SEED);
+    bm.set_tag(0, TAG_KEEP);
+    bm.set_tag(1, TAG_KEEP);
 
     g_picked_hashes.clear();
-    bm.set_evict_pick_cb(pick_skip_tag_cb, (void *) "keep");
+    uint64_t skip_tag = TAG_KEEP;
+    bm.set_evict_pick_cb(pick_skip_tag_cb, &skip_tag);
 
     const auto ids = bm.checkout_gpu_blocks(2);
 
@@ -547,9 +565,9 @@ static void test_tag_based_picker() {
     }
     CHECK(bm.block_has_hash(0));
     CHECK(bm.block_has_hash(1));
-    CHECK(bm.has_tag(0, "keep"));
-    CHECK(bm.has_tag(1, "keep"));
-    // Blocks 0/1 also carry the "seed" tag: the set holds both tags.
+    CHECK(bm.has_tag(0, TAG_KEEP));
+    CHECK(bm.has_tag(1, TAG_KEEP));
+    // Blocks 0/1 also carry the seed tag: the set holds both tags.
     CHECK(bm.tag_count(0) >= 2u);
     CHECK(bm.tag_count(1) >= 2u);
 }
@@ -561,7 +579,7 @@ static void test_tag_based_picker() {
 static void test_over_sacrifice() {
     llama_block_manager bm;
     bm.init(8, 0, 0.0f);
-    hash_all_free(bm, 8, 0x3000, "seed");
+    hash_all_free(bm, 8, 0x3000, TAG_SEED);
 
     // Requesting 1 block needs 1 sacrifice, but the picker hands back 3.
     reset_cb({ 7, 6, 5 });
@@ -600,7 +618,7 @@ static void test_over_sacrifice() {
 static void test_duplicate_ids() {
     llama_block_manager bm;
     bm.init(8, 0, 0.0f);
-    hash_all_free(bm, 8, 0x4000, "seed");
+    hash_all_free(bm, 8, 0x4000, TAG_SEED);
 
     reset_cb({ 3, 3 });
     bm.set_evict_pick_cb(pick_fixed_cb, nullptr);
@@ -632,7 +650,7 @@ static void test_duplicate_ids() {
 static void test_pool_kind() {
     llama_block_manager bm;
     bm.init(8, 0, 0.0f);
-    hash_all_free(bm, 8, 0x5000, "seed");
+    hash_all_free(bm, 8, 0x5000, TAG_SEED);
 
     reset_cb({ 0, 1 });
     bm.set_pool_kind(LLAMA_PAGED_POOL_LINEAR);
@@ -662,9 +680,9 @@ static void test_plain_only_fill() {
     // Cache-resident blocks sit at the queue head. A legacy FIFO pop would
     // evict them; the picker-based path must skip them instead.
     bm.set_block_hash(0, 0x7000);
-    bm.set_tag(0, "head");
+    bm.set_tag(0, TAG_HEAD);
     bm.set_block_hash(1, 0x7001);
-    bm.set_tag(1, "head");
+    bm.set_tag(1, TAG_HEAD);
 
     reset_cb({ 0, 1 });  // would evict the head blocks if ever consulted
     bm.set_evict_pick_cb(pick_fixed_cb, nullptr);
@@ -678,7 +696,7 @@ static void test_plain_only_fill() {
     CHECK(bm.block_has_hash(1));
     CHECK_EQ(bm.block_ref_count(0), 0u);
     CHECK_EQ(bm.block_ref_count(1), 0u);
-    CHECK(bm.tag(0) == "head");
+    CHECK_EQ(bm.tag(0), TAG_HEAD);
 
     CHECK_EQ(bm.n_cached_gpu_blocks(), 2u);
     CHECK_EQ(bm.n_free_gpu_blocks(), 2u);        // blocks 6 and 7
@@ -749,8 +767,8 @@ static void test_legacy_null_reset_equivalence() {
     llama_block_manager reset;
     never.init(8, 0, 0.0f);
     reset.init(8, 0, 0.0f);
-    hash_all_free(never, 8, 0xB000, "seed");
-    hash_all_free(reset, 8, 0xB000, "seed");
+    hash_all_free(never, 8, 0xB000, TAG_SEED);
+    hash_all_free(reset, 8, 0xB000, TAG_SEED);
 
     // Install, then uninstall through the documented NULL setter.
     reset_cb({});
@@ -782,11 +800,11 @@ static void test_cpu_checkout_ignores_policy() {
     // Cache-resident blocks on both pools. CPU ids start after the GPU pool.
     for (uint32_t id = 0; id < 4; ++id) {
         bm.set_block_hash(id, 0xC000 + id);
-        bm.set_tag(id, "seed");
+        bm.set_tag(id, TAG_SEED);
     }
     for (uint32_t id = 4; id < 8; ++id) {
         bm.set_block_hash(id, 0xC100 + id);
-        bm.set_tag(id, "seed");
+        bm.set_tag(id, TAG_SEED);
     }
 
     reset_cb({ 0, 1 });
@@ -806,7 +824,7 @@ static void test_cpu_checkout_ignores_policy() {
 static void test_cpu_id_rejected() {
     llama_block_manager bm;
     bm.init(4, 4, 0.0f);
-    hash_all_free(bm, 4, 0xD000, "seed");
+    hash_all_free(bm, 4, 0xD000, TAG_SEED);
     // CPU id 4 is a free, cache-resident CPU block: the dangerous case for
     // block_at() because the id exists but belongs to the other pool.
     bm.set_block_hash(4, 0xD004);
@@ -835,7 +853,7 @@ static void test_cpu_id_rejected() {
 static void test_callback_over_capacity_fails_atomically() {
     llama_block_manager bm;
     bm.init(4, 0, 0.0f);
-    hash_all_free(bm, 4, 0xE000, "seed");
+    hash_all_free(bm, 4, 0xE000, TAG_SEED);
 
     reset_cb({});
     bm.set_evict_pick_cb(pick_overflow_cb, nullptr);
@@ -1010,7 +1028,7 @@ static void test_prefix_reuse_unions_tags() {
     auto fixture = make_fixture(/*n_gpu_blocks=*/4, /*n_cpu_blocks=*/1);
 
     llama_sequence_group group = make_sched_group(/*request_id=*/0, /*n_prompt=*/16);
-    group.tag = "reuse-A";
+    group.tag = TAG_REUSE_A;
     CHECK(fixture.kv->allocate(/*num_tokens=*/0, group));
     CHECK_EQ(group.block_table.size(), 1u);
     if (group.block_table.empty()) {
@@ -1021,30 +1039,30 @@ static void test_prefix_reuse_unions_tags() {
     fixture.kv->register_prefix_block(hash, id, /*owner_seq=*/0, /*block_idx=*/0,
                                       /*first_tok=*/1, /*last_tok=*/2);
     fixture.kv->free_blocks(group);              // ref -> 0, still cache-resident
-    CHECK(fixture.kv->block_tag(id) == "reuse-A");
+    CHECK_EQ(fixture.kv->block_tag(id), TAG_REUSE_A);
 
     // Prefix hit: acquire_blocks() must union the hitting tag in its second
     // pass. With the old single-owner model the tag set would stay {A}.
-    CHECK(fixture.kv->acquire_blocks({ id }, "reuse-B"));
+    CHECK(fixture.kv->acquire_blocks({ id }, TAG_REUSE_B));
 
-    std::unordered_map<std::string, std::unordered_set<uint32_t>> owned;
+    std::unordered_map<uint64_t, std::unordered_set<uint32_t>> owned;
     fixture.kv->collect_tag_blocks(owned, nullptr);
-    CHECK(owned["reuse-A"].count(id) == 1u);
-    CHECK(owned["reuse-B"].count(id) == 1u);
+    CHECK(owned[TAG_REUSE_A].count(id) == 1u);
+    CHECK(owned[TAG_REUSE_B].count(id) == 1u);
 
     // Shared reference path (add_ref_blocks via share_blocks) unions too.
-    CHECK(fixture.kv->add_ref_blocks({ id }, "reuse-C"));
+    CHECK(fixture.kv->add_ref_blocks({ id }, TAG_REUSE_C));
     owned.clear();
     fixture.kv->collect_tag_blocks(owned, nullptr);
-    CHECK(owned["reuse-C"].count(id) == 1u);
+    CHECK(owned[TAG_REUSE_C].count(id) == 1u);
 
-    // The representative tag is the lexicographically first one ("reuse-A").
-    CHECK(fixture.kv->block_tag(id) == "reuse-A");
+    // The representative tag is the lowest id (reuse-A).
+    CHECK_EQ(fixture.kv->block_tag(id), TAG_REUSE_A);
 
     // swap_in also re-tags the restored private GPU block (swap_out clears the
     // tag of the unhashed GPU copy, swap_in writes it back).
     llama_sequence_group swap_group = make_sched_group(/*request_id=*/1, /*n_prompt=*/16);
-    swap_group.tag = "swap-A";
+    swap_group.tag = TAG_SWAP_A;
     CHECK(fixture.kv->allocate(/*num_tokens=*/0, swap_group));
     CHECK_EQ(swap_group.block_table.size(), 1u);
     if (!swap_group.block_table.empty()) {
@@ -1052,7 +1070,7 @@ static void test_prefix_reuse_unions_tags() {
         CHECK(fixture.kv->swap_in(swap_group));
         CHECK_EQ(swap_group.block_table.size(), 1u);
         if (!swap_group.block_table.empty()) {
-            CHECK(fixture.kv->block_tag(swap_group.block_table.front()) == "swap-A");
+            CHECK_EQ(fixture.kv->block_tag(swap_group.block_table.front()), TAG_SWAP_A);
         }
     }
 }

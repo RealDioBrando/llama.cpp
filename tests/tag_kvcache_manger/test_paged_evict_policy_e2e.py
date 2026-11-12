@@ -4,13 +4,13 @@
 # The server installs its built-in protected-tag policy through the
 # test/grayscale hook:
 #
-#   LLAMA_SERVER_PAGED_EVICT_PROTECT_TAGS=keep llama-server --kv-paged ...
+#   LLAMA_SERVER_PAGED_EVICT_PROTECT_TAGS=1 llama-server --kv-paged ...
 #
-# The scenario keeps a long prompt under tag `keep`, floods the (deliberately
+# The scenario keeps a long prompt under tag 1, floods the (deliberately
 # tiny) paged pool with differently tagged requests, then checks that:
 #   * the `keep` prefix is still cached and reused on a new request
 #     (timings.cache_n >= 64, i.e. reuse across a checkpoint boundary),
-#   * /tag_usage?tag=keep still reports cache-resident full blocks,
+#   * /tag_usage?tag=1 still reports cache-resident full blocks,
 #   * the pressure really did evict something: at least one pressure tag lost
 #     all of its blocks (or, if the picker happened to spare every tag, the
 #     owner totals demonstrably dropped).
@@ -31,9 +31,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from test_tag_kv_server_e2e import LONG_PROMPT, MODEL, ServerProc  # noqa: E402
 
-PROTECTED_TAG = "keep"
+PROTECTED_TAG = 1
 N_PRESSURE = 8
-PRESSURE_TAGS = [f"p{i}" for i in range(N_PRESSURE)]
+PRESSURE_TAGS = [100 + i for i in range(N_PRESSURE)]
 
 pytestmark = pytest.mark.skipif(
     not os.path.exists(MODEL),
@@ -54,7 +54,7 @@ def evict_server():
         ctx_len=256,
         n_batch=256,
         n_parallel=2,
-        env_extra={"LLAMA_SERVER_PAGED_EVICT_PROTECT_TAGS": PROTECTED_TAG},
+        env_extra={"LLAMA_SERVER_PAGED_EVICT_PROTECT_TAGS": str(PROTECTED_TAG)},
     )
     srv.start()
     try:

@@ -39,15 +39,15 @@ struct llama_paged_free_block {
     bool     has_hash  = false;
     uint64_t hash      = 0;
 
-    // Every tag that has used this block while it stayed cache-resident
-    // (historical union, not just the current owner). Only GPU blocks are
-    // tagged: the CPU pool does not participate in eviction and is being
-    // refactored. Tags are stored as plain strings in a std::set, so
-    // membership is O(log k) and enumeration is lexicographic. No "first
-    // owner" is tracked. The set survives free() while the block keeps its
-    // hash and is cleared when the hash is dropped or a non-cached block is
-    // freed.
-    std::set<std::string> tags;
+    // Every tag (uint64 identifier, 0 = no tag) that has used this block while
+    // it stayed cache-resident (historical union, not just the current owner).
+    // Only GPU blocks are tagged: the CPU pool does not participate in
+    // eviction and is being refactored. Tags are stored as plain uint64_t in a
+    // std::set, so membership is O(log k) and enumeration is ascending by id.
+    // No "first owner" is tracked. The set survives free() while the block
+    // keeps its hash and is cleared when the hash is dropped or a non-cached
+    // block is freed.
+    std::set<uint64_t> tags;
 
 
     // Intrusive free-queue links (raw node pointers, nullptr = none).
@@ -192,29 +192,27 @@ class llama_block_manager {
     void     set_block_hash(uint32_t id, uint64_t hash);
     void     clear_block_hash(uint32_t id);
 
-    // Add a tag to the block's tag set (deduplicated). There is no
-    // primary/first-owner tag: tag() below returns the lexicographically first
-    // one only as a representative for legacy single-tag callers.
+    // Add a tag (uint64, 0 = none) to the block's tag set (deduplicated).
+    // There is no primary/first-owner tag: tag() below returns the lowest id
+    // only as a representative for legacy single-tag callers.
     // Writing a tag on a free non-cached block is a caller bug and only
-    // produces a warning; an empty tag is ignored.
-    void set_tag(uint32_t id, const std::string & tag);
-    void add_tag(uint32_t id, const std::string & tag);
+    // produces a warning; tag 0 is ignored.
+    void set_tag(uint32_t id, uint64_t tag);
+    void add_tag(uint32_t id, uint64_t tag);
 
-    // Set membership over the block's tag strings.
-    bool has_tag(uint32_t id, const std::string & tag) const;
+    // Set membership over the block's tag ids.
+    bool has_tag(uint32_t id, uint64_t tag) const;
 
     // Number of tags currently recorded on the block (0 for free/unknown ids).
     uint32_t tag_count(uint32_t id) const;
 
-    // Name of the index-th tag in lexicographic order, nullptr when out of
-    // range.
-    const char * tag_at(uint32_t id, uint32_t index) const;
+    // The index-th tag in ascending id order, 0 when out of range.
+    uint64_t tag_at(uint32_t id, uint32_t index) const;
 
-    // Representative tag name (lexicographically first of the set, not
-    // necessarily the tag written first to this block), for legacy single-tag
-    // callers. Empty string for free/unknown blocks and for blocks with no
-    // tags.
-    const std::string & tag(uint32_t id) const;
+    // Representative tag id (lowest of the set, not necessarily the tag
+    // written first to this block), for legacy single-tag callers. 0 for
+    // free/unknown blocks and for blocks with no tags.
+    uint64_t tag(uint32_t id) const;
 
     void release_gpu_blocks(const physical_block_ids & freed_blocks);
     void release_cpu_blocks(const physical_block_ids & freed_blocks);
