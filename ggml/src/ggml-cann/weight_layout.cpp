@@ -7,6 +7,7 @@
 #include <aclnnop/aclnn_trans_matmul_weight.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -61,10 +62,24 @@ bool is_dense_weight_name(const ggml_tensor * tensor) {
     return has_suffix(ggml_get_name(tensor), suffixes);
 }
 
+bool is_down_expert_weight_name(const ggml_tensor * tensor) {
+    const char * name = ggml_get_name(tensor);
+    return name != nullptr && strstr(name, "ffn_down_exps.weight") != nullptr;
+}
+
+// The down expert stack only takes the NZ layout when the fused MoE path that
+// reads NZ grouped weights is enabled: the IndexSelect fallback only reads ND.
+bool moe_fused_down_path_enabled() {
+    static const bool enabled =
+        parse_bool(get_env_as_lowercase("GGML_CANN_MOE_ROUTER_FUSION").value_or("on")) &&
+        parse_bool(get_env_as_lowercase("GGML_CANN_MOE_FULL_FUSION").value_or("on"));
+    return enabled;
+}
+
 bool is_expert_weight_name(const ggml_tensor * tensor) {
     static const std::unordered_set<std::string> suffixes = {
-        "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
-        "ffn_gate_up_exps.weight",
+        "ffn_gate_exps.weight", "ffn_up_exps.weight",
+        "ffn_gate_up_exps.weight", "ffn_down_exps.weight",
     };
     return has_suffix(ggml_get_name(tensor), suffixes);
 }
@@ -85,6 +100,9 @@ void transform_2d_weight(void * data, aclDataType type, size_t type_size, int64_
     workspaces[device % GGML_CANN_LAYOUT_MAX_DEVICES].realloc(workspace_size);
     ACL_CHECK(aclnnTransMatmulWeight(workspaces[device % GGML_CANN_LAYOUT_MAX_DEVICES].ptr,
                                      workspace_size, executor, nullptr));
+    // the transform runs on the default stream while compute uses a backend
+    // stream, so the weight must not be read before the transform completes
+    ACL_CHECK(aclrtSynchronizeStream(nullptr));
 }
 
 size_t calculate_2d_nz_size(const ggml_tensor * tensor) {
@@ -111,11 +129,18 @@ bool ggml_cann_is_weight_layout_candidate(const ggml_tensor * tensor) {
         return false;
     }
 
+    // aclnnTransMatmulWeight only accepts FP16/INT8 weights (e.g. the F32
+    // MoE router ffn_gate_inp must stay row-major)
+    if (tensor->type != GGML_TYPE_F16 && tensor->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+
     // Expert NZ is consumed by the grouped-matmul paths in moe_ops and
     // moe_fused_ops.
     if (tensor->ne[2] > 1 || tensor->ne[3] > 1) {
         return tensor->ne[3] == 1 && tensor->type == GGML_TYPE_F16 && is_expert_weight_name(tensor) &&
-               can_transform_slice(tensor);
+               can_transform_slice(tensor) &&
+               (!is_down_expert_weight_name(tensor) || moe_fused_down_path_enabled());
     }
 
     return tensor->type == GGML_TYPE_F16 && is_dense_weight_name(tensor) && can_transform_slice(tensor);

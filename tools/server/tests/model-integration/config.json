@@ -1,0 +1,229 @@
+{
+  "version": 1,
+  "runtime": {
+    "npu_id": 5,
+    "vllm_npu_id": 5,
+    "vllm_container": "",
+    "build": {
+      "source": "",
+      "build_dir": "",
+      "jobs": 8,
+      "options": {
+        "GGML_CANN": "ON",
+        "CANN_SOC_VERSION": "310P3",
+        "CMAKE_BUILD_TYPE": "Release",
+        "USE_ACL_GRAPH": "ON",
+        "LLAMA_CURL": "OFF"
+      }
+    },
+    "cann": {
+      "ascend_home": "/usr/local/Ascend",
+      "set_env": "/usr/local/Ascend/cann-9.1.0/set_env.sh",
+      "atb_set_env": "/usr/local/Ascend/nnal/atb/set_env.sh"
+    },
+    "ais_bench": {
+      "python": "/home/common/aisbench-venv/bin/python",
+      "module": "ais_bench.benchmark.cli.main",
+      "site_packages": "/home/common/aisbench-venv/lib/python3.10/site-packages",
+      "source": "/home/common/AISBench-benchmark",
+      "stubs": ""
+    }
+  },
+  "models": {
+    "qwen3_1_7b": {
+      "name": "Qwen3 1.7B",
+      "tokenizer": "/home/common/model/qwen3/Qwen3-8B",
+      "llama": "/home/common/model/qwen3/Qwen3-1.7B-F16.gguf",
+      "vllm": "/home/common/model/qwen3/Qwen3-8B"
+    },
+    "qwen3_vl_4b": {
+      "name": "Qwen3 VL 4B",
+      "tokenizer": "/home/common/model/qwen3/Qwen3-VL-4B-Instruct",
+      "llama": "/home/common/model/qwen3/Qwen3-VL-4B-Instruct/Qwen3VL-4B-Instruct-F16.gguf",
+      "mmproj": "/home/common/model/qwen3/Qwen3-VL-4B-Instruct/Qwen3VL-4B-Instruct-mmproj-f16.gguf",
+      "vllm": "/home/common/model/qwen3/Qwen3-VL-4B-Instruct"
+    }
+  },
+  "datasets": {
+    "gsm8k_4k_2k_10": {
+      "type": "gsm8k_fixed_token",
+      "path": "aisbench://datasets/gsm8k",
+      "tokenizer_model": "qwen3_1_7b",
+      "subset_size": 10,
+      "input_tokens": 4096
+    },
+    "gsm8k_accuracy_30": {
+      "type": "gsm8k_accuracy",
+      "path": "aisbench://datasets/gsm8k",
+      "subset_size": 30
+    },
+    "gsm8k_accuracy_full": {
+      "type": "gsm8k_accuracy",
+      "path": "aisbench://datasets/gsm8k",
+      "subset_size": 0
+    },
+    "textvqa_accuracy_30": {
+      "type": "textvqa_accuracy",
+      "path": "assets/textvqa/textvqa_json/textvqa_val_30.jsonl",
+      "image_type": "image_base64"
+    },
+    "textvqa_accuracy_full": {
+      "type": "textvqa_accuracy",
+      "path": "assets/textvqa/textvqa_json/textvqa_val_full.jsonl",
+      "image_type": "image_base64"
+    },
+    "vl_image_small": {
+      "type": "local_image_perf",
+      "path": "assets/image_320x320_questions.jsonl"
+    },
+    "vl_image_large": {
+      "type": "local_image_perf",
+      "path": "assets/image_1280x720_questions.jsonl"
+    }
+  },
+  "scenarios": {
+    "text_10c": {
+      "display_name": "Qwen3 1.7B text 10 concurrency",
+      "model": "qwen3_1_7b",
+      "model_configs": {
+        "llama": "llama_qwen3_1_7b",
+        "vllm": "vllm_qwen3_1_7b"
+      },
+      "datasets": {
+        "perf": "gsm8k_4k_2k_10",
+        "accuracy_30": "gsm8k_accuracy_30",
+        "accuracy_full": "gsm8k_accuracy_full"
+      },
+      "workload": {
+        "batch_size": 10,
+        "max_output_tokens": 2048
+      },
+      "targets": {
+        "TTFT": 500.0,
+        "TPOT": 14.0
+      }
+    },
+    "vl_small": {
+      "display_name": "Qwen3 VL 4B small image",
+      "model": "qwen3_vl_4b",
+      "model_configs": {
+        "llama": "llama_qwen3_vl_4b",
+        "vllm": "vllm_qwen3_vl_4b"
+      },
+      "datasets": {
+        "perf": "vl_image_small",
+        "accuracy_30": "textvqa_accuracy_30",
+        "accuracy_full": "textvqa_accuracy_full"
+      },
+      "workload": {
+        "batch_size": 1,
+        "max_output_tokens": 128
+      },
+      "targets": {
+        "E2EL": 30.0
+      }
+    },
+    "vl_large": {
+      "display_name": "Qwen3 VL 4B large image",
+      "model": "qwen3_vl_4b",
+      "model_configs": {
+        "llama": "llama_qwen3_vl_4b",
+        "vllm": "vllm_qwen3_vl_4b"
+      },
+      "datasets": {
+        "perf": "vl_image_large",
+        "accuracy_30": "textvqa_accuracy_30",
+        "accuracy_full": "textvqa_accuracy_full"
+      },
+      "workload": {
+        "batch_size": 1,
+        "max_output_tokens": 128
+      },
+      "targets": {
+        "E2EL": 1000.0
+      }
+    }
+  },
+  "servers": {
+    "llama": {
+      "defaults": {
+        "threads": 8,
+        "threads_batch": 8,
+        "n_gpu_layers": 99,
+        "sampling_mode": "none",
+        "main_gpu": 0,
+        "kv_paged": true,
+        "cache_ram": 0,
+        "kv_block_size": 128,
+        "batch_size": 2048,
+        "ubatch_size": 2048,
+        "acl_graph": true,
+        "prefill_graph": false,
+        "act_type": "f16",
+        "mmproj_offload": true,
+        "backend_features": {
+          "fa_v5": true,
+          "weight_nz": true,
+          "gdn_proj": true,
+          "gdn_small": true,
+          "gdn_prefill_chunk": true
+        }
+      },
+      "scenarios": {
+        "text_10c": {
+          "port": 18112,
+          "context": 8192,
+          "parallel": 10
+        },
+        "vl_small": {
+          "port": 18114,
+          "context": 32768,
+          "parallel": 4
+        },
+        "vl_large": {
+          "port": 18114,
+          "context": 32768,
+          "parallel": 4
+        }
+      }
+    },
+    "vllm": {
+      "defaults": {
+        "dtype": "float16",
+        "enable_prefix_caching": true,
+        "gpu_memory_utilization": 0.85,
+        "max_num_seqs": 16,
+        "compilation_config": {
+          "cudagraph_mode": "FULL_DECODE_ONLY",
+          "cudagraph_capture_sizes": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        }
+      },
+      "scenarios": {
+        "text_10c": {
+          "port": 18110,
+          "gpu_memory_utilization": 0.5,
+          "max_model_len": 8192,
+          "max_num_seqs": 16
+        },
+        "vl_small": {
+          "port": 18120,
+          "gpu_memory_utilization": 0.9,
+          "max_model_len": 8192,
+          "max_num_seqs": 4,
+          "limit_mm_per_prompt": {
+            "image": 1
+          }
+        },
+        "vl_large": {
+          "port": 18120,
+          "gpu_memory_utilization": 0.9,
+          "max_model_len": 24000,
+          "max_num_seqs": 4,
+          "limit_mm_per_prompt": {
+            "image": 1
+          }
+        }
+      }
+    }
+  }
+}

@@ -454,7 +454,11 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
-    //v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+    // v is a strided slice of the qkv conv row; the meta backend cannot gather
+    // a head-split strided view across devices when the GDN core runs on the
+    // CPU, so materialize it into its own contiguous tensor (q/k are already
+    // materialized by the l2 norm above)
+    v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
     // if head keys and value keys are different, repeat to force tensors into matching shapes
     // note: need explicit repeat only if we are not using the fused GDN.

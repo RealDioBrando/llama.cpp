@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ggml-cpp.h"
 #include "llama-batch.h"
 #include "llama-block-manager.h"
 #include "llama-full-prefix-index.h"
@@ -193,6 +194,9 @@ class llama_kv_cache_paged : public llama_memory_i {
     std::vector<struct ggml_tensor *> v_gpu_layers;
     std::vector<struct ggml_tensor *> k_cpu_layers;
     std::vector<struct ggml_tensor *> v_cpu_layers;
+
+    std::pair<ggml_context_ptr, ggml_backend_buffer_ptr> ctx_buf_gpu;
+    std::pair<ggml_context_ptr, ggml_backend_buffer_ptr> ctx_buf_cpu;
 
     enum ggml_type kv_type;
 

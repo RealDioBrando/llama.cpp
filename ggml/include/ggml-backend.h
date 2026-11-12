@@ -220,6 +220,10 @@ extern "C" {
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
 
+    // Wait until the backend finished host-side submission of everything posted to it,
+    // device execution may still be in flight (tensor parallelism, meta backend)
+    typedef enum ggml_status (*ggml_backend_wait_submit_t)(ggml_backend_t backend);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend

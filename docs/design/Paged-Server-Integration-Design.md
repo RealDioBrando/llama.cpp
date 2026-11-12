@@ -327,7 +327,7 @@ warmup:kv_paged 模式下跳过 server 默认 warmup,改为`llama_paged_schedule
 - `n_cmpl > 1` 并行采样(块引用 fork,9.2);
 - 投机推理 `--spec-*`(draft ctx 保持经典 KV;synthetic acceptance 在 paged 下启动期拒绝;媒体请求跳过起草,9.3/9.4);
 - 多模态输入(分段预填 + 暂停边界按需编码,9.4);
-- 请求优先级调度(`--enable-priority` 打开调度器优先级模式;server 侧暂未接每请求优先级,见 9.7)。
+- 请求优先级调度(`--enable-priority` 打开调度器优先级模式;server 侧经请求体 `priority` 字段透传,并按优先级出队,见 9.7)。
 
 paged 模式下禁用清单:
 
@@ -752,10 +752,16 @@ rebase 到含请求优先级调度(!23/!29)的 origin/develop 后的增量适配
    在 `llama_paged_scheduler_init` 时固定;`add_request` 增加 `priority` 实参
    (钳制到 `[-LLAMA_PAGED_PRIORITY_LIMIT, LLAMA_PAGED_PRIORITY_LIMIT]`,
    非 priority 模式记录并忽略);`llama_paged_seq_state` 增加 `priority` 字段;
-4. server 侧暂未接每请求优先级:`server_scheduler_paged` 的 `add_request` 仍以默认
-   0 入队(每请求优先级需从 server 任务层透传,后续增量);库层行为已由
-   `examples/paged`(priority 池)与 `tests/req_priority`(单测 + e2e,含换入/换出
-   优先级)覆盖;
+4. server 侧每请求优先级(2026-11-05 增量):`--enable-priority` 注册到
+   `LLAMA_EXAMPLE_SERVER`;`task_params.priority` 由 schema 的 `priority` 字段解析
+   (钳制到 `±LLAMA_PAGED_PRIORITY_LIMIT`),`server_scheduler_paged` 的文本与多模态
+   两条入队路径均透传(`add_request_segs` 也补 `priority` 实参);`--kv-paged
+   --enable-priority` 时 server 主队列与 deferred 队列按 COMPLETION 任务优先级出队
+   (控制类任务仍先处理,同级保持到达序),补上"槽满时请求在 server 队列里按 FCFS
+   等待、优先级无法生效"的缺口。仍未做:运行中请求不会因高优先级请求等待而主动
+   让出槽位(需动态准入重构);库层行为已由 `examples/paged`(priority 池)与
+   `tests/req_priority`(单测 + e2e,含换入/换出优先级)覆盖,server 侧验收见
+   `tools/server/tests/unit/test_paged_server.py`;
 5. 测试迁移:`test-paged-kv` 与 req_priority 测试的 update 调用迁至 feedback 契约,
    并补 `n_pos_per_embd = 1` 构造(纯文本合成 fixture,多模态提交给 impl 构造函数
    加参导致的接口漂移,`718566a3d` 修复);mid-prefill chunk 仅推进 KV 不带 feedback

@@ -181,13 +181,15 @@ LLAMA_API bool llama_paged_scheduler_add_request(struct llama_paged_scheduler * 
 LLAMA_API bool llama_paged_scheduler_add_request_segs(struct llama_paged_scheduler *      sched,
                                                       const struct llama_paged_segment * segs,
                                                       int32_t                             n_segs,
-                                                      int32_t                             request_id) {
+                                                      int32_t                             request_id,
+                                                      int32_t                             priority) {
     if (!sched || !segs || n_segs <= 0) {
         return false;
     }
 
     llama_sequence_group group;
     group.request_id     = request_id;
+    group.priority       = priority;  // clamping and warnings happen in queue_request()
     group.n_prompt       = 0;
     group.n_decoded      = 0;
     group.n_past         = 0;

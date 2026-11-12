@@ -81,6 +81,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Min chunk size to attempt reusing from the cache via KV shifting. See --cache-reuse arg"));
 
+    add((new field_num("priority", params.priority))
+        ->set_hard_limits(-LLAMA_PAGED_PRIORITY_LIMIT, LLAMA_PAGED_PRIORITY_LIMIT)
+        ->set_desc("Paged scheduler request priority: lower values are served first (default: 0). Only effective when the server runs with --kv-paged --enable-priority"));
+
     // TODO: implement t_max_prompt_ms
     // add((new field_num("t_max_prompt_ms", params.t_max_prompt_ms))
 

@@ -101,6 +101,24 @@ struct server_context {
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;
 
+    // tokenize a prompt together with one already-decoded RGB image.
+    //
+    // This is the in-process (no HTTP) counterpart of the `cli_files` path: instead of
+    // handing over encoded file bytes that the server decodes with stb_image, the caller
+    // passes raw tightly-packed 8-bit RGB pixels (HWC, row-major, no stride).
+    //
+    // Returns an empty server_tokens on failure (no mmproj loaded, bad dimensions, or
+    // tokenization error). On success the result is meant to be assigned to
+    // server_task::tokens with `task.cli = false`, so that the server does not try to
+    // tokenize `cli_prompt` / `cli_files` again.
+    //
+    // thread-safe: only uses the shared mtmd_context, which mtmd documents as safe for
+    // concurrent tokenization.
+    server_tokens tokenize_with_rgb_image(const std::string & prompt,
+                                          const unsigned char * rgb,
+                                          uint32_t width,
+                                          uint32_t height) const;
+
     // get a new response reader, used by CLI application
     server_response_reader get_response_reader();
 

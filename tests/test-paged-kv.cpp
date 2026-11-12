@@ -296,6 +296,42 @@ TEST(test_free_blocks_releases_to_pool) {
     ggml_backend_free(backend);
 }
 
+TEST(test_kv_paged_pool_ownership) {
+    // init() must leave the K/V tensors backed by buffers owned by the cache,
+    // and the cache must be created and torn down cleanly (the owning
+    // ctx/buffer pairs are released in the destructor). Create/destroy several
+    // caches to exercise the teardown path of both pools.
+    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    EXPECT_TRUE(backend != nullptr);
+
+    const uint32_t n_gpu_blocks = 4;
+    const uint32_t n_cpu_blocks = 2;
+
+    for (int i = 0; i < 4; ++i) {
+        auto kv = make_kv();
+        kv.init(backend, backend, GGML_TYPE_F16, n_gpu_blocks, n_cpu_blocks, 0.0f);
+
+        ggml_tensor * k_gpu = kv.get_k_tensor(0);
+        ggml_tensor * v_cpu = kv.get_v_tensor(1);
+        EXPECT_TRUE(k_gpu != nullptr && k_gpu->buffer != nullptr);
+        EXPECT_TRUE(v_cpu != nullptr && v_cpu->buffer != nullptr);
+
+        // the pool is zeroed and readable through its buffer
+        uint16_t first_val = 0xffff;
+        ggml_backend_tensor_get(k_gpu, &first_val, 0, sizeof(first_val));
+        EXPECT_TRUE(first_val == 0);
+
+        // 2 layers x (K + V) x (gpu + cpu) pools; same CPU backend everywhere
+        const size_t bytes_gpu_tensor = 64 * 16 * 4 * n_gpu_blocks * 2;  // head_dim * block * heads * blocks * f16
+        const size_t bytes_cpu_tensor = 64 * 16 * 4 * n_cpu_blocks * 2;
+        auto breakdown = kv.memory_breakdown();
+        EXPECT_TRUE(breakdown.size() == 1);
+        EXPECT_TRUE(breakdown.begin()->second == 2 * 2 * (bytes_gpu_tensor + bytes_cpu_tensor));
+    }
+
+    ggml_backend_free(backend);
+}
+
 // Testing scheduler
 
 // For easy testing and clean-up.
@@ -757,6 +793,7 @@ int main(int /*argc*/, char ** /*argv*/) {
 
     fprintf(stderr, "test-paged-kv: llama_kv_cache_paged free_blocks\n");
     RUN(test_free_blocks_releases_to_pool);
+    RUN(test_kv_paged_pool_ownership);
 
     fprintf(stderr, "test-paged-kv: llama_kv_cache_paged scheduler\n");
     RUN(test_scheduler_no_deadlock_on_empty);

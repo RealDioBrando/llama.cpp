@@ -402,6 +402,7 @@ void ggml_cann_fill(ggml_backend_cann_context & ctx, ggml_tensor * dst);
  *            dst->op is `GGML_OP_UPSCALE`.
  */
 void ggml_cann_upsample_nearest2d(ggml_backend_cann_context & ctx, ggml_tensor * dst);
+void ggml_cann_upsample_bilinear2d(ggml_backend_cann_context & ctx, ggml_tensor * dst);
 
 /**
  * @brief   Pads a ggml tensor to match the dimensions of the destination tensor
@@ -964,6 +965,17 @@ bool ggml_cann_gdn_available();
 bool ggml_cann_gdn_snapshots_supported(const ggml_tensor * dst);
 
 /**
+ * @brief Check whether the GQA head reordering in the GDN glue is enabled.
+ *
+ * The kernel groups v-heads into k-head blocks (j / (Nv/Nk)) while the
+ * llama.cpp reference uses modulo (h % Nk); the glue reorders the v-head axis
+ * on the way in and restores it on the way out so GQA shapes (Nk != Nv) can
+ * run on device. GGML_CANN_GDN_GQA_PERM=0 disables the reorder, which makes
+ * supports_op reject GQA shapes again (CPU reference fallback).
+ */
+bool ggml_cann_gdn_gqa_perm_enabled();
+
+/**
  * @brief Preload the gated delta net index cache before graph capture.
  *
  * The index buffers need a host-to-device copy on growth, which is not allowed
@@ -1062,15 +1074,21 @@ void ggml_cann_op_add_rms_norm_fused(ggml_backend_cann_context & ctx,
 static bool is_matmul_weight(const ggml_tensor * tensor) {
     std::string                                  name = ggml_get_name(tensor);
     static const std::unordered_set<std::string> weight_suffixes{ "output.weight",      "attn_q.weight",
-                                                                  "attn_k.weight",      "attn_v.weight",
-                                                                  "attn_output.weight", "ffn_gate.weight",
-                                                                  "ffn_up.weight",      "ffn_down.weight",
-                                                                  // linear attention (GatedDeltaNet) projections:
-                                                                  // ssm_alpha/ssm_beta ([k,16] narrow weights)
-                                                                  // are routed via is_gdn_proj_weight.
-                                                                  "attn_qkv.weight",    "attn_gate.weight",
-                                                                  "ssm_out.weight",
-                                                                  "token_embd.weight" };
+                                                                   "attn_k.weight",      "attn_v.weight",
+                                                                   "attn_output.weight", "ffn_gate.weight",
+                                                                   "ffn_up.weight",      "ffn_down.weight",
+                                                                   // MoE shared expert projections (Qwen3.5/3.6):
+                                                                   // without these the Q8_0 shexp matmuls fall
+                                                                   // back to CPU and ping-pong per layer under TP
+                                                                   "ffn_gate_shexp.weight",
+                                                                   "ffn_up_shexp.weight",
+                                                                   "ffn_down_shexp.weight",
+                                                                   // linear attention (GatedDeltaNet) projections:
+                                                                   // ssm_alpha/ssm_beta ([k,16] narrow weights)
+                                                                   // are routed via is_gdn_proj_weight.
+                                                                   "attn_qkv.weight",    "attn_gate.weight",
+                                                                   "ssm_out.weight",
+                                                                   "token_embd.weight" };
     /* token_embd.weight: tied-embedding lm_head (Qwen3.5 etc., no standalone
      * output.weight). Routing it to W8A8 requires the lazy transform: skip the
      * load-time transform (GET_ROWS needs the original Q8_0) and do the one-time
@@ -1084,27 +1102,6 @@ static bool is_matmul_weight(const ggml_tensor * tensor) {
     return false;
 }
 
-/**
- * @brief   K-quant (Q4_K/Q5_K/Q6_K) NPU matmul path selection (310P).
- *
- * @details Decides how a K-quant matmul weight is handled on the CANN backend:
- *            - GGML_CANN_KQ_W8A8: Q5_K/Q6_K dequantized + re-quantized to int8
- *              (K-axis group size GGML_CANN_W8A8_GROUP_SIZE) at load time, and
- *              mul_mat runs via aclnnDynamicQuantV2 + aclnnQuantMatmulV5 (W8A8 KG).
- *            - GGML_CANN_KQ_W4A8: Q4_K re-quantized to packed int4 (group 256,
- *              with x2Scale/u64 + yOffset), for the W4A8 kernel.
- *          The SAME decision must drive: buffer alloc size, set_tensor transform,
- *          and supports_op / mul_mat dispatch. Never call this with different
- *          env settings in one process (all helpers cache env once).
- *
- * @param tensor The weight tensor (src0 of MUL_MAT).
- * @return 0 = no NPU path (fallback), 1 = W8A8, 2 = W4A8.
- */
-enum ggml_cann_kq_path {
-    GGML_CANN_KQ_NONE = 0,
-    GGML_CANN_KQ_W8A8 = 1,
-    GGML_CANN_KQ_W4A8 = 2,
-};
 
 static bool ggml_cann_env_off(const char * name) {
     const char * e = getenv(name);
@@ -1159,6 +1156,12 @@ static bool ggml_cann_qmat_debug() {
     static const bool on = ggml_cann_env_on("GGML_CANN_QMAT_DEBUG");
     return on;
 }
+
+enum ggml_cann_kq_path {
+    GGML_CANN_KQ_NONE = 0,
+    GGML_CANN_KQ_W8A8 = 1,
+    GGML_CANN_KQ_W4A8 = 2,
+};
 
 /**
  * @brief   GDN-layer projection weights (Qwen3.5 linear-attention blocks).
@@ -1232,8 +1235,14 @@ static int ggml_cann_kq_matmul_path(const ggml_tensor * tensor) {
             if (ggml_cann_w8_group_size() != 32) {
                 return GGML_CANN_KQ_NONE;  // only the native, lossless grouping
             }
-            if (k % 32 != 0 || n % 16 != 0) {
-                return GGML_CANN_KQ_NONE;  // 32 = QK8_0 block; 16 = NPU fractal n0
+            if (k % 32 != 0) {
+                return GGML_CANN_KQ_NONE;  // 32 = QK8_0 block
+            }
+            // 16 = NPU fractal n0. GDN projections may carry a TP head slice
+            // with n % 16 != 0 (e.g. 16 heads over 2 ranks): those run with
+            // the fractal padded up to the next multiple of 16.
+            if (n % 16 != 0 && !is_gdn_proj_weight(tensor)) {
+                return GGML_CANN_KQ_NONE;
             }
             return GGML_CANN_KQ_W8A8;
         case GGML_TYPE_Q4_K:
@@ -1261,10 +1270,15 @@ static int ggml_cann_kq_matmul_path(const ggml_tensor * tensor) {
  */
 static size_t ggml_cann_kq_layout_size(const ggml_tensor * tensor, int path) {
     const int64_t k = tensor->ne[0];
-    const int64_t n = tensor->ne[1];
+    // Expert stacks (MUL_MAT_ID src0) flatten ne[2] into n: ggml row order
+    // (e, m) is linear, so the stack transforms as one tall [k, E*M] matrix.
+    const int64_t n = tensor->ne[1] * (tensor->ne[2] > 1 ? tensor->ne[2] : 1);
     if (path == GGML_CANN_KQ_W8A8) {
+        // fractal n0 padding: quants and scales are laid out with the output
+        // rows rounded up to a multiple of 16 (no-op unless a TP slice broke it)
+        const int64_t n_pad = (n + 15) & ~int64_t(15);
         const int64_t gs = ggml_cann_w8_group_size();
-        return (size_t) (n * k) + (size_t) ((k / gs) * n) * sizeof(float);
+        return (size_t) (n_pad * k) + (size_t) ((k / gs) * n_pad) * sizeof(float);
     }
     if (path == GGML_CANN_KQ_W4A8) {
         return (size_t) (k * (n / 8)) * sizeof(int32_t) + (size_t) ((k / 256) * n) * sizeof(uint64_t) +

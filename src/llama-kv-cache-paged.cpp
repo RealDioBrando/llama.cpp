@@ -78,6 +78,10 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
             ggml_new_tensor_4d(ctx_gpu, type, head_dim, block_size, n_heads_kv, n_gpu_blocks);
         ggml_tensor * v_layer_gpu =
             ggml_new_tensor_4d(ctx_gpu, type, head_dim, block_size, n_heads_kv, n_gpu_blocks);
+        // the meta backend (tensor parallelism) identifies the pools by name
+        // and slices them on the KV head axis
+        ggml_format_name(k_layer_gpu, "cache_paged_k_l%u", il);
+        ggml_format_name(v_layer_gpu, "cache_paged_v_l%u", il);
         k_gpu_layers.push_back(k_layer_gpu);
         v_gpu_layers.push_back(v_layer_gpu);
     }
@@ -92,6 +96,7 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
         }
         GGML_ASSERT(k_gpu_layers[il]->buffer && v_gpu_layers[il]->buffer && "GPU layer tensor has null buffer");
     }
+    ctx_buf_gpu = {ggml_context_ptr(ctx_gpu), ggml_backend_buffer_ptr(buf_gpu)};
 
     // Set up CPU context and tensor (for swapping)
     struct ggml_init_params cpu_params;
@@ -123,6 +128,7 @@ void llama_kv_cache_paged::init(ggml_backend_t backend_gpu,
         }
         GGML_ASSERT(k_cpu_layers[il]->buffer && v_cpu_layers[il]->buffer && "CPU layer tensor has null buffer");
     }
+    ctx_buf_cpu = {ggml_context_ptr(ctx_cpu), ggml_backend_buffer_ptr(buf_cpu)};
 
     // Setting up our block accountant
     block_manager.init(n_gpu_blocks, n_cpu_blocks, watermark);
