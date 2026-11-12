@@ -312,6 +312,63 @@ class TestVLSpeculative:
         assert timings["draft_n"] > 0
         assert 0 <= timings["draft_n_accepted"] <= timings["draft_n"]
 
+    @pytest.mark.parametrize(
+        "padding", ("", "Inspection record. " * 160), ids=("image", "long-prompt")
+    )
+    def test_paged_matches_target_and_reports_drafts(
+        self, vl_case, monkeypatch, tmp_path, padding
+    ):
+        from pathlib import Path
+
+        local, payload, draft, spec_type = vl_case
+        monkeypatch.setenv("LLAMA_ARG_FIT", "on")
+        monkeypatch.setenv("LLAMA_ARG_SPEC_DRAFT_P_MIN", "0")
+        local.kv_paged = True
+        request = dict(payload, ignore_eos=True)
+        request["messages"] = [
+            {
+                "role": "user",
+                "content": [
+                    dict(
+                        payload["messages"][0]["content"][0],
+                        text=padding + payload["messages"][0]["content"][0]["text"],
+                    ),
+                    payload["messages"][0]["content"][1],
+                ],
+            }
+        ]
+        responses = []
+        for enabled in (False, True):
+            local.model_draft = draft if enabled else None
+            local.spec_type = spec_type if enabled else "none"
+            local.log_path = str(
+                tmp_path / ("paged-draft.log" if enabled else "paged-target.log")
+            )
+            try:
+                local.start(timeout_seconds=240)
+                response = local.make_request("POST", "/v1/chat/completions", request)
+                assert response.status_code == 200, response.body
+                responses.append(response.body)
+            finally:
+                local.stop()
+        baseline, speculative = responses
+        baseline_tokens = baseline["__verbose"]["tokens"]
+        assert baseline_tokens and baseline_tokens == speculative["__verbose"]["tokens"]
+        assert (
+            baseline["choices"][0]["message"]["content"]
+            == speculative["choices"][0]["message"]["content"]
+        )
+        assert (
+            baseline["choices"][0]["finish_reason"]
+            == speculative["choices"][0]["finish_reason"]
+        )
+        timings = speculative["timings"]
+        assert timings["draft_n"] > 0
+        assert 0 < timings["draft_n_accepted"] <= timings["draft_n"]
+        if padding:
+            assert speculative["usage"]["prompt_tokens"] > local.n_batch
+        assert "process() did not run" not in Path(local.log_path).read_text()
+
     def test_paged_text_request_with_loaded_projector(self, vl_case, monkeypatch):
         local, _, draft, spec_type = vl_case
         monkeypatch.setenv("LLAMA_ARG_FIT", "on")

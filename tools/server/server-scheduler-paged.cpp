@@ -412,7 +412,6 @@ void server_scheduler_paged::update() {
 
         // the scheduler's prefill accounting already counts the appended rows,
         // only track the chunk ordering here
-        slot.prompt.tokens.push_back_placeholder(target);
         slot.n_media_appended++;
         slot.stats.update_prompt_last();
 
@@ -681,7 +680,8 @@ bool server_scheduler_paged::launch_multimodal(server_task && task) {
     for (size_t r = 0; r < s.task->tokens.size(); ++r) {
         rows.push_back(s.task->tokens[r]);
     }
-    s.prompt.tokens = server_tokens(rows, /* has_mtmd = */ true);
+    // Keep media metadata at its original row, without appending duplicate placeholders.
+    s.prompt.tokens    = s.task->tokens.clone();
     s.n_media_appended = 0;
 
     // ordered text/media segments; media segments stay pending (embd NULL)
