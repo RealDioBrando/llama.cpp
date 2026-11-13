@@ -100,6 +100,8 @@ bool server_scheduler_paged::init() {
     }
 
     cancelled.assign(port.slot_pool().size(), 0);
+    // The speculative context dispatches each batch to the selected implementations.
+    has_speculation = port.spec_ctx() != nullptr;
 
     // Test/grayscale hook: LLAMA_SERVER_PAGED_EVICT_PROTECT_TAGS=1,42
     // protects every cache-resident block carrying one of these uint64 tags
@@ -212,6 +214,21 @@ server_slot * server_scheduler_paged::pick_idle_slot() {
         }
     }
     return best;
+}
+
+bool server_scheduler_paged::process_draft_batch(const llama_paged_batch_info & info) {
+    for (int32_t s = 0; s < info.n_seq; ++s) {
+        const auto id = paged_batch.seq_id[info.batch_offsets[s]][0];
+        auto & slot = port.slot_pool()[id];
+        // Discard temporary or rejected draft K/V before processing the target batch.
+        if (slot.ctx_dft && !llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), id,
+                                               info.context_lens[s] - info.batch_lens[s], -1)) {
+            return false;
+        }
+    }
+    bool ok = false;
+    port.yield([&]() { ok = common_speculative_process(port.spec_ctx(), paged_batch); });
+    return ok;
 }
 
 bool server_scheduler_paged::launch(server_task && task) {
@@ -520,7 +537,6 @@ void server_scheduler_paged::update() {
 
         // the scheduler's prefill accounting already counts the appended rows,
         // only track the chunk ordering here
-        slot.prompt.tokens.push_back_placeholder(target);
         slot.n_media_appended++;
         slot.stats.update_prompt_last();
 
@@ -563,10 +579,14 @@ void server_scheduler_paged::update() {
     }
     llama_synchronize(port.ctx());
 
-    port.metrics_flush_prompt();
-
     const llama_paged_batch_info * info = llama_paged_scheduler_get_batch_info(sched);
     GGML_ASSERT(info != nullptr);
+    if (has_speculation && !process_draft_batch(*info)) {
+        fail_all("failed to process speculative batch on the paged path");
+        return;
+    }
+
+    port.metrics_flush_prompt();
 
     server_metrics & m = port.srv_metrics();
     m.n_decode++;
@@ -674,7 +694,12 @@ void server_scheduler_paged::update() {
         if (slot.state == SLOT_STATE_DONE_PROMPT) {
             slot.state = SLOT_STATE_GENERATING;
             if (slot.can_speculate() && port.spec_ctx() != nullptr) {
-                common_speculative_begin(port.spec_ctx(), slot.id, slot.prompt.tokens.get_text_tokens());
+                auto prompt = slot.prompt.tokens.get_text_tokens();
+                if (has_speculation) {
+                    // The newly sampled anchor has not been decoded by the target yet.
+                    prompt.pop_back();
+                }
+                common_speculative_begin(port.spec_ctx(), slot.id, prompt);
             }
         }
 
@@ -785,7 +810,8 @@ bool server_scheduler_paged::launch_multimodal(server_task && task) {
     for (size_t r = 0; r < s.task->tokens.size(); ++r) {
         rows.push_back(s.task->tokens[r]);
     }
-    s.prompt.tokens = server_tokens(rows, /* has_mtmd = */ true);
+    // Keep media metadata at its original row, without appending duplicate placeholders.
+    s.prompt.tokens    = s.task->tokens.clone();
     s.n_media_appended = 0;
 
     // ordered text/media segments; media segments stay pending (embd NULL)
@@ -958,11 +984,11 @@ void server_scheduler_paged::mm_warmup() {
 
 void server_scheduler_paged::prepare_drafts() {
     bool any_drafting = false;
+    std::vector<server_slot *> drafted;
 
     for (auto & slot : port.slot_pool()) {
-        // media rows cannot be drafted: the draft context mirrors text only
         if (!slot.can_speculate() || !slot.is_processing() || slot.state != SLOT_STATE_GENERATING ||
-            slot.task->tokens.has_mtmd) {
+            !slot.has_next_token || !slot.has_budget()) {
             continue;
         }
         if (!slot.spec_draft.empty()) {
@@ -974,23 +1000,22 @@ void server_scheduler_paged::prepare_drafts() {
             continue;
         }
 
-        // roll the draft context back to the verified end; its KV beyond the
-        // prompt belongs to rejected drafts of the previous round
+        // The prompt includes the pending anchor; discard unverified draft K/V from that row.
         if (slot.ctx_dft) {
-            llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.id,
-                                (llama_pos) slot.prompt.tokens.size(), -1);
+            llama_memory_seq_rm(llama_get_memory(slot.ctx_dft), slot.id, (llama_pos) slot.prompt.tokens.size() - 1, -1);
         }
 
         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
         common_speculative_get_draft_params(port.spec_ctx(), slot.id) = {
             /* .drafting = */ true,
             /* .n_max    = */ n_draft_max,
-            /* .pos0     = */ slot.prompt.tokens.pos_next(),
+            /* .pos0     = */ has_speculation ? (llama_pos) slot.prompt.tokens.size() - 1 : slot.prompt.tokens.pos_next(),
             /* .id_last  = */ slot.sampled,
             /* .prompt   = */ &slot.spec_prompt,
             /* .result   = */ &slot.spec_draft,
         };
         any_drafting = true;
+        drafted.push_back(&slot);
     }
 
     if (any_drafting) {
@@ -998,8 +1023,11 @@ void server_scheduler_paged::prepare_drafts() {
         port.yield([&]() { common_speculative_draft(port.spec_ctx()); });
     }
 
-    for (auto & slot : port.slot_pool()) {
-        if (!slot.can_speculate() || slot.state != SLOT_STATE_GENERATING || slot.spec_draft.empty()) {
+    // Carried drafts are already attached and counted; only submit new drafts.
+    for (auto * slot_ptr : drafted) {
+        auto & slot = *slot_ptr;
+        slot.stats.n_draft_tokens += slot.spec_draft.size();
+        if (slot.spec_draft.empty()) {
             continue;
         }
         if (!llama_paged_scheduler_attach_draft(sched, slot.id, slot.spec_draft.data(),

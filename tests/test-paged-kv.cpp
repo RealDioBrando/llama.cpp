@@ -4,7 +4,9 @@
 #include "llama-full-prefix-index.h"
 #include "llama-linear-prefix-index.h"
 #include "llama-paged-scheduler-impl.h"
+#include "llama-vocab.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
@@ -775,7 +777,282 @@ TEST(test_scheduler_prefix_cache_eviction) {
     EXPECT_EQ(batch.n_tokens, 33);
 }
 
+TEST(test_scheduler_draft_uses_step_budget) {
+    auto fixture = make_fixture(/*n_ctx=*/128, /*block_size=*/16, /*n_batch=*/16,
+                                /*n_gpu_blocks=*/16, /*n_cpu_blocks=*/2);
+    fixture.sched->set_prefix_cache_enabled(false);
+    EXPECT_TRUE(fixture.sched->queue_request(make_group(0, 32)));
+
+    llama_batch batch = {};
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    fixture.sched->update(&batch, nullptr, 0);
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    const llama_token          sampled = 42;
+    const llama_paged_feedback fb      = { 0, &sampled, 1, 0 };
+    fixture.sched->update(&batch, &fb, 1);
+
+    const llama_token draft[] = { 43, 44, 45 };
+    EXPECT_FALSE(fixture.sched->attach_draft(1, draft, 3));
+    EXPECT_FALSE(fixture.sched->attach_draft(0, nullptr, 3));
+    EXPECT_FALSE(fixture.sched->attach_draft(0, draft, 0));
+    EXPECT_TRUE(fixture.sched->attach_draft(0, draft, 3));
+    EXPECT_FALSE(fixture.sched->attach_draft(0, draft, 3));
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_TRUE(batch.n_tokens == 4);
+    EXPECT_TRUE(batch.pos[0] == 32);
+    EXPECT_TRUE(batch.token[0] == sampled);
+    EXPECT_TRUE(batch.token[3] == draft[2]);
+}
+
+TEST(test_scheduler_media_spans_batches) {
+    auto fixture = make_fixture(/*n_ctx=*/128, /*block_size=*/16, /*n_batch=*/16,
+                                /*n_gpu_blocks=*/16, /*n_cpu_blocks=*/2);
+    fixture.sched->set_prefix_cache_enabled(false);
+    std::vector<float> embeddings(48 * 4, 1.0f);
+    auto               group = make_group(0, 53);
+    group.has_media          = true;
+    std::fill_n(group.logical_seq.begin() + 2, 48, LLAMA_TOKEN_NULL);
+    llama_seq_segment prefix = {};
+    prefix.n_tokens          = 2;
+    llama_seq_segment media  = {};
+    media.start_row          = 2;
+    media.n_tokens           = 48;
+    media.is_media           = true;
+    media.embd               = embeddings.data();
+    media.embd_stride        = 4;
+    llama_seq_segment suffix = {};
+    suffix.start_row         = 50;
+    suffix.n_tokens          = 3;
+    group.segments           = { prefix, media, suffix };
+    EXPECT_TRUE(fixture.sched->queue_request(std::move(group)));
+
+    llama_batch batch = {};
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_TRUE(batch.n_tokens == 2);
+    fixture.sched->update(&batch, nullptr, 0);
+    for (int chunk = 0; chunk < 3; ++chunk) {
+        EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+        EXPECT_TRUE(batch.n_tokens == 16);
+        EXPECT_TRUE(batch.token == nullptr);
+        EXPECT_TRUE(batch.embd == embeddings.data() + chunk * 16 * 4);
+        fixture.sched->update(&batch, nullptr, 0);
+    }
+}
+
+TEST(test_scheduler_swapped_media_waits_for_batch_budget) {
+    auto fixture = make_fixture(/*n_ctx=*/128, /*block_size=*/16, /*n_batch=*/16,
+                                /*n_gpu_blocks=*/6, /*n_cpu_blocks=*/4);
+    fixture.sched->set_prefix_cache_enabled(false);
+    const llama_token sampled = 42;
+    llama_batch       batch   = {};
+    for (int32_t id = 0; id < 2; ++id) {
+        EXPECT_TRUE(fixture.sched->queue_request(make_group(id, 1)));
+        EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+        EXPECT_TRUE(batch.n_tokens == 1);
+        EXPECT_TRUE(batch.seq_id[0][0] == id);
+        const llama_paged_feedback fb = { id, &sampled, 1, 0 };
+        fixture.sched->update(&batch, &fb, 1);
+    }
+
+    std::vector<float> embeddings(48 * 4, 1.0f);
+    auto               group = make_group(2, 53);
+    group.has_media          = true;
+    std::fill_n(group.logical_seq.begin() + 2, 48, LLAMA_TOKEN_NULL);
+    llama_seq_segment prefix = {};
+    prefix.n_tokens          = 2;
+    llama_seq_segment media  = {};
+    media.start_row          = 2;
+    media.n_tokens           = 48;
+    media.is_media           = true;
+    media.embd               = embeddings.data();
+    media.embd_stride        = 4;
+    llama_seq_segment suffix = {};
+    suffix.start_row         = 50;
+    suffix.n_tokens          = 3;
+    group.segments           = { prefix, media, suffix };
+    EXPECT_TRUE(fixture.sched->queue_request(std::move(group)));
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_TRUE(batch.n_tokens == 2);
+    EXPECT_TRUE(batch.seq_id[0][0] == 2);
+    fixture.sched->update(&batch, nullptr, 0);
+
+    // Expanding request 0 evicts the newer media request to the CPU pool.
+    std::vector<llama_token> draft(15, 43);
+    EXPECT_TRUE(fixture.sched->attach_draft(0, draft.data(), (int32_t) draft.size()));
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_TRUE(batch.n_tokens == 16);
+    EXPECT_TRUE(batch.seq_id[0][0] == 0);
+    auto * restored = fixture.sched->get_group_from_id(2);
+    EXPECT_TRUE(restored != nullptr);
+    EXPECT_TRUE(restored->status == llama_sequence_group_status::SWAPPED);
+    EXPECT_TRUE(restored->n_past == 2);
+    EXPECT_TRUE(restored->block_table.size() == 4);
+    for (const auto block : restored->block_table) {
+        EXPECT_TRUE(block >= 6);
+    }
+    EXPECT_TRUE(fixture.kv->n_free_cpu_blocks() == 0);
+    std::vector<llama_token> accepted(16, 43);
+    accepted.back() = 44;
+    const llama_paged_feedback verified = { 0, accepted.data(), (int32_t) accepted.size(), 0 };
+    fixture.sched->update(&batch, &verified, 1);
+
+    // Free enough GPU blocks so only the remaining 15-row batch budget blocks swap-in.
+    EXPECT_TRUE(fixture.sched->cancel(1));
+    EXPECT_TRUE(fixture.kv->n_free_gpu_blocks() == 4);
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_TRUE(batch.n_tokens == 1);
+    EXPECT_TRUE(batch.token != nullptr);
+    EXPECT_TRUE(batch.seq_id[0][0] == 0);
+    EXPECT_TRUE(restored->status == llama_sequence_group_status::SWAPPED);
+    EXPECT_TRUE(restored->n_past == 2);
+    EXPECT_TRUE(fixture.kv->n_free_cpu_blocks() == 0);
+    const llama_paged_feedback stopped = { 0, &sampled, 1, 1 };
+    fixture.sched->update(&batch, &stopped, 1);
+
+    for (int chunk = 0; chunk < 3; ++chunk) {
+        EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+        EXPECT_TRUE(restored->status == llama_sequence_group_status::RUNNING);
+        EXPECT_TRUE(batch.n_tokens == 16);
+        EXPECT_TRUE(batch.token == nullptr);
+        EXPECT_TRUE(batch.seq_id[0][0] == 2);
+        EXPECT_TRUE(batch.embd == embeddings.data() + chunk * 16 * 4);
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            EXPECT_TRUE(batch.pos[i] == 2 + chunk * 16 + i);
+        }
+        for (const auto block : restored->block_table) {
+            EXPECT_TRUE(block < 6);
+        }
+        EXPECT_TRUE(fixture.kv->n_free_cpu_blocks() == 4);
+        fixture.sched->update(&batch, nullptr, 0);
+        EXPECT_TRUE(restored->n_past == (uint32_t) (2 + (chunk + 1) * 16));
+    }
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_TRUE(batch.n_tokens == 3);
+    EXPECT_TRUE(batch.token != nullptr);
+    EXPECT_TRUE(batch.seq_id[0][0] == 2);
+    EXPECT_TRUE(batch.pos[0] == 50);
+    const llama_paged_feedback finished = { 2, &sampled, 1, 1 };
+    fixture.sched->update(&batch, &finished, 1);
+    EXPECT_TRUE(fixture.sched->step(batch) == llama_scheduler_status::OK);
+    EXPECT_TRUE(batch.n_tokens == 0);
+    EXPECT_TRUE(fixture.kv->n_free_gpu_blocks() == 6);
+    EXPECT_TRUE(fixture.kv->n_free_cpu_blocks() == 4);
+}
+
+static void check_paged_metadata_split(const std::vector<int32_t> & lengths,
+                                       uint32_t                     n_ubatch,
+                                       uint32_t                     n_pos      = 1,
+                                       bool                         init_batch = false) {
+    int32_t              n_tokens = 0;
+    std::vector<int32_t> offsets;
+    std::vector<int32_t> context_lens;
+    std::vector<int32_t> block_table;
+    for (size_t s = 0; s < lengths.size(); ++s) {
+        offsets.push_back(n_tokens);
+        n_tokens += lengths[s];
+        context_lens.push_back(100 * (int32_t) (s + 1) + lengths[s]);
+        for (int b = 0; b < 3; ++b) {
+            block_table.push_back(10 * (int32_t) (s + 1) + b);
+        }
+    }
+    std::vector<float>          embeddings(n_tokens, 1.0f);
+    std::vector<llama_pos>      positions(n_tokens * n_pos, 0);
+    std::vector<int32_t>        n_seq_id(n_tokens, 1);
+    std::vector<llama_seq_id>   seq_ids(n_tokens);
+    std::vector<llama_seq_id *> seq_ptrs(n_tokens);
+    std::vector<int8_t>         logits(n_tokens, 1);
+    std::vector<int32_t>        write_slots(n_tokens);
+    for (size_t s = 0; s < lengths.size(); ++s) {
+        for (int32_t t = 0; t < lengths[s]; ++t) {
+            const int32_t row = offsets[s] + t;
+            seq_ids[row]      = 7 - 2 * (int32_t) s;
+            seq_ptrs[row]     = &seq_ids[row];
+            positions[row]    = n_pos == 1 ? 100 * (int32_t) (s + 1) + t : 4;
+            for (uint32_t p = 1; p < n_pos; ++p) {
+                positions[p * n_tokens + row] = t;
+            }
+            write_slots[row] = 1000 + row;
+        }
+    }
+    llama_batch batch               = {};
+    batch.n_tokens                  = n_tokens;
+    batch.embd                      = embeddings.data();
+    batch.pos                       = positions.data();
+    batch.n_seq_id                  = n_seq_id.data();
+    batch.seq_id                    = seq_ptrs.data();
+    batch.logits                    = logits.data();
+    llama_paged_batch_info info     = {};
+    info.n_tokens                   = n_tokens;
+    info.n_seq                      = (int32_t) lengths.size();
+    info.n_blocks_per_seq           = 3;
+    info.write_slots                = write_slots.data();
+    info.block_table                = block_table.data();
+    info.context_lens               = context_lens.data();
+    info.batch_offsets              = offsets.data();
+    std::vector<int32_t> batch_lens = lengths;
+    info.batch_lens                 = batch_lens.data();
+
+    llama_vocab        vocab;
+    llama_batch_allocr allocr(n_pos);
+    EXPECT_TRUE(allocr.init(batch, vocab, nullptr, 1, 8, false));
+    auto fixture = make_fixture();
+    fixture.kv->set_paged_batch_info(&info);
+    llama_memory_context_ptr context;
+    if (init_batch) {
+        context = fixture.kv->init_batch(allocr, n_ubatch, false);
+    } else {
+        std::vector<llama_ubatch> ubatches;
+        while (true) {
+            auto ubatch = allocr.split_equal(n_ubatch, false, 0);
+            if (ubatch.n_tokens == 0) {
+                break;
+            }
+            ubatches.push_back(std::move(ubatch));
+        }
+        context = fixture.kv->create_batch_context(ubatches);
+    }
+    EXPECT_TRUE(context->get_status() == LLAMA_MEMORY_STATUS_SUCCESS);
+    auto *                paged = static_cast<llama_kv_cache_paged_context *>(context.get());
+    std::vector<uint32_t> consumed(lengths.size(), 0);
+    do {
+        const auto & ubatch = context->get_ubatch();
+        EXPECT_TRUE(paged->get_n_tokens() == (int32_t) ubatch.n_tokens);
+        EXPECT_TRUE(paged->get_batch_size() == (int32_t) ubatch.n_seqs);
+        for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+            const uint32_t local = s * ubatch.n_seq_tokens;
+            const uint32_t src   = (7 - ubatch.seq_id[local][0]) / 2;
+            EXPECT_TRUE(src < lengths.size());
+            EXPECT_TRUE(paged->get_batch_offsets()[s] == (int32_t) local);
+            EXPECT_TRUE(paged->get_batch_lens()[s] == (int32_t) ubatch.n_seq_tokens);
+            EXPECT_TRUE(paged->get_context_lens()[s] ==
+                        100 * (int32_t) (src + 1) + (int32_t) (consumed[src] + ubatch.n_seq_tokens));
+            for (int b = 0; b < 3; ++b) {
+                EXPECT_TRUE(paged->get_block_table()[s * 3 + b] == block_table[src * 3 + b]);
+            }
+            for (uint32_t t = 0; t < ubatch.n_seq_tokens; ++t) {
+                const uint32_t original = offsets[src] + consumed[src] + t;
+                EXPECT_TRUE(ubatch.data->batch_idxs[local + t] == (int32_t) original);
+                EXPECT_TRUE(paged->get_write_slots()[local + t] == write_slots[original]);
+            }
+            consumed[src] += ubatch.n_seq_tokens;
+        }
+    } while (context->next());
+    for (size_t s = 0; s < lengths.size(); ++s) {
+        EXPECT_TRUE(consumed[s] == (uint32_t) lengths[s]);
+    }
+}
+
+TEST(test_paged_metadata_pinned_mrope_rows) {
+    check_paged_metadata_split({ 6 }, 4, 4);
+}
+
+TEST(test_paged_metadata_first_ubatch) {
+    check_paged_metadata_split({ 10 }, 4, 1, true);
+}
+
 int main(int /*argc*/, char ** /*argv*/) {
+    RUN(test_paged_metadata_pinned_mrope_rows);
+    RUN(test_paged_metadata_first_ubatch);
     fprintf(stderr, "test-paged-kv: block_manager\n");
     RUN(test_block_manager_leak_simple);
     RUN(test_block_manager_leak_repeated);
@@ -814,6 +1091,9 @@ int main(int /*argc*/, char ** /*argv*/) {
     RUN(test_scheduler_prefix_cache_hit);
     RUN(test_scheduler_prefix_cache_zero_suffix);
     RUN(test_scheduler_prefix_cache_eviction);
+    RUN(test_scheduler_draft_uses_step_budget);
+    RUN(test_scheduler_media_spans_batches);
+    RUN(test_scheduler_swapped_media_waits_for_batch_budget);
 
     fprintf(stderr, "test-paged-kv: ALL PASSED\n");
     return 0;

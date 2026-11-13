@@ -29,6 +29,9 @@ class server_scheduler_paged final : public server_scheduler_interface {
   private:
     server_slot * pick_idle_slot();
     bool launch_multimodal(server_task && task);
+    bool process_draft_batch(const llama_paged_batch_info & info);
+
+    bool has_speculation = false;
 
     // multimodal (9.4): the pending media chunk of a slot, in order; returns
     // nullptr when all chunks are already appended
