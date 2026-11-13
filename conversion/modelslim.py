@@ -190,6 +190,17 @@ class ModelSlimAdapter:
         require(nonzero == 0, f"nonzero weight offset in {name}")
         return nonzero
 
+    def _map_weight_name(self, weight_name: str) -> str:
+        # Vision-projector tensors (merger / deepstack) are renamed by the model
+        # class itself (Qwen3VLVisionModel.modify_tensors), so fall back to it
+        # when the generic tensor map has no entry.
+        try:
+            return self.map_tensor_name(weight_name)
+        except ValueError:
+            for new_name, _ in self.model.modify_tensors(torch.empty(0), weight_name, None):
+                return new_name
+            raise
+
     def _pack_dense_weight(self, source_name: str, weight_name: str) -> dict[str, object]:
         scale_name, offset_name = self._triple_names(weight_name)
         weight_lazy = self._tensor(weight_name, "weight")
@@ -206,7 +217,7 @@ class ModelSlimAdapter:
         self._validate_offset(offset_lazy, offset_name)
         scale = self._validate_scale(scale_lazy, scale_name)
 
-        gguf_name = self.map_tensor_name(weight_name)
+        gguf_name = self._map_weight_name(weight_name)
         record = {
             "kind": "dense",
             "source_name_raw": source_name,
@@ -255,7 +266,7 @@ class ModelSlimAdapter:
                 "kind": "dense",
                 "source_name_raw": source_name,
                 "source_name": weight_name,
-                "gguf_name": self.map_tensor_name(weight_name),
+                "gguf_name": self._map_weight_name(weight_name),
                 "shape": weight_shape,
                 "scale_shape": scale_shape,
                 "scale_min": float(scale.min().item()),
