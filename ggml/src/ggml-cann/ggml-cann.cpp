@@ -3743,27 +3743,36 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
 
     if (!use_cann_graph || cann_graph_capture_required) {
         bool graph_has_a8_expert = false;
-        bool graph_a8_experts_all_nz = true;
-        bool graph_has_merged_gate_up = false;
+        bool graph_has_only_native_w8a8 = true;
+        bool graph_w8a8_experts_all_nz = true;
+        bool graph_has_merged_w8a8_gate_up = false;
         for (int i = 0; i < cgraph->n_nodes; i++) {
             const ggml_tensor * candidate = cgraph->nodes[i];
             if (candidate->op == GGML_OP_MUL_MAT_ID && candidate->src[0] != nullptr) {
-                const char * name = ggml_get_name(candidate->src[0]);
-                if (name != nullptr && strstr(name, "ffn_gate_up_exps.weight") != nullptr) {
-                    graph_has_merged_gate_up = true;
-                }
-                if (ggml_cann_a8_grouped_expert(candidate->src[0])) {
+                const ggml_tensor * weight = candidate->src[0];
+                if (ggml_cann_a8_grouped_expert(weight)) {
                     graph_has_a8_expert = true;
-                    if (candidate->src[0]->extra == nullptr) {
-                        graph_a8_experts_all_nz = false;
+                    if (weight->type != GGML_TYPE_W8A8) {
+                        graph_has_only_native_w8a8 = false;
+                    } else {
+                        if (weight->extra == nullptr) {
+                            graph_w8a8_experts_all_nz = false;
+                        }
+                        const char * name = ggml_get_name(weight);
+                        if (name != nullptr && strstr(name, "ffn_gate_up_exps.weight") != nullptr) {
+                            graph_has_merged_w8a8_gate_up = true;
+                        }
                     }
                 }
             }
         }
-        // The merged gate/up MUL_MAT_ID path is already the best decode path.
-        // Full fusion adds routing/dispatch work without reducing matmul bytes.
+        // Keep this default scoped to native W8A8 experts. Q8 A8 and mixed A8
+        // graphs remain on the previous conservative path. The merged gate/up
+        // MUL_MAT_ID path is already better than full fusion for decode.
         const bool full_fusion_default =
-            !graph_has_merged_gate_up && (!graph_has_a8_expert || graph_a8_experts_all_nz);
+            !graph_has_a8_expert ||
+            (graph_has_only_native_w8a8 && graph_w8a8_experts_all_nz &&
+             !graph_has_merged_w8a8_gate_up);
 
         int fused_until = -1;
         for (int i = 0; i < cgraph->n_nodes; i++) {
