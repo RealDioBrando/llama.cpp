@@ -487,7 +487,7 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
     ggml_cann_pool_alloc row_idx(ctx.pool(), n_rows * i32);
     ggml_cann_pool_alloc cumsum_i32(ctx.pool(), n_exp * i32);
     ggml_cann_pool_alloc cumsum_i64(ctx.pool(), n_exp * sizeof(int64_t));
-    ggml_cann_pool_alloc gate_out(ctx.pool(), n_rows * n_ff * f16);
+    ggml_cann_pool_alloc gate_out(ctx.pool(), n_rows * (merged_gate_up ? 2 * n_ff : n_ff) * f16);
     ggml_cann_pool_alloc up_out(ctx.pool(),
                                 (merged_gate_up ? 0 : n_rows * n_ff) * f16);
     ggml_cann_pool_alloc activation(ctx.pool(), n_rows * n_ff * f16);

@@ -329,6 +329,119 @@ class _ModelSlimFullAdapter(ModelSlimAdapter):
     def _merged_expert_name(layer: int, projection: str) -> str:
         return f"model.layers.{layer}.mlp.experts.{projection}.weight"
 
+    def _collect_merged_gate_up(
+        self,
+        groups: dict[tuple[int, str], dict[int, tuple[str, str]]],
+        load_payload: bool,
+    ) -> tuple[list[dict[str, object]], set[int]]:
+        if not getattr(self.model, "fuse_gate_up_exps", False):
+            return [], set()
+
+        n_experts = self._num_experts()
+        records: list[dict[str, object]] = []
+        merged_layers: set[int] = set()
+        layers = sorted({layer for layer, _ in groups})
+
+        for layer in layers:
+            gate_entries = groups.get((layer, "gate_proj"))
+            up_entries = groups.get((layer, "up_proj"))
+            if not gate_entries or not up_entries:
+                continue
+
+            for projection, entries in (("gate_proj", gate_entries), ("up_proj", up_entries)):
+                require(
+                    set(entries) == set(range(n_experts)),
+                    f"layer {layer} {projection} has experts {sorted(entries)}; expected 0..{n_experts - 1}",
+                )
+
+            gate_first_weight = self._tensor(gate_entries[0][1], "expert weight")
+            up_first_weight = self._tensor(up_entries[0][1], "expert weight")
+            gate_first_scale_name, gate_first_offset_name = self._triple_names(gate_entries[0][1])
+            up_first_scale_name, up_first_offset_name = self._triple_names(up_entries[0][1])
+            gate_first_scale = self._tensor(gate_first_scale_name, "expert scale")
+            up_first_scale = self._tensor(up_first_scale_name, "expert scale")
+            gate_first_offset = self._tensor(gate_first_offset_name, "expert offset")
+            up_first_offset = self._tensor(up_first_offset_name, "expert offset")
+
+            gate_shape = tuple(gate_first_weight.shape)
+            up_shape = tuple(up_first_weight.shape)
+            gate_scale_shape = tuple(gate_first_scale.shape)
+            up_scale_shape = tuple(up_first_scale.shape)
+            gate_offset_shape = tuple(gate_first_offset.shape)
+            up_offset_shape = tuple(up_first_offset.shape)
+            require(gate_shape == up_shape, f"layer {layer} gate/up shapes differ: {gate_shape} vs {up_shape}")
+            require(gate_scale_shape == up_scale_shape,
+                    f"layer {layer} gate/up scale shapes differ: {gate_scale_shape} vs {up_scale_shape}")
+            require(gate_offset_shape == up_offset_shape,
+                    f"layer {layer} gate/up offset shapes differ: {gate_offset_shape} vs {up_offset_shape}")
+            require(len(gate_shape) == 2, f"layer {layer} expert weight must be 2D, got {gate_shape}")
+            require(gate_shape[1] % 32 == 0, f"layer {layer} K must be divisible by 32, got {gate_shape[1]}")
+            n_ff = gate_shape[0]
+            blocks_per_row = gate_shape[1] // 32
+            require(gate_scale_shape == (n_ff, 1),
+                    f"layer {layer} gate scale shape {gate_scale_shape} != ({n_ff}, 1)")
+
+            gguf_name = self.map_tensor_name(self._merged_expert_name(layer, "gate_up_proj"))
+            raw = None
+            if load_payload:
+                raw = np.empty((n_experts, 2 * n_ff, blocks_per_row * 34), dtype=np.uint8)
+
+            for role, entries, output_offset in (
+                ("gate_proj", gate_entries, 0),
+                ("up_proj", up_entries, n_ff),
+            ):
+                for expert_id in range(n_experts):
+                    source_name, weight_name = entries[expert_id]
+                    scale_name, offset_name = self._triple_names(weight_name)
+                    weight_lazy = self._tensor(weight_name, "expert weight")
+                    scale_lazy = self._tensor(scale_name, "expert scale")
+                    offset_lazy = self._tensor(offset_name, "expert offset")
+                    require(tuple(weight_lazy.shape) == gate_shape,
+                            f"{weight_name} shape {tuple(weight_lazy.shape)} != {gate_shape}")
+                    require(tuple(scale_lazy.shape) == gate_scale_shape,
+                            f"{scale_name} shape {tuple(scale_lazy.shape)} != {gate_scale_shape}")
+                    require(tuple(offset_lazy.shape) == gate_offset_shape,
+                            f"{offset_name} shape {tuple(offset_lazy.shape)} != {gate_offset_shape}")
+                    self._validate_offset(offset_lazy, offset_name)
+                    scale = self._validate_scale(scale_lazy, scale_name)
+                    if load_payload:
+                        assert raw is not None
+                        weight = LazyTorchTensor.to_eager(weight_lazy).cpu().numpy()
+                        raw[expert_id, output_offset:output_offset + n_ff] = w8a8_blocks(
+                            weight, scale.cpu().numpy()
+                        )
+                    records.append({
+                        "kind": "expert",
+                        "layout": "merged_gate_up",
+                        "layer": layer,
+                        "projection": role,
+                        "source_projection": role,
+                        "expert_id": expert_id,
+                        "source_name_raw": source_name,
+                        "source_name": weight_name,
+                        "gguf_name": gguf_name,
+                        "shape": gate_shape,
+                        "scale_shape": gate_scale_shape,
+                        "stack_shape": (n_experts, 2 * n_ff, gate_shape[1]),
+                        "stack_scale_shape": (n_experts, 2 * n_ff),
+                        "scale_min": float(scale.min().item()),
+                        "scale_max": float(scale.max().item()),
+                        "offset_nonzero": 0,
+                    })
+                    self._accounted_w8a8_sources.add(source_name)
+                    for name in (weight_name, scale_name, offset_name):
+                        self.model_tensors.pop(name, None)
+
+            if load_payload:
+                assert raw is not None
+                self.gguf_writer.add_tensor(gguf_name, raw, raw_dtype=W8A8_TYPE)
+                logger.info(f"gguf: wrote merged {gguf_name} as W8A8 [{n_experts},{2 * n_ff},{gate_shape[1]}]")
+            else:
+                logger.info(f"gguf: validated merged gate/up experts for {gguf_name}")
+            merged_layers.add(layer)
+
+        return records, merged_layers
+
     def _collect_separate_experts(self, load_payload: bool) -> list[dict[str, object]]:
         groups: dict[tuple[int, str], dict[int, tuple[str, str]]] = defaultdict(dict)
         for source_name, weight_name in self._quantized_weight_names():
@@ -349,8 +462,10 @@ class _ModelSlimFullAdapter(ModelSlimAdapter):
             return []
 
         n_experts = self._num_experts()
-        records: list[dict[str, object]] = []
+        records, merged_layers = self._collect_merged_gate_up(groups, load_payload)
         for (layer, projection), entries in sorted(groups.items()):
+            if layer in merged_layers and projection in ("gate_proj", "up_proj"):
+                continue
             require(set(entries) == set(range(n_experts)),
                     f"layer {layer} {projection} has experts {sorted(entries)}; expected 0..{n_experts - 1}")
             _, first_name = entries[0]
