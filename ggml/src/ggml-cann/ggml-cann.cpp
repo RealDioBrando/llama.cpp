@@ -3742,15 +3742,19 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
     static bool opt_fusion = parse_bool(get_env_as_lowercase("GGML_CANN_OPERATOR_FUSION").value_or(""));
 
     if (!use_cann_graph || cann_graph_capture_required) {
-        bool graph_has_w8a8_expert = false;
+        bool graph_has_a8_expert = false;
+        bool graph_a8_experts_all_nz = true;
         for (int i = 0; i < cgraph->n_nodes; i++) {
             const ggml_tensor * candidate = cgraph->nodes[i];
             if (candidate->op == GGML_OP_MUL_MAT_ID && candidate->src[0] != nullptr &&
-                candidate->src[0]->type == GGML_TYPE_W8A8) {
-                graph_has_w8a8_expert = true;
-                break;
+                ggml_cann_a8_grouped_expert(candidate->src[0])) {
+                graph_has_a8_expert = true;
+                if (candidate->src[0]->extra == nullptr) {
+                    graph_a8_experts_all_nz = false;
+                }
             }
         }
+        const bool full_fusion_default = !graph_has_a8_expert || graph_a8_experts_all_nz;
 
         int fused_until = -1;
         for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -3770,10 +3774,12 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                 }
             }
 
-            if (ggml_cann_moe_router_fused(*cann_ctx, cgraph, i, graph_has_w8a8_expert, &fused_until)) {
+            if (ggml_cann_moe_router_fused(*cann_ctx, cgraph, i, graph_has_a8_expert,
+                                      full_fusion_default, &fused_until)) {
                 continue;
             }
-            if (ggml_cann_moe_gate_up_fused(*cann_ctx, cgraph, i, graph_has_w8a8_expert, &fused_until)) {
+            if (ggml_cann_moe_gate_up_fused(*cann_ctx, cgraph, i,
+                                       full_fusion_default, &fused_until)) {
                 continue;
             }
             if (ggml_cann_moe_down_unpermute_fused(*cann_ctx, cgraph, i, &fused_until)) {

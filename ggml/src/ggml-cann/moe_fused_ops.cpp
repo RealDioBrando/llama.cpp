@@ -15,6 +15,7 @@
 #include <aclnnop/aclnn_moe_init_routing_v2.h>
 #include <aclnnop/aclnn_moe_token_unpermute.h>
 #include <aclnnop/aclnn_mul.h>
+#include <aclnnop/aclnn_quant_grouped_matmul_dequant_weight_nz.h>
 #include <aclnnop/aclnn_reduce_sum.h>
 #include <aclnnop/aclnn_silu.h>
 
@@ -60,16 +61,16 @@ bool is_down_weight(const ggml_tensor * weight) {
     return name != nullptr && strstr(name, "ffn_down_exps.weight") != nullptr;
 }
 
-bool graph_has_w8a8_expert(const ggml_cgraph * graph) {
-    for (int i = 0; i < graph->n_nodes; ++i) {
-        const ggml_tensor * node = graph->nodes[i];
-        if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr &&
-                (node->src[0]->type == GGML_TYPE_W8A8 ||
-                 ggml_cann_q8_moe_expert(node->src[0]))) {
-            return true;
-        }
+static acl_tensor_ptr make_direct_tensor(void * data, const int64_t * shape,
+                                         const int64_t * strides, int64_t dims,
+                                         aclDataType type) {
+    int64_t storage_shape = 1;
+    for (int64_t i = 0; i < dims; ++i) {
+        storage_shape *= shape[i];
     }
-    return false;
+    aclTensor * tensor = aclCreateTensor(shape, static_cast<uint64_t>(dims), type,
+                                         strides, 0, ACL_FORMAT_ND, &storage_shape, 1, data);
+    return acl_tensor_ptr(tensor);
 }
 
 bool is_view_like(const ggml_tensor * tensor) {
@@ -210,7 +211,7 @@ int find_node_index(const ggml_cgraph * graph, const ggml_tensor * tensor) {
     return -1;
 }
 
-static void run_sorted_grouped_matmul(ggml_backend_cann_context & ctx,
+static bool run_sorted_grouped_matmul(ggml_backend_cann_context & ctx,
                                       const ggml_tensor * weight,
                                       const void * input, const void * output,
                                       const void * cumsum_i64,
@@ -226,21 +227,47 @@ static void run_sorted_grouped_matmul(ggml_backend_cann_context & ctx,
     int64_t cumsum_ne[1] = { n_exp };
     size_t  cumsum_nb[1] = { sizeof(int64_t) };
 
-    const aclFormat weight_format = ggml_cann_is_weight_layout_candidate(weight)
-                                        ? ACL_FORMAT_FRACTAL_NZ : ACL_FORMAT_ND;
     acl_tensor_ptr acl_input = ggml_cann_create_tensor(
         const_cast<void *>(input), ACL_FLOAT16, f16, input_ne, input_nb, 2);
-    acl_tensor_ptr acl_weight = ggml_cann_create_tensor(
-        weight->data, ACL_FLOAT16, f16, weight_ne, weight_nb, 3, weight_format);
     acl_tensor_ptr acl_output = ggml_cann_create_tensor(
         const_cast<void *>(output), ACL_FLOAT16, f16, output_ne, output_nb, 2);
     acl_tensor_ptr acl_cumsum = ggml_cann_create_tensor(
         const_cast<void *>(cumsum_i64), ACL_INT64, sizeof(int64_t),
         cumsum_ne, cumsum_nb, 1);
 
+    if (ggml_cann_a8_grouped_expert(weight)) {
+        // The fused path currently supports only the pre-transformed NZ A8
+        // expert layout. ND A8 would need the compact-group workaround used by
+        // the standalone grouped path and must not be fed to an F16 descriptor.
+        if (weight->extra == nullptr) {
+            return false;
+        }
+
+        char quant_mode[] = "pertoken";
+        void * weight_scale_data =
+            (char *) weight->data + ggml_cann_w8a8_expert_scale_offset(weight);
+        int64_t scale_ne[2] = { n_exp, n_out };
+        int64_t scale_nb[2] = { n_out, 1 };
+        acl_tensor_ptr acl_weight_scale = make_direct_tensor(
+            weight_scale_data, scale_ne, scale_nb, 2, ACL_FLOAT);
+        aclTensor * transformed_weight = (aclTensor *) weight->extra;
+
+        GGML_CANN_CALL_ACLNN_OP(ctx, QuantGroupedMatmulDequantWeightNZ,
+                                acl_input.get(), transformed_weight,
+                                acl_weight_scale.get(), acl_cumsum.get(),
+                                nullptr, nullptr, nullptr, nullptr,
+                                quant_mode, true, acl_output.get());
+        return true;
+    }
+
     acl_tensor_list_ptr input_list = ggml_cann_create_tensor_list(std::move(acl_input));
-    acl_tensor_list_ptr weight_list = ggml_cann_create_tensor_list(std::move(acl_weight));
     acl_tensor_list_ptr output_list = ggml_cann_create_tensor_list(std::move(acl_output));
+
+    const aclFormat weight_format = ggml_cann_is_weight_layout_candidate(weight)
+                                        ? ACL_FORMAT_FRACTAL_NZ : ACL_FORMAT_ND;
+    acl_tensor_ptr acl_weight = ggml_cann_create_tensor(
+        weight->data, ACL_FLOAT16, f16, weight_ne, weight_nb, 3, weight_format);
+    acl_tensor_list_ptr weight_list = ggml_cann_create_tensor_list(std::move(acl_weight));
     // GroupedMatmulV4 only accepts ND weights; the NZ-transformed expert
     // stacks must run through aclnnGroupedMatmulWeightNz.
     if (weight_format == ACL_FORMAT_FRACTAL_NZ) {
@@ -254,6 +281,7 @@ static void run_sorted_grouped_matmul(ggml_backend_cann_context & ctx,
                                 acl_cumsum.get(), nullptr, nullptr, nullptr, 2, 0, 0, 0,
                                 output_list.get(), nullptr, nullptr);
     }
+    return true;
 }
 
 static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
@@ -410,8 +438,12 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
             (merged_gate_up && gate_node->ne[0] % 2 != 0) ||
             gate_node->ne[0] != up_node->ne[0] ||
             // the down grouped matmul reads the weight as an
-            // [n_ff, n_embd, n_exp] stack, the real shape must match
-            down_weight->type != GGML_TYPE_F16 || down_weight->ne[3] != 1 ||
+            // [n_ff, n_embd, n_exp] stack, the real shape must match. A8
+            // experts are accepted only when they are already in NZ layout.
+            (!ggml_cann_a8_grouped_expert(down_weight) &&
+             down_weight->type != GGML_TYPE_F16) ||
+            (ggml_cann_a8_grouped_expert(down_weight) && down_weight->extra == nullptr) ||
+            down_weight->ne[3] != 1 ||
             down_weight->ne[0] != n_ff || down_weight->ne[1] != n_embd ||
             down_weight->ne[2] != n_exp ||
             down_weight->ne[0] % 32 != 0 || down_weight->ne[1] % 32 != 0 ||
@@ -505,13 +537,17 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
     GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_c32.get(), ACL_INT64, acl_c64.get());
 
     if (merged_gate_up) {
-        run_sorted_grouped_matmul(ctx, gate_node->src[0], sorted_x.get(), gate_out.get(),
-                                  cumsum_i64.get(), n_hidden, 2 * n_ff, n_rows, n_exp);
+        if (!run_sorted_grouped_matmul(ctx, gate_node->src[0], sorted_x.get(), gate_out.get(),
+                                       cumsum_i64.get(), n_hidden, 2 * n_ff, n_rows, n_exp)) {
+            return false;
+        }
     } else {
-        run_sorted_grouped_matmul(ctx, gate_node->src[0], sorted_x.get(), gate_out.get(),
-                                  cumsum_i64.get(), n_hidden, n_ff, n_rows, n_exp);
-        run_sorted_grouped_matmul(ctx, up_node->src[0], sorted_x.get(), up_out.get(),
-                                  cumsum_i64.get(), n_hidden, n_ff, n_rows, n_exp);
+        if (!run_sorted_grouped_matmul(ctx, gate_node->src[0], sorted_x.get(), gate_out.get(),
+                                       cumsum_i64.get(), n_hidden, n_ff, n_rows, n_exp) ||
+            !run_sorted_grouped_matmul(ctx, up_node->src[0], sorted_x.get(), up_out.get(),
+                                       cumsum_i64.get(), n_hidden, n_ff, n_rows, n_exp)) {
+            return false;
+        }
     }
 
     int64_t half_ne[2] = { n_ff, n_rows };
@@ -529,9 +565,11 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
     GGML_CANN_CALL_ACLNN_OP(ctx, Silu, acl_gate.get(), acl_act.get());
     GGML_CANN_CALL_ACLNN_OP(ctx, Mul, acl_act.get(), acl_up.get(), acl_act.get());
 
-    run_sorted_grouped_matmul(ctx, down_node->src[0], activation.get(),
-                              down_out.get(), cumsum_i64.get(), n_ff, n_embd,
-                              n_rows, n_exp);
+    if (!run_sorted_grouped_matmul(ctx, down_node->src[0], activation.get(),
+                                   down_out.get(), cumsum_i64.get(), n_ff, n_embd,
+                                   n_rows, n_exp)) {
+        return false;
+    }
 
     // gather the sorted rows back into the per-pair order of a mul_mat_id
     // dst; the weighted mul and the top-k sum run as normal graph nodes
@@ -761,7 +799,8 @@ void run_moe_gmm(ggml_backend_cann_context & ctx, const ggml_tensor * weight,
 
 bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
                                 const ggml_cgraph * graph, int node_idx,
-                                bool graph_has_w8a8_expert, int * last_fused_node) {
+                                bool graph_has_a8_expert, bool full_fusion_default,
+                                int * last_fused_node) {
     ggml_tensor * node = graph->nodes[node_idx];
     // anchor: the router matmul itself, or the softmax consuming its logits
     // when the matmul already ran (defensive fallback: the router matmul is
@@ -782,7 +821,7 @@ bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
     }
 
     // Router fusion is not valid for W8A8 grouped MoE on this CANN build.
-    const bool enabled = env_enabled("GGML_CANN_MOE_ROUTER_FUSION", !graph_has_w8a8_expert);
+    const bool enabled = env_enabled("GGML_CANN_MOE_ROUTER_FUSION", !graph_has_a8_expert);
     if (!enabled) {
         return false;
     }
@@ -950,11 +989,11 @@ bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
             n_used * sizeof(float), ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
     }
 
-    // Full fusion is numerically invalid for W8A8 expert weights on this CANN
-    // build, so bypass it automatically when grouped MoE A8 is selected.
-    // Evaluated per call: the W8A8 marker varies per graph.
+    // Full fusion supports F16 experts and pre-transformed NZ A8 experts.
+    // The caller keeps it off by default when the graph contains ND A8 experts.
+    // Evaluated per call: the A8/NZ marker varies per graph.
     const bool full_fusion =
-        env_enabled("GGML_CANN_MOE_FULL_FUSION", !graph_has_w8a8_expert);
+        env_enabled("GGML_CANN_MOE_FULL_FUSION", full_fusion_default);
     if (full_fusion &&
             run_moe_full_fused(ctx, graph, logits, last, selected, weights,
                                &topk_ids, last_fused_node)) {
@@ -1033,17 +1072,17 @@ bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
 
 bool ggml_cann_moe_gate_up_fused(ggml_backend_cann_context & ctx,
                                  const ggml_cgraph * graph, int node_idx,
-                                 bool graph_has_w8a8_expert, int * last_fused_node) {
+                                 bool full_fusion_default, int * last_fused_node) {
     ggml_tensor * node = graph->nodes[node_idx];
     if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] == nullptr) {
         return false;
     }
 
     static const bool enabled = env_enabled("GGML_CANN_MOE_SWIGLU_FUSION", false);
-    // Full fusion is numerically invalid for W8A8 expert weights on this CANN
-    // build, so bypass it automatically when grouped MoE A8 is selected.
+    // Full fusion supports F16 experts and pre-transformed NZ A8 experts.
+    // The caller keeps it off by default when the graph contains ND A8 experts.
     const bool full_fusion =
-        env_enabled("GGML_CANN_MOE_FULL_FUSION", !graph_has_w8a8_expert);
+        env_enabled("GGML_CANN_MOE_FULL_FUSION", full_fusion_default);
     static const bool debug =
         env_enabled("GGML_CANN_MOE_FULL_DEBUG", false);
     static int debug_count = 0;
