@@ -820,7 +820,9 @@ bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
         return false;
     }
 
-    // Router fusion is not valid for W8A8 grouped MoE on this CANN build.
+    // Router fusion is disabled by default for A8. The non-V2 operator is
+    // documented as supported on 310P, but real-model probing found a top-k
+    // semantic mismatch; keep the environment override for diagnostics only.
     const bool enabled = env_enabled("GGML_CANN_MOE_ROUTER_FUSION", !graph_has_a8_expert);
     if (!enabled) {
         return false;
