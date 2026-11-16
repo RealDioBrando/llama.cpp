@@ -691,6 +691,16 @@ class ModelBase:
             if bid in self._gate_exp_buffer and bid in self._up_exp_buffer:
                 gate_data = self._gate_exp_buffer.pop(bid)
                 up_data = self._up_exp_buffer.pop(bid)
+                if gate_data.ndim != 3 or up_data.ndim != 3:
+                    raise ValueError(
+                        f"layer {bid}: gate/up expert fusion expects 3D tensors, "
+                        f"got {tuple(gate_data.shape)} and {tuple(up_data.shape)}"
+                    )
+                if gate_data.shape != up_data.shape:
+                    raise ValueError(
+                        f"layer {bid}: gate/up expert shapes differ: "
+                        f"{tuple(gate_data.shape)} vs {tuple(up_data.shape)}"
+                    )
                 # gate/up shape: (n_expert, n_ff, n_embd), concatenate to (n_expert, n_ff*2, n_embd)
                 fused_data = torch.cat([gate_data, up_data], dim=1)
                 fused_name = self.format_tensor_name(gguf.MODEL_TENSOR.FFN_GATE_UP_EXP, bid)
@@ -1141,6 +1151,8 @@ class ModelBase:
         )
         if any(qkv_buffers):
             raise ValueError("QKV fusion did not consume all buffered tensors")
+        if self._gate_exp_buffer or self._up_exp_buffer:
+            raise ValueError("gate/up expert fusion did not consume all buffered tensors")
 
     def set_type(self):
         self.gguf_writer.add_type(gguf.GGUFType.MODEL)

@@ -150,7 +150,10 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--fuse-gate-up-exps", action="store_true",
-        help="Fuse gate_exps and up_exps tensors into a single gate_up_exps tensor for MoE models.",
+        help=("Fuse gate_exps and up_exps tensors into a single gate_up_exps tensor for MoE models. "
+              "This changes the GGUF tensor layout and is opt-in; the target runtime must support "
+              "ffn_gate_up_exps. For ModelSlim W8A8, gate/up shapes must match and the hidden "
+              "dimension must be 32-aligned."),
     )
     parser.add_argument(
         "--fp8-as-q8", action="store_true",
