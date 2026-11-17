@@ -211,6 +211,9 @@ int find_node_index(const ggml_cgraph * graph, const ggml_tensor * tensor) {
     return -1;
 }
 
+// Shared sorted-row grouped matmul driver for F16 and pre-transformed A8 NZ
+// experts. `input`/`output` are row-major activation buffers; `cumsum_i64`
+// contains the cumulative expert row boundaries.
 static bool run_sorted_grouped_matmul(ggml_backend_cann_context & ctx,
                                       const ggml_tensor * weight,
                                       const void * input, const void * output,
@@ -227,6 +230,8 @@ static bool run_sorted_grouped_matmul(ggml_backend_cann_context & ctx,
     int64_t cumsum_ne[1] = { n_exp };
     size_t  cumsum_nb[1] = { sizeof(int64_t) };
 
+    // ACL descriptors carry pointer, shape, strides, dtype and format; they do
+    // not copy the underlying activation or cumsum buffers.
     acl_tensor_ptr acl_input = ggml_cann_create_tensor(
         const_cast<void *>(input), ACL_FLOAT16, f16, input_ne, input_nb, 2);
     acl_tensor_ptr acl_output = ggml_cann_create_tensor(
@@ -236,6 +241,8 @@ static bool run_sorted_grouped_matmul(ggml_backend_cann_context & ctx,
         cumsum_ne, cumsum_nb, 1);
 
     if (ggml_cann_a8_grouped_expert(weight)) {
+        // A8 is accepted here only after upload produced a resident NZ
+        // descriptor in weight->extra. ND A8 must use the standalone path.
         // The fused path currently supports only the pre-transformed NZ A8
         // expert layout. ND A8 would need the compact-group workaround used by
         // the standalone grouped path and must not be fed to an F16 descriptor.
@@ -248,6 +255,7 @@ static bool run_sorted_grouped_matmul(ggml_backend_cann_context & ctx,
             (char *) weight->data + ggml_cann_w8a8_expert_scale_offset(weight);
         int64_t scale_ne[2] = { n_exp, n_out };
         int64_t scale_nb[2] = { n_out, 1 };
+        // The resident scale plane is FP32 [expert, output_channel].
         acl_tensor_ptr acl_weight_scale = make_direct_tensor(
             weight_scale_data, scale_ne, scale_nb, 2, ACL_FLOAT);
         aclTensor * transformed_weight = (aclTensor *) weight->extra;
@@ -430,6 +438,8 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
     const int64_t n_token  = selected->ne[1];
     const int64_t n_rows   = n_used * n_token;
     const int64_t n_hidden = gate_node->src[1]->ne[0];
+    // A merged w13 graph has one gate_up MUL_MAT_ID; separate graphs have
+    // distinct gate and up nodes.
     const bool merged_gate_up = gate_node == up_node;
     const int64_t n_ff     = merged_gate_up ? gate_node->ne[0] / 2 : gate_node->ne[0];
     const int64_t n_embd   = down_node->ne[0];
@@ -437,9 +447,8 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
     if (n_ff <= 0 || n_token <= 0 || n_used <= 0 ||
             (merged_gate_up && gate_node->ne[0] % 2 != 0) ||
             gate_node->ne[0] != up_node->ne[0] ||
-            // the down grouped matmul reads the weight as an
-            // [n_ff, n_embd, n_exp] stack, the real shape must match. A8
-            // experts are accepted only when they are already in NZ layout.
+            // Down reads [n_ff, n_embd, n_exp]. A8 down weights are accepted
+            // only when they already have the NZ descriptor.
             (!ggml_cann_a8_grouped_expert(down_weight) &&
              down_weight->type != GGML_TYPE_F16) ||
             (ggml_cann_a8_grouped_expert(down_weight) && down_weight->extra == nullptr) ||
@@ -487,6 +496,8 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
     ggml_cann_pool_alloc row_idx(ctx.pool(), n_rows * i32);
     ggml_cann_pool_alloc cumsum_i32(ctx.pool(), n_exp * i32);
     ggml_cann_pool_alloc cumsum_i64(ctx.pool(), n_exp * sizeof(int64_t));
+    // Merged gate_up produces 2*n_ff output channels per row; separate
+    // gate/up each produce n_ff.
     ggml_cann_pool_alloc gate_out(ctx.pool(), n_rows * (merged_gate_up ? 2 * n_ff : n_ff) * f16);
     ggml_cann_pool_alloc up_out(ctx.pool(),
                                 (merged_gate_up ? 0 : n_rows * n_ff) * f16);
@@ -537,11 +548,13 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
     GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_c32.get(), ACL_INT64, acl_c64.get());
 
     if (merged_gate_up) {
+        // One grouped matmul for the merged gate/up stack.
         if (!run_sorted_grouped_matmul(ctx, gate_node->src[0], sorted_x.get(), gate_out.get(),
                                        cumsum_i64.get(), n_hidden, 2 * n_ff, n_rows, n_exp)) {
             return false;
         }
     } else {
+        // Separate layout needs two grouped matmuls with the same routing.
         if (!run_sorted_grouped_matmul(ctx, gate_node->src[0], sorted_x.get(), gate_out.get(),
                                        cumsum_i64.get(), n_hidden, n_ff, n_rows, n_exp) ||
             !run_sorted_grouped_matmul(ctx, up_node->src[0], sorted_x.get(), up_out.get(),
@@ -562,6 +575,9 @@ static bool run_moe_full_fused(ggml_backend_cann_context & ctx,
         merged_gate_up ? wide_nb : half_nb, 2);
     acl_tensor_ptr acl_act = ggml_cann_create_tensor(
         activation.get(), ACL_FLOAT16, f16, half_ne, half_nb, 2);
+    // Current activation uses two ACLNN calls. aclnnSwiGlu is a possible
+    // merged-only optimization, but the profile shows activation is not the
+    // dominant cost of the fused path.
     GGML_CANN_CALL_ACLNN_OP(ctx, Silu, acl_gate.get(), acl_act.get());
     GGML_CANN_CALL_ACLNN_OP(ctx, Mul, acl_act.get(), acl_up.get(), acl_act.get());
 
@@ -820,7 +836,8 @@ bool ggml_cann_moe_router_fused(ggml_backend_cann_context & ctx,
         return false;
     }
 
-    // Router fusion is disabled by default for A8. The non-V2 operator is
+    // Router fusion is a separate graph prefix optimization. It is disabled
+    // by default for A8; the non-V2 operator is
     // documented as supported on 310P, but real-model probing found a top-k
     // semantic mismatch; keep the environment override for diagnostics only.
     const bool enabled = env_enabled("GGML_CANN_MOE_ROUTER_FUSION", !graph_has_a8_expert);
@@ -1089,6 +1106,8 @@ bool ggml_cann_moe_gate_up_fused(ggml_backend_cann_context & ctx,
         env_enabled("GGML_CANN_MOE_FULL_DEBUG", false);
     static int debug_count = 0;
 
+    // Secondary full-fusion entry: this path is used when router fusion is
+    // disabled and the graph reaches the first gate/up node.
     if (full_fusion && (is_gate_up_weight(node->src[0]) ||
                             is_gate_weight(node->src[0]) ||
                             is_up_weight(node->src[0])) &&

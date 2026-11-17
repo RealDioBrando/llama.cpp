@@ -3742,6 +3742,8 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
     static bool opt_fusion = parse_bool(get_env_as_lowercase("GGML_CANN_OPERATOR_FUSION").value_or(""));
 
     if (!use_cann_graph || cann_graph_capture_required) {
+        // Scan the graph before choosing a default: full fusion is only
+        // enabled for the verified native-W8A8/NZ/separate case.
         bool graph_has_a8_expert = false;
         bool graph_has_only_native_w8a8 = true;
         bool graph_w8a8_experts_all_nz = true;
@@ -3769,6 +3771,7 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
         // Keep this default scoped to native W8A8 experts. Q8 A8 and mixed A8
         // graphs remain on the previous conservative path. The merged gate/up
         // MUL_MAT_ID path is already better than full fusion for decode.
+        // Keep the default off for merged w13, ND, Q8-A8 and mixed graphs.
         const bool full_fusion_default =
             !graph_has_a8_expert ||
             (graph_has_only_native_w8a8 && graph_w8a8_experts_all_nz &&
@@ -3792,6 +3795,9 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                 }
             }
 
+            // Router fusion may consume the gating prefix and then extend into
+            // full fusion. The gate/up hook below is the fallback entry when
+            // router fusion is disabled.
             if (ggml_cann_moe_router_fused(*cann_ctx, cgraph, i, graph_has_a8_expert,
                                       full_fusion_default, &fused_until)) {
                 continue;

@@ -691,6 +691,8 @@ class ModelBase:
             if bid in self._gate_exp_buffer and bid in self._up_exp_buffer:
                 gate_data = self._gate_exp_buffer.pop(bid)
                 up_data = self._up_exp_buffer.pop(bid)
+                # Fusion requires [expert, n_ff, hidden] tensors with equal
+                # shapes; otherwise concatenation changes the expert layout.
                 if gate_data.ndim != 3 or up_data.ndim != 3:
                     raise ValueError(
                         f"layer {bid}: gate/up expert fusion expects 3D tensors, "

@@ -329,6 +329,8 @@ class _ModelSlimFullAdapter(ModelSlimAdapter):
     def _merged_expert_name(layer: int, projection: str) -> str:
         return f"model.layers.{layer}.mlp.experts.{projection}.weight"
 
+    # `--fuse-gate-up-exps` is opt-in because it changes the GGUF tensor
+    # contract; callers must explicitly request the merged w13 layout.
     def _collect_merged_gate_up(
         self,
         groups: dict[tuple[int, str], dict[int, tuple[str, str]]],
@@ -363,6 +365,8 @@ class _ModelSlimFullAdapter(ModelSlimAdapter):
             gate_first_offset = self._tensor(gate_first_offset_name, "expert offset")
             up_first_offset = self._tensor(up_first_offset_name, "expert offset")
 
+            # Gate and up must describe the same per-expert matrix and the
+            # same W8A8 scale layout before they can share one output range.
             gate_shape = tuple(gate_first_weight.shape)
             up_shape = tuple(up_first_weight.shape)
             gate_scale_shape = tuple(gate_first_scale.shape)
@@ -384,6 +388,8 @@ class _ModelSlimFullAdapter(ModelSlimAdapter):
             gguf_name = self.map_tensor_name(self._merged_expert_name(layer, "gate_up_proj"))
             raw = None
             if load_payload:
+                # First n_ff rows are gate, next n_ff rows are up; each row is
+                # a packed W8A8 32-element block sequence.
                 raw = np.empty((n_experts, 2 * n_ff, blocks_per_row * 34), dtype=np.uint8)
 
             for role, entries, output_offset in (
